@@ -18,6 +18,7 @@ const { mkdtemp, readFile, rm } = await import('node:fs/promises')
 const { tmpdir } = await import('node:os')
 const path = await import('node:path')
 const { fileURLToPath } = await import('node:url')
+const { annotateFailure } = await import('./ci-annotate.mjs')
 
 const root = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..')
 process.chdir(root)
@@ -292,6 +293,7 @@ let configured
 let unconfigured
 let passed = 0
 const failures = []
+const failureDetails = []
 
 async function openPhone(options = {}) {
   const origin = options.unconfigured ? unconfigured.origin : configured.origin
@@ -378,15 +380,17 @@ async function scenario(name, options, run) {
     console.log(`PASS ${name}`)
   } catch (error) {
     failures.push(name)
-    console.log(`FAIL ${name}\n${String(error instanceof Error ? error.stack : error).replace(/^/gm, '    ')}`)
+    const detail = [`FAIL ${name}`, String(error instanceof Error ? error.stack : error)]
     if (fixture) {
-      console.log(`    unexpected: ${JSON.stringify(fixture.unexpected)}`)
-      console.log(`    page errors: ${JSON.stringify(fixture.pageErrors)}`)
-      console.log(`    relay requests: ${JSON.stringify(fixture.relayRequests)}`)
+      detail.push(`unexpected: ${JSON.stringify(fixture.unexpected)}`)
+      detail.push(`page errors: ${JSON.stringify(fixture.pageErrors)}`)
+      detail.push(`relay requests: ${JSON.stringify(fixture.relayRequests)}`)
       try {
-        console.log(`    glasses: ${JSON.stringify(await fixture.page.evaluate(() => window.__g2State))}`)
+        detail.push(`glasses: ${JSON.stringify(await fixture.page.evaluate(() => window.__g2State))}`)
       } catch { /* The page may be gone. */ }
     }
+    console.log(detail.join('\n').replace(/^/gm, '    ').trimStart())
+    failureDetails.push(detail.join('\n'))
   } finally {
     await fixture?.context.close().catch(() => undefined)
   }
@@ -828,7 +832,10 @@ try {
 
   console.log(`\nPhone UI: ${passed} passed, ${failures.length} failed. Relay and G2 were stubbed; no device or live Substack validation.`)
   for (const name of failures) console.log(`  - ${name}`)
-  if (failures.length) process.exitCode = 1
+  if (failures.length) {
+    annotateFailure('Phone UI flows failed', failureDetails.join('\n\n'))
+    process.exitCode = 1
+  }
 } finally {
   await browser?.close()
   for (const served of [configured, unconfigured]) {

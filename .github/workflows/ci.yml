@@ -49,14 +49,20 @@ jobs:
         run: pnpm run test:ci
 
       - name: Install CI Chromium
+        # Run every test suite even when an earlier one failed, to get all results in one run.
+        if: ${{ !cancelled() }}
         run: pnpm exec playwright install --with-deps chromium
 
       - name: Browser tests (Chromium, network blocked)
+        # Run every test suite even when an earlier one failed, to get all results in one run.
+        if: ${{ !cancelled() }}
         env:
           CI: 'true'
         run: pnpm run test:browser:ci
 
       - name: Phone and glasses flows (Chromium, bridge stub)
+        # Run every test suite even when an earlier one failed, to get all results in one run.
+        if: ${{ !cancelled() }}
         env:
           CI: 'true'
         run: pnpm run test:ui:ci

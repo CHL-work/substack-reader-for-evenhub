@@ -13,6 +13,7 @@ import { mkdtemp, readdir, rm } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
 import { basename, dirname, join, resolve } from 'node:path'
 import { fileURLToPath } from 'node:url'
+import { annotateFailure, failureSection } from './ci-annotate.mjs'
 
 if (process.env.CI !== 'true') {
   throw new Error('These checks run only in remote CI. No local app testing is authorized.')
@@ -69,9 +70,15 @@ try {
     '--test-reporter=spec',
     '--test-timeout=60000',
     ...outputs,
-  ], { cwd: root, stdio: 'inherit', env: { ...process.env, CI: 'true' } })
+  ], { cwd: root, encoding: 'utf8', maxBuffer: 256 * 1024 * 1024, env: { ...process.env, CI: 'true' } })
   if (result.error) throw result.error
+  process.stdout.write(result.stdout ?? '')
+  process.stderr.write(result.stderr ?? '')
   status = result.status ?? 1
+  if (status !== 0) annotateFailure('Unit tests failed', failureSection(`${result.stdout ?? ''}\n${result.stderr ?? ''}`))
+} catch (error) {
+  annotateFailure('Unit test setup failed', error instanceof Error ? error.stack ?? error.message : String(error))
+  throw error
 } finally {
   await rm(temporary, { recursive: true, force: true })
 }

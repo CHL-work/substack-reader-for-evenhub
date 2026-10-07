@@ -13,6 +13,7 @@
 import { readdir } from 'node:fs/promises'
 import { basename, dirname, join, resolve } from 'node:path'
 import { fileURLToPath } from 'node:url'
+import { annotateFailure } from './ci-annotate.mjs'
 
 if (process.env.CI !== 'true') {
   throw new Error('These checks run only in remote CI. No local app testing is authorized.')
@@ -72,6 +73,7 @@ const browser = await chromium.launch()
 let passed = 0
 let failed = 0
 const problems = []
+const failureDetails = []
 try {
   for (const file of files) {
     const name = basename(file)
@@ -103,6 +105,7 @@ try {
         } else {
           failed += 1
           console.log(`  FAIL ${result.name} (${result.ms} ms)\n${String(result.error).replace(/^/gm, '       ')}`)
+          failureDetails.push(`${name} > ${result.name}\n${String(result.error)}`)
         }
       }
     } catch (error) {
@@ -119,4 +122,7 @@ try {
 
 console.log(`\nBrowser tests: ${passed} passed, ${failed} failed, ${problems.length} problem(s) in ${files.length} file(s).`)
 for (const problem of problems) console.log(`  - ${problem}`)
-if (failed || problems.length) process.exitCode = 1
+if (failed || problems.length) {
+  annotateFailure('Browser tests failed', [...failureDetails, ...problems].join('\n\n'))
+  process.exitCode = 1
+}
