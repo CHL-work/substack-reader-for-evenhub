@@ -20,7 +20,7 @@ import {
 import { ARCHIVE_PAGE_SIZE, type ArchivePage, type PostDetail, type PostSummary, type PubMeta } from '../substack/types'
 import {
   EMPTY_TEXT, TEXT, canContinue, clampIndex, fitBody, frameFor, homeEntries, isFirstRun, isRetryable,
-  latestPublications, postsRowCount, type PostsView, type ReaderView,
+  latestPublications, postsRowCount, type HomeEntry, type PostsView, type ReaderView,
 } from './frames'
 import type { Article, GlassesView, LinesPerPage, Position, PostRef, PostSource, Settings, ViewError } from './types'
 
@@ -237,8 +237,23 @@ export function createController(deps: ControllerDeps): Controller {
     generation += 1
   }
 
+  /**
+   * Home's entries change while the cursor is elsewhere (Continue appears after a post is opened,
+   * settings reorder items), so the cursor follows the selected entry's id, not its index.
+   */
+  let homeSelId: string | null = null
+  function syncHome(view: HomeView): HomeEntry[] {
+    const entries = homeEntries(state)
+    const index = homeSelId === null ? -1 : entries.findIndex(entry => entry.id === homeSelId)
+    view.sel = clampIndex(index >= 0 ? index : view.sel, entries.length)
+    homeSelId = entries[view.sel]?.id ?? null
+    return entries
+  }
+
   function computeFrame(): GlassesPage {
-    let page = frameFor(top(), state, { now: deps.now(), relayConfigured: relayConfigured() })
+    const view = top()
+    if (view.kind === 'home') syncHome(view)
+    let page = frameFor(view, state, { now: deps.now(), relayConfigured: relayConfigured() })
     if (transient) {
       page = {
         title: page.title,
@@ -636,11 +651,12 @@ export function createController(deps: ControllerDeps): Controller {
   async function onHome(view: HomeView, action: GlassesAction): Promise<void> {
     if (action === 'back') return exitApp()
     if (!relayConfigured() || isFirstRun(state)) return
-    const entries = homeEntries(state)
+    const entries = syncHome(view)
     if (action === 'next' || action === 'previous') {
       const sel = move(view.sel, action, entries.length)
       if (sel === view.sel) return
       view.sel = sel
+      homeSelId = entries[sel]?.id ?? null
       return draw()
     }
     if (action !== 'select') return
@@ -829,7 +845,7 @@ export function createController(deps: ControllerDeps): Controller {
         }
       }
       const view = top()
-      if (view.kind === 'home') view.sel = clampIndex(view.sel, homeEntries(state).length)
+      if (view.kind === 'home') syncHome(view)
       else if (view.kind === 'publications') view.sel = clampIndex(view.sel, state.publications.length)
       else if (view.kind === 'reader' && view.state === 'ready' && view.lines !== state.settings.linesPerPage) repaginate(view)
       void draw()

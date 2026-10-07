@@ -317,7 +317,8 @@ test('Home -> Publications -> posts -> reader, back preserves selections, root b
   await t.controller.onAction('back')
   assert.equal(t.last().title, 'Publications')
   await t.controller.onAction('back')
-  assert.equal(t.last().body, `${NB}Latest\n\n> Publications (2)\n\n${NB}Saved (0)`, 'Home keeps its selection')
+  assert.equal(t.last().body, `${NB}Continue: Post 12\n\n${NB}Latest\n\n> Publications (2)\n\n${NB}Saved (0)`,
+    'Home shows Continue for the unfinished post and the cursor stays on the entry it left from')
   assert.equal(t.exits(), 0)
   await t.controller.onAction('hold')
   assert.equal(t.exits(), 0, 'long-press is ignored on Home')
