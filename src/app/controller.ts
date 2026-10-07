@@ -81,7 +81,11 @@ export interface Controller {
   lastError(): ViewError | null
   /** Phone "Retry": re-run the failed glasses step. */
   retry(): Promise<void>
-  /** Resend the whole current frame (glasses reconnected, or the phone asks). */
+  /**
+   * Resend the whole current frame (glasses reconnected, or the phone asks). A no-op before
+   * start(): the glasses keep the startup frame (for example "Loading your library"), which the
+   * app re-sends itself.
+   */
   redraw(): Promise<void>
   /**
    * The glasses now show the newest frame rendered, although its render rejected (a timed-out
@@ -961,7 +965,8 @@ export function createController(deps: ControllerDeps): Controller {
     },
     async onAction(action) {
       // Before start() the glasses show the startup frame (for example "Loading your library"):
-      // only the root double-tap (the exit dialog) is honoured, so nothing draws over that frame.
+      // only the root double-tap (the exit dialog) is honoured, and redraw() and the foreground
+      // redraw wait too, so only configurationChanged (the library arrived) draws over that frame.
       if (!started) return action === 'back' ? exitApp() : undefined
       interacted = true
       // The wearer acted on an older frame than the model: show the model first, at most once per
@@ -990,7 +995,8 @@ export function createController(deps: ControllerDeps): Controller {
       }
       const since = hiddenAt
       hiddenAt = null
-      if (since !== null && deps.now() - since > FOREGROUND_REDRAW_MS) void forceRedraw()
+      // Before start() the glasses keep the startup frame, which the app (not the model) owns.
+      if (started && since !== null && deps.now() - since > FOREGROUND_REDRAW_MS) void forceRedraw()
     },
     configurationChanged() {
       for (const view of stack) {
@@ -1025,7 +1031,7 @@ export function createController(deps: ControllerDeps): Controller {
       if (view.kind === 'reader' && view.state === 'error' && isRetryable(view.error)) return loadReader(view, false)
       return Promise.resolve()
     },
-    redraw: forceRedraw,
+    redraw: () => (started ? forceRedraw() : Promise.resolve()),
     frameShown() {
       if (displayStale && latest) accepted(latest)
     },

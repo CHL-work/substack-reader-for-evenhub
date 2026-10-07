@@ -209,6 +209,7 @@ function installBridge({ seed, bridgeOnly, failReads }) {
   window.__g2Writes = []
   window.__g2Shutdown = []
   window.__g2Event = null
+  window.__g2Device = null
   window.__g2Launch = null
   window.__g2LastWrite = -Infinity
   window.__g2LastSent = {}
@@ -237,8 +238,10 @@ function installBridge({ seed, bridgeOnly, failReads }) {
       window.__g2Event = callback
       return () => { if (window.__g2Event === callback) window.__g2Event = null }
     },
-    onDeviceStatusChanged() {
-      return () => {}
+    onDeviceStatusChanged(callback) {
+      // Scenarios call it with { connectType: 'disconnected' | 'connected' | ... } (DeviceConnectType values).
+      window.__g2Device = callback
+      return () => { if (window.__g2Device === callback) window.__g2Device = null }
     },
     onLaunchSource(callback) {
       window.__g2Launch = callback
@@ -356,7 +359,8 @@ async function openPhone(options = {}) {
   page.on('pageerror', error => fixture.pageErrors.push(error.stack || error.message))
   fixture.page = page
   await page.goto(origin, { waitUntil: 'load' })
-  await ready(page, options.readyTimeout)
+  // waitReady: false lets a scenario act before the glasses phase (it then calls ready() itself).
+  if (options.waitReady !== false) await ready(page, options.readyTimeout)
   return fixture
 }
 
@@ -892,17 +896,31 @@ try {
     assert.deepEqual(relayRequests, [])
   })
 
-  await scenario('12e every bridge read of a round fails: a notice, edits go to the browser copy, a later attach merges them', {
+  await scenario('12e every bridge read of a round fails: a reconnect keeps the loading frame, a notice, edits go to the browser copy, a later attach merges them', {
     seed: { [PREFS_KEY]: prefsSeed({ publications: [ALPHA_PUB], settings: { invertSwipe: true } }) },
     bridgeOnly: true,
     failReads: 99,
-    readyTimeout: 30_000,
+    waitReady: false,
   }, async ({ page, relayRequests }) => {
+    // The page exists (its device listener is registered) while the library is still loading.
+    await expect.poll(() => page.evaluate(() => typeof window.__g2Device)).toBe('function')
     const [created] = await page.evaluate(() => window.__g2Pages)
     assert.ok(created.textObject.find(box => box.containerName === 'body').content.includes('Loading your library'))
-    // Read at once, then after 1, 3 and 10 s: only the fourth failure lifts the gate.
+    await expect(page.locator('[data-testid="library-loading"]')).toHaveCount(1)
+    // The glasses disconnect and reconnect mid-gate: the loading frame is sent again, never the
+    // controller's empty-library frame (it has not started).
+    await page.evaluate(() => {
+      window.__g2Device({ connectType: 'disconnected' })
+      window.__g2Device({ connectType: 'connected' })
+    })
+    await expect.poll(() => page.evaluate(() => window.__g2Writes.some(write => write.name === 'body' && write.content.includes('Loading your library')))).toBe(true)
+    assert.equal(await page.evaluate(() => window.__g2Writes.some(write => write.content.includes('No publications yet'))), false,
+      'A reconnect while the library loads never draws the first-run frame.')
+    await ready(page, 30_000)
+    // Read at once, then after 1, 3 and 10 s (the reconnect tries at once without restarting the round):
+    // only the fourth failure lifts the gate.
     await expect.poll(() => page.evaluate(() => window.__g2FirstRunAfter ?? -1)).toBeGreaterThanOrEqual(4)
-    await expect(page.locator('[data-testid="notice"]')).toContainText('Could not load your library from the glasses; edits will be merged later.')
+    await expect(page.locator('[data-testid="notice"]')).toContainText('Could not read your library from the Even app; edits will be merged when it answers.')
     await expect(page.locator('[data-testid="library-loading"]')).toHaveCount(0)
     await expectBody(page, 'No publications yet.')
     await openTab(page, 'settings')

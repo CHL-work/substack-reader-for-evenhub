@@ -3,8 +3,9 @@
  * MAX_KEY_CHARS. Bridge storage is the source of truth once the Even app
  * bridge exists; window.localStorage is a mirror (and the only backend in a
  * plain browser). When the bridge attaches, a bridge copy the mirror already
- * matched (SYNC_KEY) gives way to memory as a whole; one with changes the
- * mirror never saw is merged item by item (never replaced wholesale). A
+ * matched (SYNC_KEY) gives way to memory as a whole, and one that moved while
+ * the mirror did not is adopted as a whole; when both changed (or never
+ * matched) they are merged item by item (never replaced wholesale). A
  * bridge key that could not be read is never written. Every value read back
  * is normalized defensively; article text or HTML is never persisted (the
  * normalizers whitelist PostRef metadata fields only).
@@ -36,9 +37,11 @@ export type DocName = keyof typeof KEYS
 const DOCS: readonly DocName[] = ['prefs', 'progress']
 /**
  * Browser copy only, never bridge storage: {prefs, progress}, the bridge
- * savedAt each browser document last matched. A bridge copy no newer than
- * that holds nothing the browser copy has not seen, so attaching keeps the
- * browser copy as a whole and its removals stick.
+ * savedAt each browser document last matched (the matched browser document
+ * then carries that savedAt too). A bridge copy no newer than that holds
+ * nothing the browser copy has not seen, so attaching keeps the browser copy
+ * as a whole and its removals stick; a newer bridge copy next to a browser
+ * document still at that savedAt descends from it and is adopted as a whole.
  */
 export const SYNC_KEY = 'sr:sync:v1'
 
@@ -47,6 +50,8 @@ export const MAX_KEY_CHARS = 48_000
 /** Values read back above this are treated as corrupt. */
 const MAX_READ_CHARS = 4 * MAX_KEY_CHARS
 export const SAVE_DEBOUNCE_MS = 800
+/** A late bridge write makes the store rewrite a document at most this often. */
+export const LATE_REWRITE_MS = 30_000
 
 const SLUG_RE = /^[A-Za-z0-9][A-Za-z0-9_-]{0,199}$/
 const TITLE_MAX = 200
@@ -418,13 +423,13 @@ function fitPrefs(doc: PrefsDoc, own: Record<'publications' | 'saved', number>):
 }
 
 /**
- * Merge two prefs copies when the bridge holds changes the browser copy never
- * saw. Publications and saved posts are united (the newer copy's order, then
- * what only the older copy has), so a near-empty copy can never wipe a
- * library; what only the older copy had is dropped again (last first) when
- * the union would not fit MAX_KEY_CHARS. Each setting comes from the newer
- * copy unless it still has the default there. The cost: an item removed in
- * only one copy can come back.
+ * Merge two prefs copies when each holds changes the other never saw (or
+ * they never matched). Publications and saved posts are united (the newer
+ * copy's order, then what only the older copy has), so a near-empty copy can
+ * never wipe a library; what only the older copy had is dropped again (last
+ * first) when the union would not fit MAX_KEY_CHARS. Each setting comes from
+ * the newer copy unless it still has the default there. The cost: an item
+ * removed in only one copy can come back.
  */
 export function mergePrefs(newer: PrefsDoc, older: PrefsDoc): PrefsDoc {
   const doc = normalizePrefs({
@@ -441,10 +446,10 @@ export function mergePrefs(newer: PrefsDoc, older: PrefsDoc): PrefsDoc {
 }
 
 /**
- * Merge two progress copies (when the bridge holds changes the browser copy
- * never saw): each post keeps the position with the larger updatedAt; history
- * and read ids are united (newer order first); lastOpen comes from the newer
- * copy when it has one.
+ * Merge two progress copies (when each holds changes the other never saw, or
+ * they never matched): each post keeps the position with the larger
+ * updatedAt; history and read ids are united (newer order first); lastOpen
+ * comes from the newer copy when it has one.
  */
 export function mergeProgress(newer: ProgressDoc, older: ProgressDoc): ProgressDoc {
   const positions = new Map<number, Position>()
@@ -492,7 +497,9 @@ export interface Store {
    * of truth) and bring memory together with them. Memory still holding the
    * pristine defaults adopts the bridge copy. A bridge copy no newer than the
    * one the browser copy last matched (SYNC_KEY) holds nothing new, so memory
-   * is kept as a whole (removals, Clear reading and Reset settings stick).
+   * is kept as a whole (removals, Clear reading and Reset settings stick). A
+   * newer bridge copy while the browser copy is unchanged since that match
+   * is adopted as a whole, for the same reason in the other direction.
    * Otherwise the copies are merged item by item (mergePrefs, mergeProgress).
    * Then the bridge, with the loaded backend as a mirror, becomes the
    * backend, and only documents the bridge lacks are written to it.
@@ -503,11 +510,15 @@ export interface Store {
    */
   attachBridge(bridge: KV, onApplied?: (changed: boolean) => void): Promise<boolean>
   /**
-   * A bridge write that timed out landed after all and may have replaced a
-   * newer document: write every stored document again (debounced). No-op
+   * A bridge write that timed out stored `raw` under `key` after all. Only
+   * when it is older than a document the bridge already stored did it replace
+   * newer data: that document is then written again (debounced), at most
+   * once per stored write and per LATE_REWRITE_MS, and never while a write
+   * is in flight (otherwise it stays dirty and goes out with the next save),
+   * so a host that keeps answering late cannot make the store loop. No-op
    * before the bridge is attached.
    */
-  resync(): void
+  lateWrite(key: string, raw: string): void
   /** True once attachBridge succeeded. */
   attached(): boolean
   /** True when load() found neither document (first run, or the browser copy was lost). */
@@ -545,6 +556,14 @@ export function createStore(options: StoreOptions = {}): Store {
   let ok = true
   let found = false
   let attaching: Promise<boolean> | null = null
+  /** A writeDirty is running. */
+  let writing = false
+  /** savedAt of the newest document the bridge stored (confirmed in time or answered late); -1: none yet. */
+  const stored: Record<DocName, number> = { prefs: -1, progress: -1 }
+  /** stored[name] when a late older write last caused a rewrite: once per stored write. */
+  const rewritten: Record<DocName, number> = { prefs: -1, progress: -1 }
+  /** When a late older write last caused a rewrite (now()). */
+  const rewriteAt: Record<DocName, number> = { prefs: -Infinity, progress: -Infinity }
 
   function applyPrefs(doc: PrefsDoc) {
     state.publications = doc.publications
@@ -643,11 +662,25 @@ export function createStore(options: StoreOptions = {}): Store {
         continue
       }
       const local = docOf(name)
+      if (!dirty[name] && local.savedAt === synced[name] && remote.savedAt > synced[name]) {
+        // Only the bridge moved since the copies last matched: a matched mirror document carries the
+        // savedAt it matched, and any later write to it a greater one. The bridge copy descends from
+        // the mirror's, so it is adopted as a whole (a removal, Clear reading or Reset settings that
+        // reached only the bridge sticks), and only the mirror is refreshed.
+        if (!sameContent(remote, local)) {
+          apply(name, remote)
+          changed = true
+        }
+        savedAt[name] = remote.savedAt
+        size[name] = raws[name].length
+        refresh.push({ name, raw: raws[name], stamp: remote.savedAt })
+        continue
+      }
       let merged = local
       if (remote.savedAt > synced[name]) {
-        // The bridge holds changes the mirror never saw (say, the mirror was lost and then edited):
-        // unite the copies item by item. Otherwise every difference is an edit made since they last
-        // matched, removals included, and memory is kept as a whole.
+        // Both copies changed since they last matched, or they never matched (say, the mirror was
+        // lost and then edited): unite them item by item. Otherwise every difference is an edit made
+        // since they last matched, removals included, and memory is kept as a whole.
         const [newer, older] = localStamp(name) >= remote.savedAt ? [local, remote] : [remote, local]
         merged = name === 'prefs'
           ? mergePrefs(newer as PrefsDoc, older as PrefsDoc)
@@ -661,8 +694,10 @@ export function createStore(options: StoreOptions = {}): Store {
       savedAt[name] = Math.max(savedAt[name], remote.savedAt)
       if (!sameContent(merged, remote)) {
         dirty[name] = true // The bridge lacks something or holds a removed item: write memory to both.
-      } else if (memoryChanged || dirty[name]) {
-        dirty[name] = false // The bridge already has it all: refresh only the mirror.
+      } else if (memoryChanged || dirty[name] || local.savedAt !== remote.savedAt) {
+        // The bridge already has it all: refresh only the mirror (also when the mirror holds the same
+        // content under another savedAt, so that it carries the savedAt it matched).
+        dirty[name] = false
         size[name] = raws[name].length
         refresh.push({ name, raw: raws[name], stamp: remote.savedAt })
       } else if (synced[name] !== remote.savedAt) {
@@ -691,6 +726,15 @@ export function createStore(options: StoreOptions = {}): Store {
     const names = DOCS.filter(name => dirty[name])
     if (!names.length) return true
     if (!primary && !mirror) return false
+    writing = true
+    try {
+      return await writeDocs(names)
+    } finally {
+      writing = false
+    }
+  }
+
+  async function writeDocs(names: readonly DocName[]): Promise<boolean> {
     let success = true
     const stamps: Array<[DocName, number]> = []
     for (const name of names) {
@@ -707,6 +751,7 @@ export function createStore(options: StoreOptions = {}): Store {
         primary ? safeSet(primary, KEYS[name], raw) : Promise.resolve(false),
         mirror ? safeSet(mirror, KEYS[name], raw) : Promise.resolve(false),
       ])
+      if (first) stored[name] = Math.max(stored[name], stamp)
       if (primary ? first : second) {
         savedAt[name] = stamp
         if (primary && second) stamps.push([name, stamp]) // Both copies hold this document now.
@@ -767,11 +812,26 @@ export function createStore(options: StoreOptions = {}): Store {
       }
       return attaching
     },
-    resync() {
-      if (!primary) return
-      // Never the pristine defaults: only documents that were loaded, adopted or written.
-      const names = DOCS.filter(name => savedAt[name] > 0 || dirty[name])
-      if (names.length) markDirty(names)
+    lateWrite(key, raw) {
+      const name = DOCS.find(item => KEYS[item] === key)
+      if (!primary || !name) return
+      const stamp = savedAtOf(raw)
+      if (stamp >= stored[name]) {
+        stored[name] = stamp // The newest document the bridge stored so far: it replaced nothing newer.
+        return
+      }
+      // An older document replaced a newer one on the bridge: write memory again, at most once per
+      // stored write and per LATE_REWRITE_MS, and not while a write runs (it may carry the document,
+      // and late answers landing during writes is how a slow host would loop). Otherwise the document
+      // stays dirty and goes out with the next save.
+      const time = now()
+      if (writing || rewritten[name] === stored[name] || time - rewriteAt[name] < LATE_REWRITE_MS) {
+        dirty[name] = true
+        return
+      }
+      rewritten[name] = stored[name]
+      rewriteAt[name] = time
+      markDirty([name])
     },
     attached: () => primary !== null,
     loadedEmpty: () => !found,

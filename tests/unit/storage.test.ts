@@ -1,6 +1,7 @@
 import { test } from 'node:test'
 import assert from 'node:assert/strict'
 import { LIMITS, defaultSettings, emptyState, type Position, type PostRef, type Publication } from '../../src/app/types'
+import { STORAGE_TIMEOUT_MS, createBridgeQueue } from '../../src/events'
 import {
   KEYS, MAX_KEY_CHARS, SAVE_DEBOUNCE_MS, SYNC_KEY, addPublication, addSaved, browserKV, bridgeKV, clearReading, createStore,
   markRead, mergePrefs, mergeProgress, mirroredKV, normalizePrefs, normalizeProgress, prefsFit, recordHistory,
@@ -53,6 +54,8 @@ function fakeScheduler() {
       for (const task of due) task.run()
     },
     size: () => tasks.length,
+    /** The fake time, for a store's `now`. */
+    now: () => time,
   }
 }
 
@@ -586,32 +589,245 @@ test('a removal made while the mirror is ahead of the bridge is not undone by th
   assert.equal(bridge.data.has(KEYS.progress), false, 'the pristine progress defaults are never written')
 })
 
-test('a bridge write that lands late is followed by a rewrite of the newest documents', async () => {
+test('a bridge copy that moved while the browser copy did not is adopted: removals, Clear reading and Reset settings stick (A1)', async () => {
+  const scheduler = fakeScheduler()
+  const x = { host: 'x.substack.com' }
+  const y = { host: 'y.substack.com' }
+  const bridgePrefs = JSON.stringify({ schemaVersion: 1, savedAt: 2_000, publications: [y], saved: [], settings: {} })
+  const bridgeProgress = JSON.stringify({ schemaVersion: 1, savedAt: 2_000, positions: [], history: [], read: [], lastOpen: null })
+  const local = memoryKV('localStorage', {
+    [KEYS.prefs]: JSON.stringify({ schemaVersion: 1, savedAt: 1_000, publications: [x, y], saved: [ref(5)], settings: { linesPerPage: 5, invertSwipe: true } }),
+    [KEYS.progress]: JSON.stringify({ schemaVersion: 1, savedAt: 1_000, positions: [position(5, 900)], history: [ref(5)], read: [5], lastOpen: ref(5) }),
+    [SYNC_KEY]: JSON.stringify({ prefs: 1_000, progress: 1_000 }),
+  })
+  const bridge = memoryKV('bridge', { [KEYS.prefs]: bridgePrefs, [KEYS.progress]: bridgeProgress })
+  const store = createStore({ now: () => 3_000, schedule: scheduler.schedule })
+  await store.load(local.kv)
+  assert.equal(await store.attachBridge(bridge.kv), true)
+  assert.deepEqual(hosts(store.state.publications), ['y.substack.com'], 'x stays removed')
+  assert.deepEqual(store.state.saved, [])
+  assert.deepEqual(store.state.settings, defaultSettings(), 'Reset settings sticks')
+  assert.deepEqual([store.state.positions, store.state.history, store.state.read, store.state.lastOpen], [[], [], [], null], 'Clear reading sticks')
+  assert.deepEqual(bridge.writes, [], 'nothing is written back to the bridge')
+  assert.equal(local.data.get(KEYS.prefs), bridgePrefs, 'the browser copy is refreshed from the bridge')
+  assert.equal(local.data.get(KEYS.progress), bridgeProgress)
+  assert.deepEqual(JSON.parse(local.data.get(SYNC_KEY)!), { prefs: 2_000, progress: 2_000 })
+  assert.equal(store.pending(), false)
+})
+
+test('edits that reached only the bridge (the browser copy write failed) are adopted at the next attach, never merged away (A1)', async () => {
   const scheduler = fakeScheduler()
   let clock = 2_000
   const bridge = memoryKV('bridge', { [KEYS.prefs]: BRIDGE_PREFS, [KEYS.progress]: BRIDGE_PROGRESS })
   const local = memoryKV('localStorage', { [KEYS.prefs]: BRIDGE_PREFS, [KEYS.progress]: BRIDGE_PROGRESS })
-  const store = createStore({ now: () => clock, schedule: scheduler.schedule })
-  await store.load(local.kv)
-  store.resync()
-  assert.equal(store.pending(), false, 'nothing to rewrite before the bridge is attached')
-  assert.equal(await store.attachBridge(bridge.kv), false)
+  const first = createStore({ now: () => clock, schedule: scheduler.schedule })
+  await first.load(local.kv)
+  assert.equal(await first.attachBridge(bridge.kv), false)
+  assert.deepEqual(JSON.parse(local.data.get(SYNC_KEY)!), { prefs: 800, progress: 700 })
+  // The user removes the saved post, clears reading and resets settings; the browser copy refuses the write (quota).
+  assert.equal(removeSaved(first.state, ref(5)), true)
+  clearReading(first.state)
+  first.state.settings = defaultSettings()
   clock = 3_000
+  first.save()
+  local.failWrites(true)
+  assert.equal(await first.flush(), true, 'the bridge (the source of truth) stored both documents')
+  local.failWrites(false)
+  assert.equal(JSON.parse(local.data.get(KEYS.prefs)!).savedAt, 800, 'the browser copy kept the old documents')
+  assert.deepEqual(JSON.parse(local.data.get(SYNC_KEY)!), { prefs: 800, progress: 700 })
+  const writes = bridge.writes.length
+
+  clock = 4_000
+  const next = createStore({ now: () => clock, schedule: scheduler.schedule })
+  await next.load(local.kv)
+  assert.equal(next.state.saved.length, 1, 'the stale browser copy still has the saved post')
+  assert.equal(await next.attachBridge(bridge.kv), true)
+  assert.deepEqual(next.state.saved, [])
+  assert.deepEqual(next.state.settings, defaultSettings())
+  assert.deepEqual([next.state.positions, next.state.history, next.state.read, next.state.lastOpen], [[], [], [], null])
+  assert.equal(bridge.writes.length, writes, 'nothing is written back to the bridge')
+  assert.equal(JSON.parse(local.data.get(KEYS.prefs)!).savedAt, 3_000, 'the browser copy is refreshed from the bridge')
+  assert.deepEqual(JSON.parse(local.data.get(SYNC_KEY)!), { prefs: 3_000, progress: 3_000 })
+  assert.equal(next.pending(), false)
+})
+
+test('copies with the same content under different savedAt leave the browser copy carrying the matched savedAt (A1)', async () => {
+  const scheduler = fakeScheduler()
+  const doc = (savedAt: number, publications: object[]) => JSON.stringify({ schemaVersion: 1, savedAt, publications, saved: [], settings: {} })
+  const x = { host: 'x.substack.com' }
+  const y = { host: 'y.substack.com' }
+  const local = memoryKV('localStorage', { [KEYS.prefs]: doc(1_500, [x, y]) })
+  const bridge = memoryKV('bridge', { [KEYS.prefs]: doc(1_000, [x, y]) })
+  const store = createStore({ now: () => 3_000, schedule: scheduler.schedule })
+  await store.load(local.kv)
+  assert.equal(await store.attachBridge(bridge.kv), false)
+  assert.deepEqual(bridge.writes, [])
+  assert.equal(JSON.parse(local.data.get(KEYS.prefs)!).savedAt, 1_000, 'the browser copy takes the bridge document it matched')
+  assert.deepEqual(JSON.parse(local.data.get(SYNC_KEY)!), { prefs: 1_000, progress: -1 })
+  // Then only the bridge moves on (x removed in a session whose browser copy was not written): adopted.
+  bridge.data.set(KEYS.prefs, doc(2_000, [y]))
+  const next = createStore({ now: () => 4_000, schedule: scheduler.schedule })
+  await next.load(local.kv)
+  assert.equal(await next.attachBridge(bridge.kv), true)
+  assert.deepEqual(hosts(next.state.publications), ['y.substack.com'])
+  assert.deepEqual(bridge.writes, [])
+})
+
+test('a late bridge write older than a stored one is rewritten at most once per stored write and per 30 s, never during a write (A2, B1)', async () => {
+  const scheduler = fakeScheduler()
+  const bridge = memoryKV('bridge', { [KEYS.prefs]: BRIDGE_PREFS, [KEYS.progress]: BRIDGE_PROGRESS })
+  const local = memoryKV('localStorage', { [KEYS.prefs]: BRIDGE_PREFS, [KEYS.progress]: BRIDGE_PROGRESS })
+  let gate: Promise<void> | null = null
+  const gated: KV = {
+    name: 'bridge',
+    get: key => bridge.kv.get(key),
+    async set(key, value) {
+      await gate
+      return bridge.kv.set(key, value)
+    },
+  }
+  const store = createStore({ now: scheduler.now, schedule: scheduler.schedule })
+  /** Let the debounce run out and the write finish. */
+  const debounce = async () => {
+    scheduler.advance(SAVE_DEBOUNCE_MS)
+    await flushPromises()
+  }
+  const savedAtOnBridge = () => JSON.parse(bridge.data.get(KEYS.prefs)!).savedAt
+  const old = JSON.stringify({ schemaVersion: 1, savedAt: 1 }) // Older than anything this session stores.
+  await store.load(local.kv)
+  store.lateWrite(KEYS.prefs, old)
+  assert.equal(store.pending(), false, 'nothing to rewrite before the bridge is attached')
+  assert.equal(await store.attachBridge(gated), false)
+  store.save('prefs')
+  await debounce() // t = 800: prefs stored at 801.
+  assert.equal(savedAtOnBridge(), 801)
+
+  // While a write is in flight, a late older write schedules nothing; the document waits for the next save.
+  let release = () => undefined as void
+  gate = new Promise<void>(resolve => { release = resolve })
+  store.save('progress')
+  await debounce() // t = 1600: the progress write waits.
+  store.lateWrite(KEYS.prefs, old)
+  assert.equal(scheduler.size(), 0)
+  release()
+  gate = null
+  await flushPromises()
+  assert.equal(store.pending(), true)
+  assert.equal(await store.flush(), true) // prefs stored at 1600.
+
+  // Otherwise it is written again after the debounce...
+  store.lateWrite(KEYS.prefs, old)
+  assert.equal(scheduler.size(), 1)
+  await debounce() // t = 2400
+  assert.equal(savedAtOnBridge(), 2_400)
+  // ...but within 30 s of that rewrite only marked for the next save.
+  store.lateWrite(KEYS.prefs, old)
+  assert.equal(scheduler.size(), 0)
+  assert.equal(store.pending(), true)
+  assert.equal(await store.flush(), true) // prefs stored at 2401.
+
+  // Once per stored write: a rewrite the bridge refused is not tried again for the next late answer.
+  scheduler.advance(37_600) // t = 40000
+  bridge.failWrites(true)
+  store.lateWrite(KEYS.prefs, old)
+  await debounce()
+  assert.equal(store.lastSaveOk(), false)
+  const writes = bridge.writes.length
+  scheduler.advance(39_200) // t = 80000
+  store.lateWrite(KEYS.prefs, old)
+  assert.equal(scheduler.size(), 0)
+  scheduler.advance(60_000)
+  await flushPromises()
+  assert.equal(bridge.writes.length, writes)
+
+  // The newest document landing late, or another key, changes nothing; the next save writes the document.
+  store.lateWrite(KEYS.prefs, JSON.stringify({ schemaVersion: 1, savedAt: 2_401 }))
+  store.lateWrite('sr:other', old)
+  assert.equal(scheduler.size(), 0)
+  bridge.failWrites(false)
+  store.save('prefs')
+  await debounce()
+  assert.equal(savedAtOnBridge(), 140_800)
+  assert.equal(store.lastSaveOk(), true)
+  assert.equal(store.pending(), false)
+})
+
+test('through the bridge queue, a host that answers writes late never makes the store loop (A2, B1)', async () => {
+  const scheduler = fakeScheduler()
+  /** The host's storage. */
+  const data = new Map<string, string>([[KEYS.prefs, BRIDGE_PREFS], [KEYS.progress, BRIDGE_PROGRESS]])
+  const local = memoryKV('localStorage', { [KEYS.prefs]: BRIDGE_PREFS, [KEYS.progress]: BRIDGE_PROGRESS })
+  /** Keys the host was asked to write, in order. */
+  const sent: string[] = []
+  /** How the host answers the next writes (after `ms`, storing only when `stores`); then at once, storing. */
+  const answers: Array<{ ms: number; stores: boolean }> = []
+  const store = createStore({ now: scheduler.now, schedule: scheduler.schedule })
+  const queue = createBridgeQueue({ closed: () => false, schedule: scheduler.schedule })
+  // Wired as in glasses.ts: writes go through the queue, and only a late write that stored is reported.
+  const bridge = bridgeKV({
+    async storageGet(key) { return data.get(key) ?? '' },
+    storageSet: (key, value) => queue.run('storage', STORAGE_TIMEOUT_MS, () => new Promise<boolean>(resolve => {
+      sent.push(key)
+      const { ms, stores } = answers.shift() ?? { ms: 0, stores: true }
+      const settle = () => {
+        if (stores) data.set(key, value)
+        resolve(stores)
+      }
+      if (ms > 0) scheduler.schedule(settle, ms)
+      else settle()
+    }), 'set', (ok, stored) => {
+      if (ok && stored === true) store.lateWrite(key, value)
+    }),
+  })
+  /** Let `ms` of fake time pass in steps, so the promise chains of each step run. */
+  const elapse = async (ms: number) => {
+    for (let step = 0; step < ms; step += 200) {
+      scheduler.advance(200)
+      await flushPromises()
+    }
+  }
+  const storedPrefs = () => JSON.parse(data.get(KEYS.prefs)!)
+  await store.load(local.kv)
+  assert.equal(await store.attachBridge(bridge), false)
+  assert.deepEqual(sent, [])
+
+  // Every write answers true after 5 s (the queue gives up after 4 s). The late answer is the newest
+  // document, so nothing is written again, however long the host stays slow.
+  answers.push(...Array.from({ length: 20 }, () => ({ ms: 5_000, stores: true })))
   store.state.publications.push(publication('y.substack.com'))
   store.save('prefs')
-  assert.equal(await store.flush(), true)
-  // An older write that had timed out lands now and replaces the newer bridge document.
-  bridge.data.set(KEYS.prefs, BRIDGE_PREFS)
-  clock = 4_000
-  store.resync()
-  assert.equal(store.pending(), true)
-  scheduler.advance(SAVE_DEBOUNCE_MS)
-  await flushPromises()
-  const prefs = JSON.parse(bridge.data.get(KEYS.prefs)!)
-  assert.deepEqual(hosts(prefs.publications), ['bridge.substack.com', 'y.substack.com'])
-  assert.equal(prefs.savedAt, 4_000)
-  assert.equal(JSON.parse(bridge.data.get(KEYS.progress)!).savedAt, 4_000)
+  await elapse(60_000)
+  assert.deepEqual(sent, [KEYS.prefs], 'one write, no rewrite loop')
+  assert.deepEqual(hosts(storedPrefs().publications), ['bridge.substack.com', 'y.substack.com'], 'it landed late')
+  assert.equal(store.lastSaveOk(), false)
+
+  // A late refusal stored nothing: no rewrite either.
+  answers.length = 0
+  answers.push(...Array.from({ length: 20 }, () => ({ ms: 5_000, stores: false })))
+  store.state.publications.push(publication('z.substack.com'))
+  store.save('prefs')
+  await elapse(60_000)
+  assert.deepEqual(sent, [KEYS.prefs, KEYS.prefs])
+  assert.deepEqual(hosts(storedPrefs().publications), ['bridge.substack.com', 'y.substack.com'])
+
+  // A write that timed out lands after a newer one was stored, replacing it: written again, once.
+  answers.length = 0
+  answers.push({ ms: 5_000, stores: true })
+  store.state.publications.push(publication('w.substack.com'))
+  store.save('prefs')
+  await elapse(1_000) // The write starts at 0.8 s and hangs (it lands at 5.8 s).
+  assert.equal(sent.length, 3)
+  await elapse(4_000) // It timed out at 4.8 s.
+  assert.equal(await store.flush(), true, 'the next write is stored at once')
+  assert.equal(sent.length, 4)
+  const newest = storedPrefs().savedAt
+  await elapse(60_000)
+  assert.deepEqual(sent.slice(2), [KEYS.prefs, KEYS.prefs, KEYS.prefs], 'exactly one rewrite')
+  assert.ok(storedPrefs().savedAt > newest)
+  assert.deepEqual(hosts(storedPrefs().publications), ['bridge.substack.com', 'y.substack.com', 'z.substack.com', 'w.substack.com'])
+  assert.equal(store.lastSaveOk(), true)
   assert.equal(store.pending(), false)
+  assert.deepEqual(sent.filter(key => key === KEYS.progress), [], 'the other document is never rewritten')
 })
 
 test('united copies that would not fit 48k drop what only the older copy had, never the newer copy\'s items', async () => {

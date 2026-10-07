@@ -69,10 +69,11 @@ export interface GlassesOptions {
    */
   onExit?(): void | Promise<void>
   /**
-   * A setLocalStorage that timed out landed after all and may have replaced a
-   * newer value: write the newest documents again.
+   * A setLocalStorage that timed out stored `value` under `key` after all (a
+   * late refusal or error stored nothing and is not reported). It may have
+   * replaced a newer value: the store decides whether to write it again.
    */
-  onStorageLate?(): void
+  onStorageLate?(key: string, value: string): void
   /**
    * The newest frame rendered is fully on the display, also when its render()
    * already rejected (an update that timed out landed, and the late recovery
@@ -256,11 +257,8 @@ export async function connectGlasses(opts: GlassesOptions): Promise<GlassesContr
       if (!disposed) report('error', errorMessage(error))
     },
     onLate(kind, label) {
-      if (disposed) return
-      if (kind === 'screen') display.late(label)
-      else if (label === 'set') {
-        try { opts.onStorageLate?.() } catch { /* Observer errors are isolated. */ }
-      }
+      // Late storage writes are reported per call (storageSet), with their key and value.
+      if (!disposed && kind === 'screen') display.late(label)
     },
   })
 
@@ -300,7 +298,11 @@ export async function connectGlasses(opts: GlassesOptions): Promise<GlassesContr
     storageSet(key, value) {
       // Defense in depth for the shared BLE link; storage.ts keeps values far smaller.
       if (value.length > MAX_BRIDGE_VALUE_CHARS) return Promise.resolve(false)
-      return queue.run('storage', STORAGE_TIMEOUT_MS, async () => (await bridge.setLocalStorage(key, value)) === true, 'set')
+      return queue.run('storage', STORAGE_TIMEOUT_MS, async () => (await bridge.setLocalStorage(key, value)) === true, 'set', (ok, stored) => {
+        // Timed out, then answered: only a write that stored can have replaced a newer value.
+        if (disposed || !ok || stored !== true) return
+        try { opts.onStorageLate?.(key, value) } catch { /* Observer errors are isolated. */ }
+      })
     },
   }
 
@@ -406,9 +408,14 @@ export async function connectGlasses(opts: GlassesOptions): Promise<GlassesContr
       return display.render(snapshotOf(page))
     },
     exit() {
+      // From now on (the exit may still wait in the queue), a late screen answer never draws over the dialog.
+      display.exitRequested()
       return queue.run('screen', SCREEN_TIMEOUT_MS, async () => {
         const accepted = await bridge.shutDownPageContainer(1)
-        if (!accepted) throw new Error('G2 could not open the exit menu. Double-tap to retry.')
+        if (!accepted) {
+          display.exitFailed() // No dialog opened (a timeout keeps the guard: the dialog may still open).
+          throw new Error('G2 could not open the exit menu. Double-tap to retry.')
+        }
         // Mode 1 shows the OS exit dialog. Only a following SYSTEM_EXIT (or
         // pagehide) disposes: the user can cancel the dialog. Resend the whole
         // frame next time in case the dialog disturbed the containers.

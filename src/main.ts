@@ -30,12 +30,15 @@ const BRIDGE_GRACE_MS = 4000
  * and while the library is still loading, until it was read or the retries ran out.
  */
 const START_WAIT_MS = 4000
-/** Retries after a failed bridge storage read; foreground and reconnect start a new round. */
+/**
+ * Retries after a failed bridge storage read. Foreground and reconnect try again at once; once the
+ * library is known they also start a new round, while it loads they keep the round (and its bound).
+ */
 const ATTACH_RETRY_MS = [1000, 3000, 10_000] as const
 /** First glasses frame while the bridge library is still being read and the browser copy was empty. */
 const LOADING_LIBRARY_FRAME = messageFrame(APP_NAME, 'Loading your library\u2026', TEXT.exitFooter)
 /** Phone notice when the loading gate is lifted because every bridge read of a round failed. */
-const LIBRARY_UNREAD = 'Could not load your library from the glasses; edits will be merged later.'
+const LIBRARY_UNREAD = 'Could not read your library from the Even app; edits will be merged when it answers.'
 
 function delay(ms: number): Promise<void> {
   return new Promise(resolve => setTimeout(resolve, ms))
@@ -95,6 +98,17 @@ async function boot(root: HTMLElement): Promise<void> {
     try { controller.configurationChanged() } catch { /* Drawn again on the next action. */ }
   }
 
+  /**
+   * Send the "Loading your library" frame again in full (the glasses reconnected while it is up).
+   * Only while the gate is up: then the controller has not started and draws nothing, and the
+   * gate's end (libraryChanged) draws the model after this frame.
+   */
+  function showLoading() {
+    if (!libraryLoading || !glasses) return
+    glasses.invalidate()
+    void glasses.render(LOADING_LIBRARY_FRAME).catch(() => undefined)
+  }
+
   // -------------------------------------------------------------------------
   // Bridge storage (the source of truth), attached as soon as the bridge
   // exists, independent of page creation. A failed read never overwrites it:
@@ -151,10 +165,13 @@ async function boot(root: HTMLElement): Promise<void> {
     }, wait)
   }
 
-  /** Foreground or reconnect: try now, with a fresh round of retries. */
+  /**
+   * Foreground or reconnect: try now. Once the library is known, with a fresh round of retries;
+   * while it loads, within the current round, so the gate still lifts after its last retry.
+   */
   function retryAttach() {
     if (!bridgeStorage || store.attached()) return
-    retries = 0
+    if (!libraryLoading) retries = 0
     void attach()
   }
 
@@ -190,7 +207,9 @@ async function boot(root: HTMLElement): Promise<void> {
     onAction: action => controller.onAction(action),
     onStatus: status => phone?.setGlassesStatus(status),
     onReconnect: () => {
-      void controller.redraw()
+      // While the library loads, the controller has not started and the loading frame is the app's.
+      if (libraryLoading) showLoading()
+      else void controller.redraw()
       retryAttach()
     },
     onLifecycle: signal => {
@@ -200,14 +219,15 @@ async function boot(root: HTMLElement): Promise<void> {
     onLaunchSource: source => controller.onLaunchSource(source),
     onRawEvent: summary => phone?.logEvent(summary),
     onExit: async () => { await store.flush() },
-    onStorageLate: () => store.resync(),
+    onStorageLate: (key, value) => store.lateWrite(key, value),
     onFrameShown: () => controller.frameShown(),
   }).then(async connected => {
     clearTimeout(grace)
     glasses = connected
     // A glassesMenu launch resumes lastOpen, which may only be in bridge storage. An empty browser
     // copy keeps the "Loading your library" frame until the library was read or the retries ran out
-    // (bounded: every read times out after 4 s), instead of drawing the first-run screen.
+    // (bounded: every read times out after 4 s, and a foreground or reconnect never restarts the
+    // round while it loads), instead of drawing the first-run screen.
     await Promise.race([attachApplied, delay(START_WAIT_MS)])
     await libraryKnown
     await controller.start()

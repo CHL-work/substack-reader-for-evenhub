@@ -175,6 +175,8 @@ interface Setup {
   settings?: Partial<Settings>
   relay?: boolean
   getFeed?: (host: string, signal?: AbortSignal) => Promise<FeedResult>
+  /** The controller's clock (default: fixed at NOW). */
+  now?: () => number
 }
 
 interface Harness {
@@ -226,7 +228,7 @@ async function setup(options: Setup = {}): Promise<Harness> {
     getFeed: options.getFeed,
     store,
     buildArticle,
-    now: () => NOW,
+    now: options.now ?? (() => NOW),
     relayConfigured: () => options.relay !== false,
     resetGestures() { resets += 1 },
     invalidate() { invalidations += 1 },
@@ -1183,13 +1185,24 @@ test('helpers: toViewError, sameText and resumePage', () => {
 })
 
 test('before start only the root double-tap acts, so nothing draws over the startup frame', async () => {
-  const t = await setup({ publications: [pub(ALPHA, 'Alpha')] })
+  let clock = NOW
+  const t = await setup({ publications: [pub(ALPHA, 'Alpha')], now: () => clock })
   for (const action of ['next', 'previous', 'select', 'hold', 'menu:1', 'menu:5'] as const) await t.controller.onAction(action)
   assert.equal(t.frames.length, 0, 'gestures and menu items wait for start()')
   assert.equal(t.api.archive.length, 0)
+  // A reconnect (redraw) and a return after a long background leave the startup frame alone too (A3, B3).
+  await t.controller.redraw()
+  t.controller.onLifecycle('background')
+  clock += 31_000
+  t.controller.onLifecycle('foreground')
+  assert.equal(t.frames.length, 0, 'redraw() and the foreground redraw wait for start()')
+  assert.equal(t.invalidations(), 0)
   await t.controller.onAction('back')
   assert.equal(t.exits(), 1, 'the root double-tap still opens the exit dialog')
   assert.equal(t.frames.length, 0)
   await t.controller.start()
+  assert.equal(t.frames.length, 1, 'start draws once')
   assert.equal(t.last().body.split('\n')[0], '> Latest', 'start draws Home with the first entry selected')
+  await t.controller.redraw()
+  assert.deepEqual([t.frames.length, t.invalidations()], [2, 1], 'after start, redraw resends the frame in full')
 })

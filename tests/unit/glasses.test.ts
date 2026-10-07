@@ -151,17 +151,20 @@ function queueFixture() {
   const late: BridgeCallKind[] = []
   /** `kind:label` of every late answer. */
   const lateLabels: string[] = []
+  /** [ok, value] of every late answer. */
+  const lateOutcomes: Array<[boolean, unknown]> = []
   let closed = false
   const queue = createBridgeQueue({
     closed: () => closed,
     schedule: timers.schedule,
     onScreenError: error => errors.push(error),
-    onLate: (kind, label) => {
+    onLate: (kind, label, ok, value) => {
       late.push(kind)
       lateLabels.push(`${kind}:${label}`)
+      lateOutcomes.push([ok, value])
     },
   })
-  return { queue, timers, errors, late, lateLabels, close() { closed = true } }
+  return { queue, timers, errors, late, lateLabels, lateOutcomes, close() { closed = true } }
 }
 
 test('bridge calls run one at a time in order, and a failed call never blocks the next', async () => {
@@ -283,16 +286,35 @@ test('a reconnect asks for a full redraw after a disconnect or a failed write, w
   assert.equal(link.connected(), false)
 })
 
-test('a storage write that lands after its timeout is reported with its label', async () => {
-  const { queue, timers, errors, lateLabels } = queueFixture()
-  const stalled = deferred<boolean>()
-  const write = outcome(queue.run('storage', STORAGE_TIMEOUT_MS, () => stalled.promise, 'set'))
+test('a call that settles after its timeout reports how it settled, to its own handler and to onLate (A2, B1)', async () => {
+  const { queue, timers, errors, lateLabels, lateOutcomes } = queueFixture()
+  const own: Array<[boolean, unknown]> = []
+  const report = (ok: boolean, value: unknown) => { own.push([ok, value]) }
+  const stored = deferred<boolean>()
+  const refused = deferred<boolean>()
+  let fail = (_error: Error) => undefined as void
+  const failing = new Promise<boolean>((_resolve, reject) => { fail = reject })
+  const writes = [
+    outcome(queue.run('storage', STORAGE_TIMEOUT_MS, () => stored.promise, 'set', report)),
+    outcome(queue.run('storage', STORAGE_TIMEOUT_MS, () => refused.promise, 'set', report)),
+    outcome(queue.run('storage', STORAGE_TIMEOUT_MS, () => failing, 'set', report)),
+  ]
+  for (const write of writes) {
+    await flushPromises()
+    timers.advance(STORAGE_TIMEOUT_MS)
+    assert.equal((await write)?.name, 'BridgeTimeoutError')
+  }
+  assert.equal(await queue.run('storage', STORAGE_TIMEOUT_MS, async () => true, 'set', report), true)
+  assert.deepEqual(own, [], 'an answer in time is no late answer')
+  stored.resolve(true)
+  refused.resolve(false)
+  const error = new Error('setLocalStorage failed')
+  fail(error)
   await flushPromises()
-  timers.advance(STORAGE_TIMEOUT_MS)
-  assert.equal((await write)?.name, 'BridgeTimeoutError')
-  stalled.resolve(true)
-  await flushPromises()
-  assert.deepEqual(lateLabels, ['storage:set'], 'the store can write the newest documents again')
+  assert.deepEqual(own, [[true, true], [true, false], [false, error]],
+    'only a write that answered true stored anything; a late refusal or error changed nothing')
+  assert.deepEqual(lateOutcomes, own)
+  assert.deepEqual(lateLabels, ['storage:set', 'storage:set', 'storage:set'])
   assert.deepEqual(errors, [])
 })
 
@@ -488,6 +510,58 @@ test('an exit dialog that answers late is never drawn over; the next frame resen
   await f.answer(2)
   assert.equal(await next, null)
   assert.deepEqual(f.sent(), ['body', 'title', 'footer'])
+})
+
+test('a late answer after an exit was asked for never draws over the dialog; the app\'s next frame resends every field (B2)', async () => {
+  const f = displayFixture()
+  f.display.created(frame(1))
+  const r2 = outcome(f.display.render(frame(2)))
+  await flushPromises()
+  assert.deepEqual(f.sent(), ['body'])
+  f.timers.advance(SCREEN_TIMEOUT_MS) // Frame 2's body update hangs.
+  assert.equal((await r2)?.name, 'BridgeTimeoutError')
+  // The display looks frozen, so the wearer double-taps on Home: the exit dialog is asked for.
+  f.display.exitRequested()
+  const dialog = deferred<boolean>()
+  const exit = outcome(f.queue.run('screen', SCREEN_TIMEOUT_MS, async () => {
+    if (!(await dialog.promise)) throw new Error('refused')
+    f.display.invalidate()
+  }, 'exit'))
+  await flushPromises()
+  await f.answer(0) // Frame 2's body lands late while the exit runs...
+  dialog.resolve(true) // ...and the dialog opens.
+  assert.equal(await exit, null)
+  await flushPromises()
+  assert.equal(f.calls.length, 1, 'no recovery frame is queued behind the exit and sent over the dialog')
+  assert.deepEqual(f.display.shown(), {})
+  // The wearer cancels the dialog and acts: the app's next frame resends every field.
+  const next = outcome(f.display.render(frame(3)))
+  await flushPromises()
+  await f.answer(1)
+  await f.answer(2)
+  await f.answer(3)
+  assert.equal(await next, null)
+  assert.deepEqual(f.sent(1), ['body', 'title', 'footer'])
+
+  // An exit the glasses refused opened no dialog: a late answer then sends the newest frame again.
+  const g = displayFixture()
+  g.display.created(frame(1))
+  const r5 = outcome(g.display.render(frame(5)))
+  await flushPromises()
+  g.timers.advance(SCREEN_TIMEOUT_MS)
+  assert.equal((await r5)?.name, 'BridgeTimeoutError')
+  g.display.exitRequested()
+  const refused = outcome(g.queue.run('screen', SCREEN_TIMEOUT_MS, async () => {
+    g.display.exitFailed() // As glasses.ts does when shutDownPageContainer answers false.
+    throw new Error('G2 could not open the exit menu.')
+  }, 'exit'))
+  assert.match((await refused)?.message ?? '', /exit menu/)
+  await g.answer(0)
+  await g.answer(1)
+  await g.answer(2)
+  await g.answer(3)
+  assert.deepEqual(g.sent(1), ['body', 'title', 'footer'])
+  assert.deepEqual(g.display.shown(), frame(5))
 })
 
 test('a frame counts as the newest shown only when nothing newer was asked for, also after a late recovery (K2)', async () => {

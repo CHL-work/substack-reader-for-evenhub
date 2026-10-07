@@ -182,14 +182,22 @@ export type BridgeCallLabel = string
 export type BridgeOperation<T> = (live: () => boolean) => Promise<T>
 /** setTimeout-like; returns a cancel function. Tests inject a fake clock. */
 export type Schedule = (callback: () => void, ms: number) => () => void
+/**
+ * How a call that already timed out settled afterwards: `ok` false when it rejected, and `value`
+ * what it resolved with (a write that stored answers `true`) or the error.
+ */
+export type LateAnswer = (ok: boolean, value: unknown) => void
 
 export interface BridgeQueueOptions {
   /** True once the reader is disposed: calls not yet started reject without reaching the bridge. */
   closed(): boolean
   /** A screen call (render or exit) failed or timed out. Never called for superseded renders. */
   onScreenError?(error: unknown, label: BridgeCallLabel): void
-  /** A call that already timed out settled afterwards: its native effect may have landed late. */
-  onLate?(kind: BridgeCallKind, label: BridgeCallLabel): void
+  /**
+   * A call that already timed out settled afterwards: its native effect may have landed late
+   * (`ok` and `value` as in LateAnswer; a late refusal or rejection changed nothing).
+   */
+  onLate?(kind: BridgeCallKind, label: BridgeCallLabel, ok: boolean, value: unknown): void
   schedule?: Schedule
 }
 
@@ -197,8 +205,9 @@ export interface BridgeQueue {
   /**
    * Run one bridge call after every earlier one settled (or timed out), bounded by `ms`
    * (Infinity: no bound for the whole call; each native call inside it is bounded with `call`).
+   * `onLate` hears how this call settled when it answers after its timeout (before onLate).
    */
-  run<T>(kind: BridgeCallKind, ms: number, operation: BridgeOperation<T>, label?: BridgeCallLabel): Promise<T>
+  run<T>(kind: BridgeCallKind, ms: number, operation: BridgeOperation<T>, label?: BridgeCallLabel, onLate?: LateAnswer): Promise<T>
   /**
    * One native call inside a running operation (it does not wait for the queue), bounded by `ms` on
    * its own. A timeout rejects with BridgeTimeoutError; a late answer is reported through onLate.
@@ -235,11 +244,12 @@ export function createBridgeQueue(options: BridgeQueueOptions): BridgeQueue {
   let tail: Promise<unknown> = Promise.resolve()
   let waiting: { operation: BridgeOperation<void>; resolve(): void; reject(error: unknown): void } | null = null
 
-  function late(kind: BridgeCallKind, label: BridgeCallLabel) {
-    try { options.onLate?.(kind, label) } catch { /* Observer errors are isolated. */ }
+  function late(kind: BridgeCallKind, label: BridgeCallLabel, ok: boolean, value: unknown, own?: LateAnswer) {
+    try { own?.(ok, value) } catch { /* Observer errors are isolated. */ }
+    try { options.onLate?.(kind, label, ok, value) } catch { /* Observer errors are isolated. */ }
   }
 
-  function bounded<T>(kind: BridgeCallKind, ms: number, operation: BridgeOperation<T>, label: BridgeCallLabel): Promise<T> {
+  function bounded<T>(kind: BridgeCallKind, ms: number, operation: BridgeOperation<T>, label: BridgeCallLabel, own?: LateAnswer): Promise<T> {
     return new Promise<T>((resolve, reject) => {
       let settled = false
       let timedOut = false
@@ -257,7 +267,7 @@ export function createBridgeQueue(options: BridgeQueueOptions): BridgeQueue {
       }
       const finish = (ok: boolean, value: unknown) => {
         if (settled) {
-          if (timedOut) late(kind, label)
+          if (timedOut) late(kind, label, ok, value, own)
           return
         }
         settled = true
@@ -269,10 +279,10 @@ export function createBridgeQueue(options: BridgeQueueOptions): BridgeQueue {
     })
   }
 
-  function run<T>(kind: BridgeCallKind, ms: number, operation: BridgeOperation<T>, label: BridgeCallLabel = kind): Promise<T> {
+  function run<T>(kind: BridgeCallKind, ms: number, operation: BridgeOperation<T>, label: BridgeCallLabel = kind, onLate?: LateAnswer): Promise<T> {
     const result = tail.then(() => {
       if (options.closed()) throw new Error('The G2 reader is closed.')
-      return bounded(kind, ms, operation, label)
+      return bounded(kind, ms, operation, label, onLate)
     })
     // Keep a fulfilled tail while the caller gets the rejection: a failed or
     // hung call must never block later page turns.
@@ -374,9 +384,19 @@ export interface Display {
   /**
    * A screen call that timed out landed after all and may have overwritten a newer field. Forget
    * the display and send the newest frame again, once per frame. A late exit dialog is never drawn
-   * over: the next frame the controller asks for resends every field.
+   * over, nor is one asked for (exitRequested): the next frame the app renders resends every field.
    */
   late(label: BridgeCallLabel): void
+  /**
+   * The exit dialog (shutDownPageContainer) was asked for: until the app renders again, a late
+   * answer only forgets the display and never sends a frame, which would land over the dialog.
+   */
+  exitRequested(): void
+  /**
+   * An exit asked for was refused (its dialog never opened): unless another exit is still asked
+   * for, late answers may send the newest frame again. Not called on a timeout (the dialog may open).
+   */
+  exitFailed(): void
   /** Fields known to be on the display (diagnostics and tests). */
   shown(): Partial<GlassesPage>
 }
@@ -392,6 +412,8 @@ export function createDisplay(options: DisplayOptions): Display {
   let wanted: GlassesPage | null = null
   /** The frame a late answer already re-sent: one late redraw per frame, so a slow link cannot loop. */
   let lateRetried: GlassesPage | null = null
+  /** Exit dialogs asked for and not refused since the app last rendered: late answers send nothing. */
+  let exiting = 0
 
   function invalidate() {
     epoch += 1
@@ -429,7 +451,7 @@ export function createDisplay(options: DisplayOptions): Display {
     try { options.onFrame?.(page === wanted) } catch { /* Observer errors are isolated. */ }
   }
 
-  function render(page: GlassesPage): Promise<void> {
+  function send(page: GlassesPage): Promise<void> {
     wanted = page
     return queue.render(Infinity, live => write(page, live))
   }
@@ -440,13 +462,22 @@ export function createDisplay(options: DisplayOptions): Display {
       known = { ...page }
       wanted = page
     },
-    render,
+    render(page) {
+      exiting = 0 // The app draws again (for example the wearer cancelled the exit dialog).
+      return send(page)
+    },
     invalidate,
     late(label) {
       invalidate()
-      if (label === 'exit' || !wanted || queue.renderPending() || lateRetried === wanted) return
+      if (exiting > 0 || label === 'exit' || !wanted || queue.renderPending() || lateRetried === wanted) return
       lateRetried = wanted
-      render(wanted).catch(() => undefined)
+      send(wanted).catch(() => undefined)
+    },
+    exitRequested() {
+      exiting += 1
+    },
+    exitFailed() {
+      exiting = Math.max(0, exiting - 1)
     },
     shown: () => ({ ...known }),
   }
