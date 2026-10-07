@@ -2,9 +2,9 @@ import { test } from 'node:test'
 import assert from 'node:assert/strict'
 import { LIMITS, defaultSettings, emptyState, type Position, type PostRef, type Publication } from '../../src/app/types'
 import {
-  KEYS, MAX_KEY_CHARS, SAVE_DEBOUNCE_MS, addPublication, addSaved, browserKV, bridgeKV, clearReading, createStore,
+  KEYS, MAX_KEY_CHARS, SAVE_DEBOUNCE_MS, SYNC_KEY, addPublication, addSaved, browserKV, bridgeKV, clearReading, createStore,
   markRead, mergePrefs, mergeProgress, mirroredKV, normalizePrefs, normalizeProgress, prefsFit, recordHistory,
-  recordPosition, refKey, rehostPost, rehostPublication, reorderItem, serializePrefs, serializeProgress,
+  recordPosition, refKey, rehostPost, rehostPublication, removeSaved, reorderItem, serializePrefs, serializeProgress,
   type AddResult, type KV,
 } from '../../src/storage'
 import { flushPromises, installLocalStorage } from './helpers'
@@ -423,7 +423,9 @@ test('attachBridge adopts the bridge library when the browser copy was lost, and
 
 test('a failed bridge read writes nothing and keeps the browser copy in charge; a later attach merges', async () => {
   const scheduler = fakeScheduler()
-  const local = memoryKV('localStorage')
+  // The browser copy was lost (a stray sync stamp without its documents means nothing), so the
+  // bridge may hold anything this session never saw: the copies are united, never replaced.
+  const local = memoryKV('localStorage', { [SYNC_KEY]: JSON.stringify({ prefs: 800, progress: 700 }) })
   const bridge = memoryKV('bridge', { [KEYS.prefs]: BRIDGE_PREFS, [KEYS.progress]: BRIDGE_PROGRESS })
   let failReads = 1
   const flaky: KV = {
@@ -461,6 +463,8 @@ test('a failed bridge read writes nothing and keeps the browser copy in charge; 
   assert.equal(store.state.settings.linesPerPage, 5, 'Default settings in the browser copy never override chosen ones.')
   assert.equal(store.state.lastOpen?.postId, 5)
   assert.equal(store.backend(), 'bridge+localStorage')
+  assert.deepEqual(JSON.parse(local.data.get(SYNC_KEY)!), { prefs: 3_001, progress: 700 },
+    'the browser copy now matches the bridge: the merged prefs written to both, the adopted progress')
 })
 
 test('phone edits made before the bridge arrived are merged into the bridge library, never replace it', async () => {
@@ -496,17 +500,158 @@ test('attaching never writes the pristine defaults, and copies already in sync n
   fresh.save('prefs')
   assert.equal(await fresh.flush(), true)
   assert.deepEqual(bridge.writes.map(([key]) => key), [KEYS.prefs])
-  assert.deepEqual(local.writes.map(([key]) => key), [KEYS.prefs])
+  assert.deepEqual(local.writes.map(([key]) => key), [KEYS.prefs, SYNC_KEY], 'the sync stamp stays in the browser copy')
+  assert.deepEqual(JSON.parse(local.data.get(SYNC_KEY)!), { prefs: 5_000, progress: -1 })
 
-  // The usual relaunch: both copies hold the same documents.
+  // The usual relaunch: both copies hold the same documents (this browser copy has no sync stamp yet).
   const synced = memoryKV('localStorage', Object.fromEntries(bridge.data))
   const again = createStore({ now: () => 6_000, schedule: scheduler.schedule })
   await again.load(synced.kv)
   const before = bridge.writes.length
   assert.equal(await again.attachBridge(bridge.kv), false)
   assert.equal(bridge.writes.length, before)
-  assert.equal(synced.writes.length, 0)
+  assert.deepEqual(synced.writes.map(([key]) => key), [SYNC_KEY], 'no document is written; only the sync stamp is recorded')
   assert.deepEqual(hosts(again.state.publications), ['first.substack.com'])
+  // And the next relaunch writes nothing at all.
+  const third = createStore({ now: () => 7_000, schedule: scheduler.schedule })
+  await third.load(synced.kv)
+  assert.equal(await third.attachBridge(bridge.kv), false)
+  assert.equal(bridge.writes.length, before)
+  assert.equal(synced.writes.length, 1)
+  assert.equal(third.pending(), false)
+})
+
+test('removals, Clear reading and Reset settings made while the bridge write failed stick at the next attach', async () => {
+  const scheduler = fakeScheduler()
+  let clock = 2_000
+  const bridge = memoryKV('bridge', { [KEYS.prefs]: BRIDGE_PREFS, [KEYS.progress]: BRIDGE_PROGRESS })
+  const local = memoryKV('localStorage', { [KEYS.prefs]: BRIDGE_PREFS, [KEYS.progress]: BRIDGE_PROGRESS })
+  const first = createStore({ now: () => clock, schedule: scheduler.schedule })
+  await first.load(local.kv)
+  assert.equal(await first.attachBridge(bridge.kv), false, 'both copies hold the same documents')
+  assert.deepEqual(bridge.writes, [])
+  assert.deepEqual(JSON.parse(local.data.get(SYNC_KEY)!), { prefs: 800, progress: 700 })
+  // The user removes the saved post, clears reading and resets settings; the app closes before the
+  // bridge write lands (it timed out, or the exit cut it off). Only the browser copy has the edits.
+  assert.equal(removeSaved(first.state, ref(5)), true)
+  clearReading(first.state)
+  first.state.settings = defaultSettings()
+  clock = 3_000
+  first.save()
+  bridge.failWrites(true)
+  assert.equal(await first.flush(), false)
+  assert.equal(JSON.parse(local.data.get(KEYS.prefs)!).savedAt, 3_000)
+  assert.deepEqual(JSON.parse(local.data.get(SYNC_KEY)!), { prefs: 800, progress: 700 }, 'a failed bridge write moves no stamp')
+
+  bridge.failWrites(false)
+  clock = 4_000
+  const next = createStore({ now: () => clock, schedule: scheduler.schedule })
+  await next.load(local.kv)
+  assert.equal(await next.attachBridge(bridge.kv), false, 'the bridge copy holds nothing new: memory is kept as a whole')
+  assert.deepEqual(next.state.saved, [])
+  assert.deepEqual(next.state.settings, defaultSettings())
+  assert.deepEqual(hosts(next.state.publications), ['bridge.substack.com'])
+  assert.deepEqual([next.state.positions, next.state.history, next.state.read, next.state.lastOpen], [[], [], [], null])
+  const prefs = JSON.parse(bridge.data.get(KEYS.prefs)!)
+  const progress = JSON.parse(bridge.data.get(KEYS.progress)!)
+  assert.deepEqual(prefs.saved, [], 'the removal is written to the bridge')
+  assert.equal(prefs.settings.linesPerPage, defaultSettings().linesPerPage)
+  assert.deepEqual([progress.read, progress.history, progress.lastOpen], [[], [], null])
+  assert.equal(prefs.savedAt, 4_000)
+  assert.deepEqual(JSON.parse(local.data.get(SYNC_KEY)!), { prefs: 4_000, progress: 4_000 })
+  assert.equal(next.pending(), false)
+})
+
+test('a removal made while the mirror is ahead of the bridge is not undone by the attach', async () => {
+  const scheduler = fakeScheduler()
+  const x = { host: 'x.substack.com' }
+  const y = { host: 'y.substack.com' }
+  const bridge = memoryKV('bridge', {
+    [KEYS.prefs]: JSON.stringify({ schemaVersion: 1, savedAt: 1_000, publications: [x, y], saved: [], settings: {} }),
+  })
+  const local = memoryKV('localStorage', {
+    [KEYS.prefs]: JSON.stringify({ schemaVersion: 1, savedAt: 2_000, publications: [y], saved: [], settings: {} }),
+    [SYNC_KEY]: JSON.stringify({ prefs: 1_000, progress: -1 }),
+  })
+  const store = createStore({ now: () => 3_000, schedule: scheduler.schedule })
+  await store.load(local.kv)
+  assert.equal(await store.attachBridge(bridge.kv), false)
+  assert.deepEqual(hosts(store.state.publications), ['y.substack.com'], 'x stays removed')
+  for (const backend of [bridge, local]) {
+    const prefs = JSON.parse(backend.data.get(KEYS.prefs)!)
+    assert.deepEqual(hosts(prefs.publications), ['y.substack.com'])
+    assert.equal(prefs.savedAt, 3_000)
+  }
+  assert.deepEqual(JSON.parse(local.data.get(SYNC_KEY)!), { prefs: 3_000, progress: -1 })
+  assert.equal(bridge.data.has(KEYS.progress), false, 'the pristine progress defaults are never written')
+})
+
+test('a bridge write that lands late is followed by a rewrite of the newest documents', async () => {
+  const scheduler = fakeScheduler()
+  let clock = 2_000
+  const bridge = memoryKV('bridge', { [KEYS.prefs]: BRIDGE_PREFS, [KEYS.progress]: BRIDGE_PROGRESS })
+  const local = memoryKV('localStorage', { [KEYS.prefs]: BRIDGE_PREFS, [KEYS.progress]: BRIDGE_PROGRESS })
+  const store = createStore({ now: () => clock, schedule: scheduler.schedule })
+  await store.load(local.kv)
+  store.resync()
+  assert.equal(store.pending(), false, 'nothing to rewrite before the bridge is attached')
+  assert.equal(await store.attachBridge(bridge.kv), false)
+  clock = 3_000
+  store.state.publications.push(publication('y.substack.com'))
+  store.save('prefs')
+  assert.equal(await store.flush(), true)
+  // An older write that had timed out lands now and replaces the newer bridge document.
+  bridge.data.set(KEYS.prefs, BRIDGE_PREFS)
+  clock = 4_000
+  store.resync()
+  assert.equal(store.pending(), true)
+  scheduler.advance(SAVE_DEBOUNCE_MS)
+  await flushPromises()
+  const prefs = JSON.parse(bridge.data.get(KEYS.prefs)!)
+  assert.deepEqual(hosts(prefs.publications), ['bridge.substack.com', 'y.substack.com'])
+  assert.equal(prefs.savedAt, 4_000)
+  assert.equal(JSON.parse(bridge.data.get(KEYS.progress)!).savedAt, 4_000)
+  assert.equal(store.pending(), false)
+})
+
+test('united copies that would not fit 48k drop what only the older copy had, never the newer copy\'s items', async () => {
+  const big = (id: number) => ref(id, { slug: 's'.repeat(200), title: 'T'.repeat(200), pubName: 'P'.repeat(120) })
+  const fits = (doc: object) => JSON.stringify({ ...doc, savedAt: Number.MAX_SAFE_INTEGER }).length <= MAX_KEY_CHARS
+  const newer = normalizePrefs({ savedAt: 20, saved: Array.from({ length: 60 }, (_, index) => big(index + 1)) })
+  const older = normalizePrefs({ savedAt: 10, publications: [{ host: 'a.substack.com' }], saved: Array.from({ length: 60 }, (_, index) => big(index + 101)) })
+  assert.ok(fits(newer) && fits(older), 'each copy fits on its own')
+  const merged = mergePrefs(newer, older)
+  assert.ok(fits(merged))
+  const ids = merged.saved.map(item => item.postId)
+  assert.deepEqual(ids.slice(0, 60), Array.from({ length: 60 }, (_, index) => index + 1), 'the newer copy keeps every item')
+  assert.ok(ids.length > 60 && ids.length < LIMITS.saved, `${ids.length}`)
+  assert.deepEqual(ids.slice(60), Array.from({ length: ids.length - 60 }, (_, index) => index + 101), 'the older copy loses its last items')
+  assert.ok(!fits({ ...merged, saved: [...merged.saved, big(101 + ids.length - 60)] }), 'no more than needed is dropped')
+  assert.deepEqual(hosts(merged.publications), ['a.substack.com'])
+
+  // At attach, the trimmed union is stored, so later saves keep working.
+  const scheduler = fakeScheduler()
+  const bridge = memoryKV('bridge', { [KEYS.prefs]: JSON.stringify({ ...older, savedAt: 800 }) })
+  const local = memoryKV('localStorage', { [KEYS.prefs]: JSON.stringify({ ...newer, savedAt: 900 }) })
+  const store = createStore({ now: () => 2_000, schedule: scheduler.schedule })
+  await store.load(local.kv)
+  assert.equal(await store.attachBridge(bridge.kv), true)
+  assert.equal(store.lastSaveOk(), true)
+  assert.ok(prefsFit(store.state))
+  const stored = JSON.parse(bridge.data.get(KEYS.prefs)!)
+  assert.equal(stored.savedAt, 2_000)
+  assert.deepEqual(stored.saved.map((item: PostRef) => item.postId), ids)
+})
+
+test('one setting changed on an otherwise default copy keeps every other setting chosen in the older copy', () => {
+  const newer = normalizePrefs({ savedAt: 20, settings: { linesPerPage: 6 } })
+  const older = normalizePrefs({
+    savedAt: 10,
+    settings: { linesPerPage: 5, invertSwipe: true, footnotes: 'inline', homeItems: ['history', 'saved'], latestMaxPublications: 12 },
+  })
+  assert.deepEqual(mergePrefs(newer, older).settings, {
+    ...defaultSettings(), linesPerPage: 6, invertSwipe: true, footnotes: 'inline', homeItems: ['history', 'saved'], latestMaxPublications: 12,
+  })
 })
 
 test('merging keeps the newest position per post, unites lists and never lets default settings win', () => {

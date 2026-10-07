@@ -115,10 +115,15 @@ const MAX_BUCKETS = 10_000
 const MAX_VERDICTS = 2_000
 const VERDICT_PASS_MS = 24 * 3_600_000
 const VERDICT_FAIL_MS = 3_600_000
-/** S3: a host with no addresses fails without a proof fetch; short, so a new domain recovers quickly. */
-const VERDICT_NO_ADDRESS_MS = 600_000
+/**
+ * S3, Y3: nothing serves the host (no addresses; or definitive DNS and no HTTPS answer: refused,
+ * TLS error, Cloudflare 530); short, so a new domain recovers quickly.
+ */
+const VERDICT_NO_SERVER_MS = 600_000
 /** S6: an inconclusive check is remembered in memory only, briefly. */
 const VERDICT_UNKNOWN_MS = 60_000
+/** Y1: the host refused the proof without Substack's fingerprint; not Substack, but kept as briefly as 'unknown'. */
+const VERDICT_REFUSED_MS = VERDICT_UNKNOWN_MS
 const TARGET_IPS_MS = 3_600_000
 /** S2: at most one round of health probes per isolate per minute. */
 const PROBE_MEMO_MS = 60_000
@@ -714,6 +719,8 @@ type Verdict = 'pass' | 'fail' | 'unknown'
 interface Outcome {
   verdict: Verdict
   blocked?: RelayUpstreamInfo
+  /** A mapping proof's 'fail' kept shorter than VERDICT_FAIL_MS (Y1, Y3). */
+  ttlMs?: number
 }
 
 /** A verdict remembered in isolate memory ('unknown' only briefly). */
@@ -742,6 +749,12 @@ interface Call {
 }
 
 const UNKNOWN: Outcome = { verdict: 'unknown' }
+const NO_SERVER: Outcome = { verdict: 'fail', ttlMs: VERDICT_NO_SERVER_MS }
+const REFUSED: Outcome = { verdict: 'fail', ttlMs: VERDICT_REFUSED_MS }
+
+function refusal(response: Response, info: RelayUpstreamInfo): boolean {
+  return info.challenge || response.status === 401 || response.status === 403
+}
 
 /**
  * S5: an answer that proves nothing about the host. 429 and 5xx are outages; 401, 403 and
@@ -749,7 +762,21 @@ const UNKNOWN: Outcome = { verdict: 'unknown' }
  */
 function inconclusive(response: Response): Outcome | null {
   const info = describe(response)
-  if (info.challenge || response.status === 401 || response.status === 403) return { verdict: 'unknown', blocked: info }
+  if (refusal(response, info)) return { verdict: 'unknown', blocked: info }
+  return response.status === 429 || response.status >= 500 ? UNKNOWN : null
+}
+
+/**
+ * The host's own answer to the proof's first request, before anything ties it to Substack. Y1:
+ * only a fingerprinted refusal is Substack's (S5); an unmarked 401, 403 or challenge comes from
+ * whatever else serves the host (its own WAF), so it is a brief fail and the phone tries www.
+ * Y3: an unmarked 530 is a Cloudflare zone with no origin. Other 429 and 5xx stay outages (a
+ * genuine domain proxied through its owner's zone shows unmarked 52x while Substack is down).
+ */
+function firstAnswer(response: Response): Outcome | null {
+  if (fingerprinted(response)) return inconclusive(response)
+  if (refusal(response, describe(response))) return REFUSED
+  if (response.status === 530) return NO_SERVER
   return response.status === 429 || response.status >= 500 ? UNKNOWN : null
 }
 
@@ -866,6 +893,10 @@ export function createRelay(options: RelayOptions = {}): Relay {
   const perMinute = Math.max(1, Math.floor(options.rateLimitPerMinute ?? RATE_LIMIT_PER_MINUTE))
   const strictPerMinute = Math.max(1, Math.floor(options.strictRateLimitPerMinute ?? STRICT_RATE_LIMIT_PER_MINUTE))
   const buckets = new Map<string, { units: number; at: number }>()
+  /** Y2: strict 'verify' tokens that passing proofs gave back, per client key. */
+  const credits = new Map<string, number>()
+  /** Y2: passes apart from fail/unknown, so a stream of cheap failures never evicts them. */
+  const passes = new Map<string, MemoVerdict>()
   const verdicts = new Map<string, MemoVerdict>()
   const pendingVerdicts = new Map<string, Promise<Outcome>>()
   let targetIps: { ips: string[]; expires: number } | null = null
@@ -974,6 +1005,31 @@ export function createRelay(options: RelayOptions = {}): Relay {
     if (wait > 0) throw new RelayFailure('RATE_LIMITED', { retryAfterSeconds: wait })
   }
 
+  /**
+   * Y2: a mapping proof takes its strict 'verify' token before it runs, so a burst of proofs is
+   * bounded by the budget, and returns a refund for a proof that passes: a credit (at most a
+   * budget's worth) that pays for the client's next proof, because the RL_STRICT binding cannot
+   * give a token back. Only proofs that fail or prove nothing cost budget, so verifying many
+   * genuine custom domains on a cold isolate (whose Cache API may store nothing on workers.dev)
+   * is never limited.
+   */
+  async function reserveProof(call: Call): Promise<() => void> {
+    const key = `${clientKey(call.request)}:verify`
+    const credit = credits.get(key) ?? 0
+    if (credit > 1) credits.set(key, credit - 1)
+    else if (credit === 1) credits.delete(key)
+    else await rateLimit('verify', call, true)
+    return () => {
+      const kept = credits.get(key) ?? 0
+      credits.delete(key)
+      if (credits.size >= MAX_BUCKETS) {
+        const oldest = credits.keys().next()
+        if (!oldest.done) credits.delete(oldest.value)
+      }
+      credits.set(key, Math.min(strictPerMinute, kept + 1))
+    }
+  }
+
   /* ---------- host verification (C4) */
 
   async function dohQuery(name: string, type: 'CNAME' | 'A' | 'AAAA'): Promise<DnsRecord[] | null> {
@@ -1010,7 +1066,9 @@ export function createRelay(options: RelayOptions = {}): Relay {
 
   /**
    * C4(c): the host serves Substack JSON naming publication S, and S.substack.com redirects to the
-   * host. S5: a refusal (401, 403, challenge) or an outage is 'unknown', never a cached 'fail'.
+   * host. S5: Substack refusing (401, 403, challenge) or an outage is 'unknown', never a cached
+   * 'fail'. Y1, Y3: the host's own unmarked refusal, a connection or TLS error (not a timeout) and
+   * an unmarked 530 are short fails; runChecks makes them 'unknown' unless DNS was definitive.
    */
   async function mappingProof(host: string): Promise<Outcome> {
     const fail: Outcome = { verdict: 'fail' }
@@ -1020,9 +1078,9 @@ export function createRelay(options: RelayOptions = {}): Relay {
       try {
         first = await get(`https://${host}/api/v1/archive?sort=new&offset=0&limit=1`, ACCEPT_JSON, clock.signal)
       } catch {
-        return UNKNOWN
+        return clock.expired() ? UNKNOWN : NO_SERVER
       }
-      const refused = inconclusive(first)
+      const refused = firstAnswer(first)
       if (refused || first.status !== 200 || !fingerprinted(first) || contentTypeOf(first) !== 'application/json') {
         await discard(first)
         return refused ?? fail
@@ -1062,38 +1120,57 @@ export function createRelay(options: RelayOptions = {}): Relay {
    * C4 checks, cheapest first: (a) CNAME to the target; (b) a CNAME chain in the A answer that
    * ends at the target, or apex flattening (the host's A/AAAA records intersect the target's);
    * (c) the mapping proof. S3: definitive but empty A and AAAA answers mean nothing can serve the
-   * host, so it fails without any request to it. S6: the proof, the only request to a
-   * caller-chosen host, first takes a token from the caller's strict budget (`admit` throws
-   * RATE_LIMITED, and nothing is remembered).
+   * host, so it fails without any request to it. S6, Y2: the proof, the only request to a
+   * caller-chosen host, first takes a token from the caller's strict budget (RATE_LIMITED, and
+   * nothing is remembered); a proof that passes gives it back. Without definitive DNS (a lookup
+   * failed), a proof that did not pass is inconclusive: the host may be Substack's after all.
    */
-  async function runChecks(host: string, admit: () => Promise<void>): Promise<Checked> {
+  async function runChecks(host: string, call: Call): Promise<Checked> {
     const cname = await dohQuery(host, 'CNAME')
     if (cname !== null && pointsAtTarget(cname)) return { verdict: 'pass', ttlMs: VERDICT_PASS_MS }
     const [a, aaaa, target] = await Promise.all([dohQuery(host, 'A'), dohQuery(host, 'AAAA'), targetAddresses()])
     const records = [...(a ?? []), ...(aaaa ?? [])]
     const hostIps = new Set(addresses(records))
     if (pointsAtTarget(records) || (target !== null && target.some(ip => hostIps.has(ip)))) return { verdict: 'pass', ttlMs: VERDICT_PASS_MS }
-    if (a !== null && aaaa !== null && hostIps.size === 0) return { verdict: 'fail', ttlMs: VERDICT_NO_ADDRESS_MS }
-    await admit()
+    if (a !== null && aaaa !== null && hostIps.size === 0) return { verdict: 'fail', ttlMs: VERDICT_NO_SERVER_MS }
+    const refund = await reserveProof(call)
     const proof = await mappingProof(host)
-    if (proof.verdict === 'pass') return { verdict: 'pass', ttlMs: VERDICT_PASS_MS }
+    if (proof.verdict === 'pass') {
+      refund()
+      return { verdict: 'pass', ttlMs: VERDICT_PASS_MS }
+    }
     if (proof.verdict === 'unknown' || cname === null || a === null || aaaa === null || target === null) {
       return { ...proof, verdict: 'unknown', ttlMs: VERDICT_UNKNOWN_MS }
     }
-    return { verdict: 'fail', ttlMs: VERDICT_FAIL_MS }
+    return { verdict: 'fail', ttlMs: proof.ttlMs ?? VERDICT_FAIL_MS }
   }
 
   function verdictKey(host: string, cacheNs: string): string {
     return `${cacheNs}/host-verdict?host=${host}`
   }
 
-  function remember(host: string, memo: MemoVerdict): void {
-    verdicts.delete(host)
-    if (verdicts.size >= MAX_VERDICTS) {
-      const oldest = verdicts.keys().next()
-      if (!oldest.done) verdicts.delete(oldest.value)
+  /** Y2: a live remembered verdict, moved to most recently used (eviction is LRU). */
+  function memoOf(host: string): MemoVerdict | null {
+    for (const memos of [passes, verdicts]) {
+      const memo = memos.get(host)
+      if (!memo) continue
+      memos.delete(host)
+      if (memo.expires <= now()) return null
+      memos.set(host, memo)
+      return memo
     }
-    verdicts.set(host, memo)
+    return null
+  }
+
+  function remember(host: string, memo: MemoVerdict): void {
+    passes.delete(host)
+    verdicts.delete(host)
+    const memos = memo.verdict === 'pass' ? passes : verdicts
+    if (memos.size >= MAX_VERDICTS) {
+      const oldest = memos.keys().next()
+      if (!oldest.done) memos.delete(oldest.value)
+    }
+    memos.set(host, memo)
   }
 
   /** S4: an entry that claims to live longer than the relay ever stores one is not the relay's. */
@@ -1129,21 +1206,30 @@ export function createRelay(options: RelayOptions = {}): Relay {
   }
 
   /**
-   * Remembered per host: pass 24 h, fail 1 h (10 min for a host without addresses) in memory and
-   * the Cache API; 'unknown' (lookup outage, Substack refusing the proof) 60 s in memory only.
+   * Remembered per host: pass 24 h, fail 1 h (10 min when nothing serves the host, 60 s when it
+   * refused the proof itself) in memory and the Cache API; 'unknown' (lookup outage, Substack
+   * refusing the proof) 60 s in memory only. Concurrent callers share one verification.
    */
   async function verifyCustomDomain(host: string, call: Call): Promise<Outcome> {
-    const memo = verdicts.get(host)
-    if (memo && memo.expires > now()) return memo
+    const memo = memoOf(host)
+    if (memo) return memo
     const pending = pendingVerdicts.get(host)
-    if (pending) return pending
+    // Y4: a shared verification spends its starter's strict budget. A waiter never inherits that
+    // RATE_LIMITED: it retries under its own budget. Bounded: the starter's `finally` has already
+    // run, so the retry starts its own verification or joins one another waiter started just now.
+    if (pending) {
+      return pending.catch(error => {
+        if (error instanceof RelayFailure && error.code === 'RATE_LIMITED') return verifyCustomDomain(host, call)
+        throw error
+      })
+    }
     const work = (async (): Promise<Outcome> => {
       const stored = await storedVerdict(host, call.cacheNs)
       if (stored) {
         remember(host, stored)
         return stored
       }
-      const checked = await runChecks(host, () => rateLimit('verify', call, true))
+      const checked = await runChecks(host, call)
       const expires = now() + checked.ttlMs
       if (checked.verdict === 'unknown') {
         const unknown: MemoVerdict = checked.blocked ? { verdict: 'unknown', blocked: checked.blocked, expires } : { verdict: 'unknown', expires }
@@ -1158,7 +1244,7 @@ export function createRelay(options: RelayOptions = {}): Relay {
     try {
       return await work
     } finally {
-      pendingVerdicts.delete(host)
+      if (pendingVerdicts.get(host) === work) pendingVerdicts.delete(host)
     }
   }
 

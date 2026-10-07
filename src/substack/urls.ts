@@ -25,7 +25,7 @@ export const MAX_PASTE_CHARS = 65536
 export const MAX_LINES = 50
 export const SEARCH_MIN_CHARS = 2
 export const SEARCH_MAX_CHARS = 100
-/** parseMany: a paste of at most this many lines, exactly one with a link, is share text. */
+/** parseMany: a paste of at most this many lines, exactly one with a link, is share text as a whole. */
 export const SHARE_TEXT_MAX_LINES = 3
 /** parseMany: characters of a skipped line quoted in its reason. */
 export const SKIPPED_PREVIEW_CHARS = 40
@@ -252,21 +252,44 @@ function resultKey(parsed: ParsedInput): string | null {
 }
 
 /**
+ * Which lines of a paste are share-text decoration: plain text in a paste
+ * that also has a link, when the paste is short share text (exactly one line
+ * with a link, at most SHARE_TEXT_MAX_LINES lines), when it sits directly
+ * above a link line (a title or blurb over its link, also when several share
+ * texts are pasted together), or when it is too long to ever be a search.
+ */
+function decorationLines(lines: readonly string[]): boolean[] {
+  const links = lines.map(line => HAS_SCHEME_RE.test(line))
+  const linkCount = links.filter(Boolean).length
+  const decoration = lines.map(() => false)
+  if (!linkCount) return decoration
+  const shareText = lines.length <= SHARE_TEXT_MAX_LINES && linkCount === 1
+  let aboveLink = false
+  for (let index = lines.length - 1; index >= 0; index -= 1) {
+    const line = lines[index]!
+    if (links[index]) aboveLink = true
+    else if (!isPlainText(line)) aboveLink = false
+    else decoration[index] = shareText || aboveLink || line.replace(/\s+/g, ' ').length > SEARCH_MAX_CHARS
+  }
+  return decoration
+}
+
+/**
  * One result per non-empty line (at most MAX_LINES), duplicates removed.
- * Share text (exactly one line with a link, at most SHARE_TEXT_MAX_LINES
- * lines) carries a title or blurb next to its link: those plain-text lines
- * become `skipped` results (shown, never searched or validated). In any
- * other paste every line counts, plain text included (a search).
+ * Share-text decoration next to a link (decorationLines) becomes a `skipped`
+ * result (shown, never searched or validated). Every other line counts,
+ * plain text included (a search): a name below the last link, or in a paste
+ * without links.
  */
 export function parseMany(input: string): ParsedInput[] {
   if (typeof input !== 'string' || !input.trim()) return []
   if (input.length > MAX_PASTE_CHARS) return [invalid(INVALID_REASONS.tooLong)]
   const lines = input.split(LINE_SPLIT_RE).map(line => line.trim()).filter(Boolean)
-  const shareText = lines.length <= SHARE_TEXT_MAX_LINES && lines.filter(line => HAS_SCHEME_RE.test(line)).length === 1
+  const decoration = decorationLines(lines)
   const results: ParsedInput[] = []
   const seen = new Set<string>()
-  for (const line of lines) {
-    const parsed = shareText && isPlainText(line) ? skipped(line) : parseSubstackInput(line)
+  for (const [index, line] of lines.entries()) {
+    const parsed = decoration[index] ? skipped(line) : parseSubstackInput(line)
     const key = resultKey(parsed)
     if (key !== null) {
       if (seen.has(key)) continue

@@ -240,9 +240,9 @@ test('exported patterns', () => {
 })
 
 test('parseMany: one result per line, duplicates removed', () => {
-  // Five lines: a list, not share text, so the plain-text line is a search too.
+  // Five lines, a list: the title directly above its link is still share text (K3).
   assert.deepEqual(parseMany('Great read\nhttps://foo.substack.com/p/my-slug\n\n@thezvi\r\nwww.slowboring.com\nWWW.slowboring.com'), [
-    search('Great read'),
+    skipped('Great read'),
     post('foo.substack.com', 'my-slug'),
     handle('thezvi'),
     pub('www.slowboring.com'),
@@ -293,7 +293,7 @@ test('parseMany: text next to a single link is share text, shown as skipped (C4,
   assert.deepEqual(parseMany('Big Data: why the hype died https://foo.substack.com/p/big-data'), [post('foo.substack.com', 'big-data')])
 })
 
-test('parseMany: lists with several links or more lines search every plain-text line (P9)', () => {
+test('parseMany: lists with several links or more lines search the plain-text lines below the last link (P9)', () => {
   assert.deepEqual(parseMany('https://a.substack.com\nhttps://b.substack.com\nMatt Yglesias'), [
     pub('a.substack.com'),
     pub('b.substack.com'),
@@ -305,6 +305,40 @@ test('parseMany: lists with several links or more lines search every plain-text 
     search('Noah Smith'),
     invalid(INVALID_REASONS.searchShort),
   ])
+  // A handle or domain between a name and the links: the name is not a title over a link.
+  assert.deepEqual(parseMany('Matt Yglesias\n@thezvi\nhttps://a.substack.com\nhttps://b.substack.com'), [
+    search('Matt Yglesias'),
+    handle('thezvi'),
+    pub('a.substack.com'),
+    pub('b.substack.com'),
+  ])
+})
+
+test('parseMany: share text in longer pastes is skipped, never searched or reported as too long (K3)', () => {
+  // Two share texts copied together: each title sits directly above its link.
+  assert.deepEqual(parseMany('Why prices rose\nhttps://foo.substack.com/p/prices\n\nThe case for more housing\nhttps://bar.substack.com/p/housing'), [
+    skipped('Why prices rose'),
+    post('foo.substack.com', 'prices'),
+    skipped('The case for more housing'),
+    post('bar.substack.com', 'housing'),
+  ])
+  // A four-line share text: title, a 123-character blurb and an author line over the link.
+  const blurb = `${'word '.repeat(24)}end`
+  const preview = 'word word word word word word word word\u{2026}'
+  assert.deepEqual(parseMany(`Why prices rose\n${blurb}\nBy Writer\nhttps://foo.substack.com/p/prices`), [
+    skipped('Why prices rose'),
+    skipped(blurb, preview),
+    skipped('By Writer'),
+    post('foo.substack.com', 'prices'),
+  ])
+  // Below the last link a blurb is still too long to be a search: skipped, not a "too long" error.
+  assert.deepEqual(parseMany(`https://a.substack.com\nhttps://b.substack.com\n${blurb}`), [
+    pub('a.substack.com'),
+    pub('b.substack.com'),
+    skipped(blurb, preview),
+  ])
+  // Without any link the same line is a search that is too long.
+  assert.deepEqual(parseMany(`${blurb}\nMatt Yglesias`), [invalid(INVALID_REASONS.searchLong), search('Matt Yglesias')])
 })
 
 test('parseMany caps the number of results and the paste size', () => {

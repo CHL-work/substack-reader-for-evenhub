@@ -2,11 +2,12 @@
  * Persistence: two JSON documents (prefs, progress), each kept under
  * MAX_KEY_CHARS. Bridge storage is the source of truth once the Even app
  * bridge exists; window.localStorage is a mirror (and the only backend in a
- * plain browser). When the bridge attaches, its documents are merged with
- * memory item by item (never replaced wholesale), and a bridge key that could
- * not be read is never written. Every value read back is normalized
- * defensively; article text or HTML is never persisted (the normalizers
- * whitelist PostRef metadata fields only).
+ * plain browser). When the bridge attaches, a bridge copy the mirror already
+ * matched (SYNC_KEY) gives way to memory as a whole; one with changes the
+ * mirror never saw is merged item by item (never replaced wholesale). A
+ * bridge key that could not be read is never written. Every value read back
+ * is normalized defensively; article text or HTML is never persisted (the
+ * normalizers whitelist PostRef metadata fields only).
  */
 import type { AppState, HomeItemId, Position, PostRef, PrefsDoc, ProgressDoc, Publication, Settings } from './app/types'
 import { HOME_ITEM_IDS, LATEST_MAX_PUBLICATIONS_RANGE, LIMITS, defaultSettings, emptyState } from './app/types'
@@ -33,6 +34,13 @@ export interface StorageBridge {
 export const KEYS = { prefs: 'sr:prefs:v1', progress: 'sr:progress:v1' } as const
 export type DocName = keyof typeof KEYS
 const DOCS: readonly DocName[] = ['prefs', 'progress']
+/**
+ * Browser copy only, never bridge storage: {prefs, progress}, the bridge
+ * savedAt each browser document last matched. A bridge copy no newer than
+ * that holds nothing the browser copy has not seen, so attaching keeps the
+ * browser copy as a whole and its removals stick.
+ */
+export const SYNC_KEY = 'sr:sync:v1'
 
 /** Per-key cap (bridge values must stay below 48k characters). */
 export const MAX_KEY_CHARS = 48_000
@@ -213,6 +221,13 @@ export function savedAtOf(raw: string): number {
   return typeof value === 'number' && Number.isSafeInteger(value) && value >= 0 ? value : 0
 }
 
+/** The SYNC_KEY value; -1 (never matched) for a missing, corrupt or invalid stamp. */
+function syncStamps(raw: string): Record<DocName, number> {
+  const value = record(parseStored(raw))
+  const stamp = (item: unknown) => (typeof item === 'number' && Number.isSafeInteger(item) && item >= 0 ? item : -1)
+  return { prefs: stamp(value.prefs), progress: stamp(value.progress) }
+}
+
 // ---------------------------------------------------------------------------
 // Serialization with caps
 
@@ -370,29 +385,66 @@ function publicationKeys(item: Publication): string[] {
   return item.id === null ? [`host:${item.host}`] : [`host:${item.host}`, `id:${item.id}`]
 }
 
-function isDefaultSettings(settings: Settings): boolean {
-  return JSON.stringify(normalizeSettings(settings)) === JSON.stringify(normalizeSettings(defaultSettings()))
+const savedKeys = (item: PostRef) => [refKey(item)]
+
+/** Each setting from the newer copy, unless it still has the default there (then the older copy's). */
+function mergeSettings(newer: Settings, older: Settings): Settings {
+  const defaults = defaultSettings()
+  const merged: Record<string, unknown> = { ...newer }
+  for (const key of Object.keys(defaults) as Array<keyof Settings>) {
+    if (JSON.stringify(newer[key]) === JSON.stringify(defaults[key])) merged[key] = older[key]
+  }
+  return normalizeSettings(merged)
 }
 
 /**
- * Merge two prefs copies. Publications and saved posts are united (the newer
- * copy's order, then what only the older copy has), so a near-empty copy can
- * never wipe a library. Settings come from the newer copy unless it still has
- * the defaults. The cost: an item removed in only one copy can come back.
+ * Drop items from the end of the saved list, then of the publication list,
+ * never below `own` (the newer copy's items), until the document fits
+ * MAX_KEY_CHARS with the largest savedAt.
+ */
+function fitPrefs(doc: PrefsDoc, own: Record<'publications' | 'saved', number>): PrefsDoc {
+  const measure = () => JSON.stringify({ ...doc, savedAt: Number.MAX_SAFE_INTEGER }).length
+  let length = measure()
+  for (const field of ['saved', 'publications'] as const) {
+    const list: unknown[] = doc[field]
+    while (length > MAX_KEY_CHARS && list.length > own[field]) {
+      // Drop enough items to cover the excess, then measure exactly.
+      let excess = length - MAX_KEY_CHARS
+      while (excess > 0 && list.length > own[field]) excess -= JSON.stringify(list.pop()).length + 1
+      length = measure()
+    }
+  }
+  return doc
+}
+
+/**
+ * Merge two prefs copies when the bridge holds changes the browser copy never
+ * saw. Publications and saved posts are united (the newer copy's order, then
+ * what only the older copy has), so a near-empty copy can never wipe a
+ * library; what only the older copy had is dropped again (last first) when
+ * the union would not fit MAX_KEY_CHARS. Each setting comes from the newer
+ * copy unless it still has the default there. The cost: an item removed in
+ * only one copy can come back.
  */
 export function mergePrefs(newer: PrefsDoc, older: PrefsDoc): PrefsDoc {
-  return normalizePrefs({
+  const doc = normalizePrefs({
     savedAt: Math.max(newer.savedAt, older.savedAt),
     publications: unionBy(newer.publications, older.publications, publicationKeys, LIMITS.publications),
-    saved: unionBy(newer.saved, older.saved, item => [refKey(item)], LIMITS.saved),
-    settings: isDefaultSettings(newer.settings) ? older.settings : newer.settings,
+    saved: unionBy(newer.saved, older.saved, savedKeys, LIMITS.saved),
+    settings: mergeSettings(newer.settings, older.settings),
+  })
+  // unionBy keeps the newer copy's items first, so these counts mark where the older copy's begin.
+  return fitPrefs(doc, {
+    publications: unionBy(newer.publications, [], publicationKeys, LIMITS.publications).length,
+    saved: unionBy(newer.saved, [], savedKeys, LIMITS.saved).length,
   })
 }
 
 /**
- * Merge two progress copies: each post keeps the position with the larger
- * updatedAt; history and read ids are united (newer order first); lastOpen
- * comes from the newer copy when it has one.
+ * Merge two progress copies (when the bridge holds changes the browser copy
+ * never saw): each post keeps the position with the larger updatedAt; history
+ * and read ids are united (newer order first); lastOpen comes from the newer
+ * copy when it has one.
  */
 export function mergeProgress(newer: ProgressDoc, older: ProgressDoc): ProgressDoc {
   const positions = new Map<number, Position>()
@@ -403,7 +455,7 @@ export function mergeProgress(newer: ProgressDoc, older: ProgressDoc): ProgressD
   return normalizeProgress({
     savedAt: Math.max(newer.savedAt, older.savedAt),
     positions: [...positions.values()], // normalizeProgress sorts by updatedAt and caps.
-    history: unionBy(newer.history, older.history, item => [refKey(item)], LIMITS.history),
+    history: unionBy(newer.history, older.history, savedKeys, LIMITS.history),
     read: unionBy(newer.read, older.read, id => [String(id)], LIMITS.read),
     lastOpen: newer.lastOpen ?? older.lastOpen,
   })
@@ -437,16 +489,25 @@ export interface Store {
   flush(): Promise<boolean>
   /**
    * The Even app bridge exists: read both documents from `bridge` (the source
-   * of truth) and merge them into memory item by item (mergePrefs,
-   * mergeProgress; memory still holding the pristine defaults simply adopts
-   * the bridge copy). Then bridge + the loaded backend (as a mirror) become
-   * the backend, and only documents the bridge lacks are written to it.
+   * of truth) and bring memory together with them. Memory still holding the
+   * pristine defaults adopts the bridge copy. A bridge copy no newer than the
+   * one the browser copy last matched (SYNC_KEY) holds nothing new, so memory
+   * is kept as a whole (removals, Clear reading and Reset settings stick).
+   * Otherwise the copies are merged item by item (mergePrefs, mergeProgress).
+   * Then the bridge, with the loaded backend as a mirror, becomes the
+   * backend, and only documents the bridge lacks are written to it.
    * `onApplied(changed)` runs right after the merge, before any write.
    * Rejects when a bridge read failed or timed out, changing nothing (no
    * write, backend unchanged): try again later. Resolves true when memory
    * changed. Once attached, further calls resolve false.
    */
   attachBridge(bridge: KV, onApplied?: (changed: boolean) => void): Promise<boolean>
+  /**
+   * A bridge write that timed out landed after all and may have replaced a
+   * newer document: write every stored document again (debounced). No-op
+   * before the bridge is attached.
+   */
+  resync(): void
   /** True once attachBridge succeeded. */
   attached(): boolean
   /** True when load() found neither document (first run, or the browser copy was lost). */
@@ -473,12 +534,16 @@ export function createStore(options: StoreOptions = {}): Store {
   const changedAt: Record<DocName, number> = { prefs: 0, progress: 0 }
   const dirty: Record<DocName, boolean> = { prefs: false, progress: false }
   const size: Record<DocName, number> = { prefs: 0, progress: 0 }
-  let kv: KV | null = null
+  /** The loaded backend; once the bridge is attached, its mirror. */
+  let mirror: KV | null = null
+  /** Bridge storage (the source of truth), once attached. */
+  let primary: KV | null = null
+  /** SYNC_KEY in memory: the bridge savedAt each mirror document last matched (-1: never). */
+  const synced: Record<DocName, number> = { prefs: -1, progress: -1 }
   let cancel: (() => void) | null = null
   let chain: Promise<unknown> = Promise.resolve()
   let ok = true
   let found = false
-  let bridged = false
   let attaching: Promise<boolean> | null = null
 
   function applyPrefs(doc: PrefsDoc) {
@@ -530,6 +595,26 @@ export function createStore(options: StoreOptions = {}): Store {
     } while (current !== chain)
   }
 
+  function markDirty(names: readonly DocName[]) {
+    const stamp = now()
+    for (const name of names) {
+      dirty[name] = true
+      changedAt[name] = stamp
+    }
+    if (cancel) cancel()
+    cancel = schedule(() => {
+      cancel = null
+      void flush()
+    }, delay)
+  }
+
+  /** The mirror now holds the bridge documents with these savedAt stamps: remember it (SYNC_KEY). */
+  async function matched(stamps: ReadonlyArray<readonly [DocName, number]>): Promise<void> {
+    if (!mirror || !stamps.length) return
+    for (const [name, stamp] of stamps) synced[name] = stamp
+    await safeSet(mirror, SYNC_KEY, JSON.stringify(synced))
+  }
+
   async function attach(bridge: KV, onApplied?: (changed: boolean) => void): Promise<boolean> {
     await idle()
     // A failed read must never look like an absent key: strictGet rejects, and
@@ -537,7 +622,10 @@ export function createStore(options: StoreOptions = {}): Store {
     const raws: Record<DocName, string> = { prefs: await strictGet(bridge, KEYS.prefs), progress: await strictGet(bridge, KEYS.progress) }
     await idle() // A debounced write may have started while the bridge answered.
     let changed = false
-    const mirrorOnly: Array<[DocName, string]> = []
+    /** Bridge documents copied to the mirror as they are. */
+    const refresh: Array<{ name: DocName; raw: string; stamp: number }> = []
+    /** Documents both copies already hold: only the sync stamp moves. */
+    const inSync: Array<[DocName, number]> = []
     for (const name of DOCS) {
       const parsed = parseStored(raws[name])
       const pristine = savedAt[name] === 0 && !dirty[name]
@@ -551,15 +639,20 @@ export function createStore(options: StoreOptions = {}): Store {
         apply(name, remote)
         changed = true
         size[name] = raws[name].length
-        mirrorOnly.push([name, raws[name]])
+        refresh.push({ name, raw: raws[name], stamp: remote.savedAt })
         continue
       }
       const local = docOf(name)
-      const localNewer = localStamp(name) >= remote.savedAt
-      const [newer, older] = localNewer ? [local, remote] : [remote, local]
-      const merged = name === 'prefs'
-        ? mergePrefs(newer as PrefsDoc, older as PrefsDoc)
-        : mergeProgress(newer as ProgressDoc, older as ProgressDoc)
+      let merged = local
+      if (remote.savedAt > synced[name]) {
+        // The bridge holds changes the mirror never saw (say, the mirror was lost and then edited):
+        // unite the copies item by item. Otherwise every difference is an edit made since they last
+        // matched, removals included, and memory is kept as a whole.
+        const [newer, older] = localStamp(name) >= remote.savedAt ? [local, remote] : [remote, local]
+        merged = name === 'prefs'
+          ? mergePrefs(newer as PrefsDoc, older as PrefsDoc)
+          : mergeProgress(newer as ProgressDoc, older as ProgressDoc)
+      }
       const memoryChanged = !sameContent(merged, local)
       if (memoryChanged) {
         apply(name, merged)
@@ -567,22 +660,27 @@ export function createStore(options: StoreOptions = {}): Store {
       }
       savedAt[name] = Math.max(savedAt[name], remote.savedAt)
       if (!sameContent(merged, remote)) {
-        dirty[name] = true // The bridge lacks something: write the merged document to both.
+        dirty[name] = true // The bridge lacks something or holds a removed item: write memory to both.
       } else if (memoryChanged || dirty[name]) {
         dirty[name] = false // The bridge already has it all: refresh only the mirror.
         size[name] = raws[name].length
-        mirrorOnly.push([name, raws[name]])
+        refresh.push({ name, raw: raws[name], stamp: remote.savedAt })
+      } else if (synced[name] !== remote.savedAt) {
+        inSync.push([name, remote.savedAt])
       }
     }
-    const mirror = kv
-    kv = mirror ? mirroredKV(bridge, mirror) : bridge
-    bridged = true
+    const target = mirror
+    primary = bridge
     try { onApplied?.(changed) } catch { /* Observer errors are isolated. */ }
-    if (mirror && mirrorOnly.length) {
-      const refresh = chain.then(async () => {
-        for (const [name, raw] of mirrorOnly) await safeSet(mirror, KEYS[name], raw)
+    if (target && (refresh.length || inSync.length)) {
+      const run = chain.then(async () => {
+        const stamps = [...inSync]
+        for (const item of refresh) {
+          if (await safeSet(target, KEYS[item.name], item.raw)) stamps.push([item.name, item.stamp])
+        }
+        await matched(stamps)
       })
-      chain = refresh.catch(() => undefined)
+      chain = run.catch(() => undefined)
       await chain
     }
     if (dirty.prefs || dirty.progress) await flush()
@@ -592,9 +690,9 @@ export function createStore(options: StoreOptions = {}): Store {
   async function writeDirty(): Promise<boolean> {
     const names = DOCS.filter(name => dirty[name])
     if (!names.length) return true
-    const target = kv
-    if (!target) return false
+    if (!primary && !mirror) return false
     let success = true
+    const stamps: Array<[DocName, number]> = []
     for (const name of names) {
       dirty[name] = false
       const stamp = Math.max(now(), savedAt[name] + 1)
@@ -604,13 +702,20 @@ export function createStore(options: StoreOptions = {}): Store {
         continue
       }
       size[name] = raw.length
-      if (await safeSet(target, KEYS[name], raw)) {
+      // Both copies at once. The bridge (the source of truth) decides, or the mirror when there is none.
+      const [first, second] = await Promise.all([
+        primary ? safeSet(primary, KEYS[name], raw) : Promise.resolve(false),
+        mirror ? safeSet(mirror, KEYS[name], raw) : Promise.resolve(false),
+      ])
+      if (primary ? first : second) {
         savedAt[name] = stamp
+        if (primary && second) stamps.push([name, stamp]) // Both copies hold this document now.
       } else {
         dirty[name] = true
         success = false
       }
     }
+    await matched(stamps)
     ok = success
     try { options.onSaved?.(success) } catch { /* Observer errors are isolated. */ }
     return success
@@ -626,10 +731,16 @@ export function createStore(options: StoreOptions = {}): Store {
     return run
   }
 
+  function backendName(): string {
+    if (primary && mirror) return `${primary.name ?? 'primary'}+${mirror.name ?? 'mirror'}`
+    const only = primary ?? mirror
+    return only ? only.name ?? 'custom' : 'none'
+  }
+
   return {
     state,
     async load(source) {
-      kv = source
+      mirror = source
       const docs = await readDocs(source)
       applyPrefs(normalizePrefs(docs.prefs.value))
       applyProgress(normalizeProgress(docs.progress.value))
@@ -638,22 +749,16 @@ export function createStore(options: StoreOptions = {}): Store {
       dirty.prefs = false
       dirty.progress = false
       found = docs.prefs.value !== null || docs.progress.value !== null
+      // A stamp means something only next to the document it describes.
+      const stamps = syncStamps(await safeGet(source, SYNC_KEY))
+      for (const name of DOCS) synced[name] = docs[name].value === null ? -1 : stamps[name]
     },
     save(which) {
-      const stamp = now()
-      for (const name of which ? [which] : DOCS) {
-        dirty[name] = true
-        changedAt[name] = stamp
-      }
-      if (cancel) cancel()
-      cancel = schedule(() => {
-        cancel = null
-        void flush()
-      }, delay)
+      markDirty(which ? [which] : DOCS)
     },
     flush,
     attachBridge(bridge, onApplied) {
-      if (bridged) return Promise.resolve(false)
+      if (primary) return Promise.resolve(false)
       if (!attaching) {
         const run = attach(bridge, onApplied)
         attaching = run
@@ -662,10 +767,16 @@ export function createStore(options: StoreOptions = {}): Store {
       }
       return attaching
     },
-    attached: () => bridged,
+    resync() {
+      if (!primary) return
+      // Never the pristine defaults: only documents that were loaded, adopted or written.
+      const names = DOCS.filter(name => savedAt[name] > 0 || dirty[name])
+      if (names.length) markDirty(names)
+    },
+    attached: () => primary !== null,
     loadedEmpty: () => !found,
     lastSaveOk: () => ok,
-    backend: () => (kv ? kv.name ?? 'custom' : 'none'),
+    backend: backendName,
     sizes: () => ({ prefs: size.prefs, progress: size.progress }),
     pending: () => cancel !== null || dirty.prefs || dirty.progress,
   }

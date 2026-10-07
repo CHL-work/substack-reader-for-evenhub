@@ -109,6 +109,27 @@ function plainDns(host: string): Record<string, Handler> {
   }
 }
 
+/** An archive page whose byline names a publication with custom domain `host` and this subdomain. */
+function claimFor(host: string, subdomain: string): unknown[] {
+  return [{
+    id: 2,
+    publication_id: 77,
+    slug: 'claim',
+    publishedBylines: [{ id: 1, name: 'X', publicationUsers: [{ id: 1, publication_id: 77, publication: { id: 77, name: 'X', subdomain, custom_domain: host, custom_domain_optional: false } }] }],
+  }]
+}
+
+function hung(init: RequestInit | undefined): Promise<Response> {
+  return new Promise<Response>((_resolve, reject) => {
+    const signal = init?.signal
+    if (!signal) {
+      reject(new Error('The relay must pass an AbortSignal.'))
+      return
+    }
+    signal.addEventListener('abort', () => reject(new DOMException('The operation was aborted.', 'AbortError')), { once: true })
+  })
+}
+
 function assertCommonHeaders(res: Response): void {
   assert.equal(res.headers.get('access-control-allow-origin'), '*')
   assert.equal(res.headers.get('access-control-allow-methods'), 'GET, OPTIONS')
@@ -513,12 +534,6 @@ test('custom domains: a failed proof is HOST_NOT_SUBSTACK; lookup outages are 50
   const clock = createFakeClock(1_000_000)
   const cache = memoryCache()
   const relay = newRelay({ cache, now: clock.now })
-  const claimFor = (host: string, subdomain: string) => [{
-    id: 2,
-    publication_id: 77,
-    slug: 'claim',
-    publishedBylines: [{ id: 1, name: 'X', publicationUsers: [{ id: 1, publication_id: 77, publication: { id: 77, name: 'X', subdomain, custom_domain: host, custom_domain_optional: false } }] }],
-  }]
   const offline = (): Response => {
     throw new TypeError('network down')
   }
@@ -613,15 +628,92 @@ test('custom domains: Substack refusing the mapping proof is UPSTREAM_BLOCKED, n
     const challenged = await expectError(relay, `/v1/archive?host=${host}`, 503, 'UPSTREAM_BLOCKED')
     assert.deepEqual(challenged.error.upstream, { status: 403, contentType: 'text/html', challenge: true })
 
+    // Y1: a refusal of the first request is Substack's when it carries Substack's fingerprint.
     clock.advance(61_000)
-    first = () => html('denied', 401)
+    first = () => html('denied', 401, FINGERPRINT)
     const denied = await expectError(relay, `/v1/archive?host=${host}`, 503, 'UPSTREAM_BLOCKED')
     assert.deepEqual(denied.error.upstream, { status: 401, contentType: 'text/html', challenge: false })
+
+    clock.advance(61_000)
+    first = () => html('forbidden', 403, FINGERPRINT)
+    const forbidden = await expectError(relay, `/v1/archive?host=${host}`, 503, 'UPSTREAM_BLOCKED')
+    assert.deepEqual(forbidden.error.upstream, { status: 403, contentType: 'text/html', challenge: false })
 
     clock.advance(61_000)
     first = () => html('busy', 503)
     await expectError(relay, `/v1/archive?host=${host}`, 503, 'UPSTREAM_UNAVAILABLE')
     assert.equal([...cache.entries.keys()].some(key => key.includes(host)), false)
+  })
+})
+
+test('custom domains: the host refusing the proof without the Substack fingerprint is HOST_NOT_SUBSTACK for 60 s (Y1)', async () => {
+  const clock = createFakeClock(4_000_000)
+  const cache = memoryCache()
+  const relay = newRelay({ cache, now: clock.now })
+  // An apex behind its owner's WAF (only www is on Substack), or any other site that refuses bots.
+  const host = 'walled.example.net'
+  const stored = () => JSON.parse(cache.entries.get(`${CACHE_NS}/host-verdict?host=${host}`)?.body ?? 'null')
+  let first: () => Response = () => html('denied', 403)
+  await withUpstream({
+    ...TARGET_DNS,
+    ...plainDns(host),
+    [proofUrl(host)]: () => first(),
+  }, async () => {
+    const refused = await expectError(relay, `/v1/archive?host=${host}`, 403, 'HOST_NOT_SUBSTACK')
+    assert.equal(refused.error.upstream, undefined)
+    assert.deepEqual(stored(), { verdict: 'fail', expires: 4_000_000 + 60_000 })
+    // Remembered for the minute: no new request.
+    const calls = fetchCalls.length
+    await expectError(relay, `/v1/feed?host=${host}`, 403, 'HOST_NOT_SUBSTACK')
+    assert.equal(fetchCalls.length, calls)
+
+    clock.advance(61_000)
+    first = () => html('challenge', 403, { 'cf-mitigated': 'challenge' })
+    await expectError(relay, `/v1/archive?host=${host}`, 403, 'HOST_NOT_SUBSTACK')
+    assert.deepEqual(stored(), { verdict: 'fail', expires: 4_061_000 + 60_000 })
+
+    clock.advance(61_000)
+    first = () => html('denied', 401)
+    await expectError(relay, `/v1/archive?host=${host}`, 403, 'HOST_NOT_SUBSTACK')
+    assert.deepEqual(stored(), { verdict: 'fail', expires: 4_122_000 + 60_000 })
+    assert.equal(fetchCalls.filter(entry => entry.url === proofUrl(host)).length, 3)
+  })
+})
+
+test('custom domains: definitive DNS and no HTTPS answer fails for 10 min; a timeout or 502 stays inconclusive (Y3)', async () => {
+  const clock = createFakeClock(5_000_000)
+  const cache = memoryCache()
+  const relay = newRelay({ cache, now: clock.now, timeoutMs: 25 })
+  const parked = 'parked.example.net'
+  const noOrigin = 'noorigin.example.net'
+  const busy = 'busy.example.net'
+  const slow = 'slow.example.net'
+  const stored = (host: string) => JSON.parse(cache.entries.get(`${CACHE_NS}/host-verdict?host=${host}`)?.body ?? 'null')
+  await withUpstream({
+    ...TARGET_DNS,
+    ...plainDns(parked),
+    [proofUrl(parked)]: () => {
+      throw new TypeError('connection refused')
+    },
+    ...plainDns(noOrigin),
+    [proofUrl(noOrigin)]: () => html('origin DNS error', 530),
+    ...plainDns(busy),
+    [proofUrl(busy)]: () => html('bad gateway', 502),
+    ...plainDns(slow),
+    [proofUrl(slow)]: hung,
+  }, async () => {
+    await expectError(relay, `/v1/archive?host=${parked}`, 403, 'HOST_NOT_SUBSTACK')
+    await expectError(relay, `/v1/archive?host=${noOrigin}`, 403, 'HOST_NOT_SUBSTACK')
+    assert.deepEqual(stored(parked), { verdict: 'fail', expires: 5_000_000 + 600_000 })
+    assert.deepEqual(stored(noOrigin), { verdict: 'fail', expires: 5_000_000 + 600_000 })
+    // A domain proxied through its owner's zone shows unmarked 52x while Substack is down.
+    await expectError(relay, `/v1/archive?host=${busy}`, 503, 'UPSTREAM_UNAVAILABLE')
+    await expectError(relay, `/v1/archive?host=${slow}`, 503, 'UPSTREAM_UNAVAILABLE')
+    assert.equal(stored(busy), null)
+    assert.equal(stored(slow), null)
+    clock.advance(599_000)
+    await expectError(relay, `/v1/feed?host=${parked}`, 403, 'HOST_NOT_SUBSTACK')
+    assert.equal(fetchCalls.filter(entry => entry.url === proofUrl(parked)).length, 1, 'remembered for 10 min')
   })
 })
 
@@ -643,6 +735,86 @@ test('custom domains: mapping proofs, the only requests to caller-chosen hosts, 
     await expectOk<ArchivePage>(relay, '/v1/archive?host=cname.example.net', ip)
     await expectError(relay, `/v1/archive?host=${hosts[2]}`, 403, 'HOST_NOT_SUBSTACK', { headers: { 'CF-Connecting-IP': '203.0.113.78' }, cf: CF })
     assert.equal(fetchCalls.filter(entry => entry.url === proofUrl(hosts[2])).length, 1)
+  })
+})
+
+test('custom domains: a mapping proof that passes gives its strict token back; failing ones are still limited (Y2)', async () => {
+  const ip: CallInit = { headers: { 'CF-Connecting-IP': '203.0.113.90' }, cf: CF }
+  // Twelve genuine domains proxied through their owners' zones: only the proof can verify them.
+  const genuine = Array.from({ length: 12 }, (_value, index) => `pub${index}.example.net`)
+  const other = Array.from({ length: 11 }, (_value, index) => `other${index}.example.net`)
+  const table: Record<string, Handler> = { ...TARGET_DNS }
+  genuine.forEach((host, index) => Object.assign(table, plainDns(host), {
+    [proofUrl(host)]: () => substackJson(claimFor(host, `genuine${index}`)),
+    [proofUrl(`genuine${index}.substack.com`)]: () => redirectTo(proofUrl(host)),
+    [archiveUrl(host)]: () => substackJson([]),
+  }))
+  for (const host of other) Object.assign(table, plainDns(host), { [proofUrl(host)]: () => html('<html>not substack</html>', 200) })
+  await withUpstream(table, async () => {
+    // A cold isolate without the Cache API, 10 proofs per minute: all twelve pass.
+    const relay = newRelay({ now: createFakeClock(0).now })
+    for (const host of genuine) await expectOk<ArchivePage>(relay, `/v1/archive?host=${host}`, ip)
+    assert.equal(fetchCalls.filter(entry => /^https:\/\/genuine\d+\.substack\.com\//.test(entry.url)).length, 12, 'every domain needed the proof')
+    // The budget is whole again: ten failing proofs, then 429.
+    for (const host of other.slice(0, 10)) await expectError(relay, `/v1/archive?host=${host}`, 403, 'HOST_NOT_SUBSTACK', ip)
+    const limited = await expectError(relay, `/v1/archive?host=${other[10]}`, 429, 'RATE_LIMITED', ip)
+    assert.equal(limited.error.retryAfterSeconds, 6)
+    assert.equal(fetchCalls.some(entry => entry.url === proofUrl(other[10])), false)
+
+    // RL_STRICT cannot refund: it is asked once, and each pass leaves a credit for the next proof.
+    const strictKeys: string[] = []
+    const env: Env = {
+      RL_STRICT: {
+        async limit({ key }) {
+          strictKeys.push(key)
+          return { success: strictKeys.length === 1 }
+        },
+      },
+    }
+    const bound = newRelay({ now: createFakeClock(0).now })
+    for (const host of genuine) await expectOk<ArchivePage>(bound, `/v1/archive?host=${host}`, ip, env)
+    assert.deepEqual(strictKeys, ['203.0.113.90:verify'])
+    await expectError(bound, `/v1/archive?host=${other[0]}`, 403, 'HOST_NOT_SUBSTACK', ip, env)
+    const refused = await expectError(bound, `/v1/archive?host=${other[1]}`, 429, 'RATE_LIMITED', ip, env)
+    assert.equal(refused.error.retryAfterSeconds, 60)
+    assert.deepEqual(strictKeys, ['203.0.113.90:verify', '203.0.113.90:verify'])
+  })
+})
+
+test('custom domains: a client over its strict budget never hands its 429 to another client verifying the same host (Y4)', async () => {
+  const relay = newRelay({ now: createFakeClock(0).now, strictRateLimitPerMinute: 1 })
+  const over: CallInit = { headers: { 'CF-Connecting-IP': '203.0.113.60' }, cf: CF }
+  const fresh: CallInit = { headers: { 'CF-Connecting-IP': '203.0.113.61' }, cf: CF }
+  const spent = 'spent.example.net'
+  const host = 'shared.example.net'
+  let release: () => void = () => undefined
+  const gate = new Promise<void>(resolve => {
+    release = resolve
+  })
+  await withUpstream({
+    ...TARGET_DNS,
+    ...plainDns(spent),
+    [proofUrl(spent)]: () => html('<html>not substack</html>', 200),
+    ...plainDns(host),
+    // Holds the first verification open until the second request has joined it.
+    [dohUrl(host, 'CNAME')]: async () => {
+      await gate
+      return dns([])
+    },
+    [proofUrl(host)]: () => html('<html>not substack</html>', 200),
+  }, async () => {
+    await expectError(relay, `/v1/archive?host=${spent}`, 403, 'HOST_NOT_SUBSTACK', over)
+    const first = expectError(relay, `/v1/archive?host=${host}`, 429, 'RATE_LIMITED', over)
+    const second = expectError(relay, `/v1/feed?host=${host}`, 403, 'HOST_NOT_SUBSTACK', fresh)
+    await new Promise(resolve => setImmediate(resolve))
+    assert.equal(fetchCalls.filter(entry => entry.url === dohUrl(host, 'CNAME')).length, 1, 'the second request joined the first verification')
+    release()
+    const [limited] = await Promise.all([first, second])
+    assert.equal(limited.error.retryAfterSeconds, 60)
+    assert.equal(fetchCalls.filter(entry => entry.url === dohUrl(host, 'CNAME')).length, 2, 'the second client verified under its own budget')
+    assert.equal(fetchCalls.filter(entry => entry.url === proofUrl(host)).length, 1)
+    // The verdict it reached is shared and costs the first client nothing.
+    await expectError(relay, `/v1/archive?host=${host}`, 403, 'HOST_NOT_SUBSTACK', over)
   })
 })
 
@@ -777,16 +949,7 @@ test('responses over the route cap are UPSTREAM_TOO_LARGE, streamed or declared'
 
 test('a hung upstream answers UPSTREAM_TIMEOUT', async () => {
   const relay = newRelay({ timeoutMs: 25 })
-  await withUpstream({
-    [archiveUrl('exampleletters.substack.com')]: init => new Promise<Response>((_resolve, reject) => {
-      const signal = init?.signal
-      if (!signal) {
-        reject(new Error('The relay must pass an AbortSignal.'))
-        return
-      }
-      signal.addEventListener('abort', () => reject(new DOMException('The operation was aborted.', 'AbortError')), { once: true })
-    }),
-  }, async () => {
+  await withUpstream({ [archiveUrl('exampleletters.substack.com')]: hung }, async () => {
     const { error } = await expectError(relay, '/v1/archive?host=exampleletters.substack.com', 504, 'UPSTREAM_TIMEOUT')
     assert.equal(error.upstream, undefined)
   })

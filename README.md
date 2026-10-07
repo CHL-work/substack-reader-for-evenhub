@@ -39,7 +39,7 @@ Post HTML is converted to plain text on the phone and never inserted into the pa
 
 ## Features
 
-- **Add publications** by pasting a `*.substack.com` link, a custom domain (for example `www.slowboring.com`), a post or share link, an `@handle` (to import that person's public subscriptions), or a name to search for. Several lines are added one by one. In a short share text with a single link (up to 3 lines), the title or blurb next to the link is shown as skipped instead of being searched.
+- **Add publications** by pasting a `*.substack.com` link, a custom domain (for example `www.slowboring.com`), a post or share link, an `@handle` (to import that person's public subscriptions), or a name to search for. Several lines are added one by one. Share text is shown as skipped instead of being searched: the title or blurb directly above a link (also when several share texts are pasted together), any text next to the link in a short share text (up to 3 lines with a single link), and a line too long to search in a paste that has a link.
 - **Glasses Home:** Continue (the post you were reading), Latest (newest posts across your publications), Publications, Saved, and History. The items and their order are set on the phone.
 - **Reader:** page counter, percentage and minutes left in the footer. Reading positions are saved, so a post reopens where you stopped, including when you launch the app from the glasses menu.
 - **Gestures:** swipe to move or turn pages, tap to open or turn, double-tap to go back (and to exit from Home), plus a contextual menu (Home, Save for later, Next post, Restart post, Refresh). See [docs/glasses.md](docs/glasses.md).
@@ -56,7 +56,7 @@ Post HTML is converted to plain text on the phone and never inserted into the pa
 - No images, audio or video on the glasses, only placeholders. Podcast posts show their text, if any.
 - Article text is kept in memory only, so there is no offline reading. The Even WebView cannot use the network in the background.
 - Search uses Substack's site-wide search and may return few results for some names. Pasting a link always works.
-- Your library is kept twice: in the Even app's storage (the main copy) and in the WebView. When the two differ, for example after edits made before the Even app's storage answered, they are merged item by item so nothing is lost. The cost: a publication or saved post removed in only one copy can come back; remove it again.
+- Your library is kept twice: in the Even app's storage (the main copy) and in the WebView. The WebView remembers which version of the main copy it last matched, so edits that only reached the WebView (because the Even app's storage did not answer in time) are written back as they are, removals, "Clear reading" and "Reset settings" included. Only when the main copy holds changes the WebView never saw (for example after the WebView lost its copy) are the two merged item by item, so nothing is lost. The cost: in that case a publication or saved post removed in only one copy can come back; remove it again.
 
 ## Setup
 

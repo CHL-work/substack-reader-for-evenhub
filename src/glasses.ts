@@ -11,8 +11,10 @@ import {
   waitForEvenAppBridge,
 } from '@evenrealities/even_hub_sdk'
 import { createGestureFilter } from './input'
-import { OsEvent, SCREEN_TIMEOUT_MS, STORAGE_TIMEOUT_MS, createBridgeQueue, createLinkTracker, describeEvent, mapEvent } from './events'
-import type { GlassesAction, GlassesPage, GlassesStatus, LaunchSource, LifecycleSignal } from './events'
+import {
+  OsEvent, SCREEN_TIMEOUT_MS, STORAGE_TIMEOUT_MS, createBridgeQueue, createDisplay, createLinkTracker, describeEvent, mapEvent,
+} from './events'
+import type { Display, FrameField, GlassesAction, GlassesPage, GlassesStatus, LaunchSource, LifecycleSignal } from './events'
 import { G2_BODY_LINES, G2_LAYOUT, G2_TEXT_PADDING, bodyBox, isReaderPage, normalizeReaderText, paginate, truncateGlassesLabel } from './pagination'
 
 export { OsEvent, SupersededRenderError, describeEvent, mapEvent } from './events'
@@ -66,6 +68,17 @@ export interface GlassesOptions {
    * while the returned promise is pending (bounded to 1.5 s); then dispose().
    */
   onExit?(): void | Promise<void>
+  /**
+   * A setLocalStorage that timed out landed after all and may have replaced a
+   * newer value: write the newest documents again.
+   */
+  onStorageLate?(): void
+  /**
+   * The newest frame rendered is fully on the display, also when its render()
+   * already rejected (an update that timed out landed, and the late recovery
+   * wrote the frame): the app can stop treating the display as stale.
+   */
+  onFrameShown?(): void
 }
 
 export interface GlassesController extends GlassesStorage {
@@ -73,7 +86,9 @@ export interface GlassesController extends GlassesStorage {
    * Resolves after the frame was written. Rejects with an Error named
    * 'SupersededRenderError' when a newer render replaced it before it was
    * written (not shown; do not retry), and with any other Error when the
-   * bridge refused it or did not answer within SCREEN_TIMEOUT_MS.
+   * bridge refused it or one container update did not answer within
+   * SCREEN_TIMEOUT_MS. Only fields that differ from what the glasses are
+   * known to show are sent.
    */
   render(page: GlassesPage): Promise<void>
   /** shutDownPageContainer(1): the OS exit dialog; cancelling keeps the app usable. Waits for at most one render. */
@@ -122,12 +137,9 @@ export const MAX_BRIDGE_VALUE_CHARS = 48_000
 const EXIT_FLUSH_LIMIT_MS = 1500
 /** createStartUpPageContainer waits at most this long for onBridgeReady (bridge storage reads). */
 export const BRIDGE_READY_WAIT_MS = 1500
-/** A refused container update is tried once more after this pause (transient refusals on a busy link). */
-const UPGRADE_RETRY_MS = 150
-
-function pause(ms: number): Promise<void> {
-  return new Promise(resolve => setTimeout(resolve, ms))
-}
+/** Later bridge calls wait at most this long for createStartUpPageContainer (the page itself is awaited unbounded). */
+const CREATE_HOLD_MS = 8000
+const CONTAINER_IDS: Record<FrameField, number> = { title: 1, body: 2, footer: 3 }
 
 /** Wait for `promise` (its outcome ignored), but never longer than `ms`. */
 function settleWithin(promise: Promise<unknown>, ms: number): Promise<void> {
@@ -203,10 +215,6 @@ export async function connectGlasses(opts: GlassesOptions): Promise<GlassesContr
   let exiting = false
   let unsubscribeEvents = () => undefined as void
   let unsubscribeDevice = () => undefined as void
-  /** The last frame known to be on the display (null: unknown, resend every field). */
-  let last: GlassesPage | null = null
-  /** The newest frame asked for (sent again when a timed-out write lands late). */
-  let wanted: GlassesPage | null = null
   /** Disconnects and failed writes: the next Connected asks for a full redraw. */
   const link = createLinkTracker()
   let lastWriteAt = -Infinity
@@ -236,65 +244,48 @@ export async function connectGlasses(opts: GlassesOptions): Promise<GlassesContr
     })
   }
 
-  // One serialized chain for every bridge call, each bounded by a timeout. A
-  // failed or hung native call never blocks later page turns, exits or saves.
+  // One serialized chain for every bridge call (page creation included), each
+  // native call bounded by a timeout. A failed or hung native call never
+  // blocks later page turns, exits or saves.
   const queue = createBridgeQueue({
     closed: () => disposed,
-    onScreenError(error) {
-      last = null // The next render refreshes every field after a partial update.
+    onScreenError(error, label) {
+      // A failed frame already forgot the field it was writing; an exit may have left the dialog up or not.
+      if (label === 'exit') display.invalidate()
       link.writeFailed()
       if (!disposed) report('error', errorMessage(error))
     },
-    onLate(kind) {
-      // A write that timed out landed after all and may have overwritten a
-      // newer frame: forget the display state and send the newest frame again.
-      if (kind !== 'screen' || disposed) return
-      last = null
-      if (wanted && !queue.renderPending()) queueRender(wanted).catch(() => undefined)
+    onLate(kind, label) {
+      if (disposed) return
+      if (kind === 'screen') display.late(label)
+      else if (label === 'set') {
+        try { opts.onStorageLate?.() } catch { /* Observer errors are isolated. */ }
+      }
     },
   })
 
-  /**
-   * The reader closed or the write timed out: stop issuing bridge calls. It rejects, so a render
-   * only ever resolves once its frame was fully written (a timed-out caller already got its error).
-   */
-  function abandoned(live: () => boolean) {
-    if (!live()) throw new Error(disposed ? 'The G2 reader is closed.' : 'G2 did not answer in time.')
-  }
-
-  async function writeFrame(snapshot: GlassesPage, live: () => boolean): Promise<void> {
-    if (!isReaderPage(snapshot.body, G2_BODY_LINES)) {
-      throw new RangeError('Reader body exceeds one G2 page. Paginate the text before rendering.')
-    }
-    for (const [field, containerID] of [['body', 2], ['title', 1], ['footer', 3]] as const) {
-      abandoned(live)
-      if (last?.[field] === snapshot[field]) continue
-      // Never send textColor on upgrades, so the created brightness is kept.
-      const upgrade = () => bridge.textContainerUpgrade(new TextContainerUpgrade({
-        containerID,
-        containerName: field,
-        content: snapshot[field] || ' ',
-      }))
-      let accepted = await upgrade()
-      if (!accepted) {
-        // One retry absorbs a transient refusal; a second one fails the frame (the controller redraws it).
-        await pause(UPGRADE_RETRY_MS)
-        abandoned(live)
-        accepted = await upgrade()
-      }
-      if (!accepted) throw new Error(`G2 rejected the ${field} update. Try the page again.`)
+  const display: Display = createDisplay({
+    queue,
+    // Never send textColor on upgrades, so the created brightness is kept.
+    upgrade: (field, content) => bridge.textContainerUpgrade(new TextContainerUpgrade({
+      containerID: CONTAINER_IDS[field],
+      containerName: field,
+      content: content || ' ',
+    })),
+    check(page) {
+      if (!isReaderPage(page.body, G2_BODY_LINES)) throw new RangeError('Reader body exceeds one G2 page. Paginate the text before rendering.')
+    },
+    onWrite() {
       lastWriteAt = clock()
-    }
-    abandoned(live)
-    last = snapshot
-    link.written()
-    report('ready', GLASSES_MESSAGES.ready)
-  }
-
-  function queueRender(snapshot: GlassesPage): Promise<void> {
-    wanted = snapshot
-    return queue.render(SCREEN_TIMEOUT_MS, live => writeFrame(snapshot, live))
-  }
+    },
+    onFrame(newest) {
+      link.written()
+      report('ready', GLASSES_MESSAGES.ready)
+      if (newest) {
+        try { opts.onFrameShown?.() } catch { /* Observer errors are isolated. */ }
+      }
+    },
+  })
 
   const storage: GlassesStorage = {
     storageGet(key) {
@@ -304,12 +295,12 @@ export async function connectGlasses(opts: GlassesOptions): Promise<GlassesContr
         if (value === null || value === undefined) return ''
         if (typeof value !== 'string') throw new Error('Even app storage returned an unreadable value.')
         return value
-      })
+      }, 'get')
     },
     storageSet(key, value) {
       // Defense in depth for the shared BLE link; storage.ts keeps values far smaller.
       if (value.length > MAX_BRIDGE_VALUE_CHARS) return Promise.resolve(false)
-      return queue.run('storage', STORAGE_TIMEOUT_MS, async () => (await bridge.setLocalStorage(key, value)) === true)
+      return queue.run('storage', STORAGE_TIMEOUT_MS, async () => (await bridge.setLocalStorage(key, value)) === true, 'set')
     },
   }
 
@@ -337,7 +328,9 @@ export async function connectGlasses(opts: GlassesOptions): Promise<GlassesContr
 
   try {
     const menuObject = validMenu(opts.menuItems)
-    const result = await bridge.createStartUpPageContainer(new CreateStartUpPageContainer({
+    // Through the queue like every other bridge call, so it never overlaps the storage calls that
+    // onBridgeReady started; later calls wait for it at most CREATE_HOLD_MS.
+    const result = await queue.hold('screen', CREATE_HOLD_MS, () => bridge.createStartUpPageContainer(new CreateStartUpPageContainer({
       containerTotalNum: 3,
       textObject: [
         new TextContainerProperty({
@@ -360,11 +353,10 @@ export async function connectGlasses(opts: GlassesOptions): Promise<GlassesContr
         }),
       ],
       ...(menuObject ? { menuObject } : {}),
-    }))
+    })), 'create')
     // Do not retry: the host rejects a second create anyway.
     if (result !== 0) throw new Error(`G2 could not create the reader screen (code ${result}).`)
-    last = initial
-    wanted = initial
+    display.created(initial)
     lastWriteAt = clock()
 
     unsubscribeEvents = bridge.onEvenHubEvent(event => {
@@ -384,13 +376,14 @@ export async function connectGlasses(opts: GlassesOptions): Promise<GlassesContr
     unsubscribeDevice = bridge.onDeviceStatusChanged(status => {
       if (disposed) return
       if (status.connectType === DeviceConnectType.Disconnected || status.connectType === DeviceConnectType.ConnectionFailed) {
-        last = null
+        display.invalidate()
         link.disconnected()
         report('disconnected', GLASSES_MESSAGES.disconnected)
       } else if (status.connectType === DeviceConnectType.Connecting) {
+        display.invalidate()
         link.disconnected() // A reconnect cycle may skip Disconnected; the next Connected redraws.
       } else if (status.connectType === DeviceConnectType.Connected) {
-        last = null
+        display.invalidate()
         const redraw = link.connected()
         report('ready', GLASSES_MESSAGES.ready)
         if (redraw) {
@@ -410,7 +403,7 @@ export async function connectGlasses(opts: GlassesOptions): Promise<GlassesContr
 
   return {
     render(page) {
-      return queueRender(snapshotOf(page))
+      return display.render(snapshotOf(page))
     },
     exit() {
       return queue.run('screen', SCREEN_TIMEOUT_MS, async () => {
@@ -419,8 +412,8 @@ export async function connectGlasses(opts: GlassesOptions): Promise<GlassesContr
         // Mode 1 shows the OS exit dialog. Only a following SYSTEM_EXIT (or
         // pagehide) disposes: the user can cancel the dialog. Resend the whole
         // frame next time in case the dialog disturbed the containers.
-        last = null
-      })
+        display.invalidate()
+      }, 'exit')
     },
     storageGet: storage.storageGet,
     storageSet: storage.storageSet,
@@ -428,7 +421,7 @@ export async function connectGlasses(opts: GlassesOptions): Promise<GlassesContr
       filter.reset()
     },
     invalidate() {
-      last = null
+      display.invalidate()
     },
     dispose,
   }

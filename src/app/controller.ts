@@ -83,6 +83,12 @@ export interface Controller {
   retry(): Promise<void>
   /** Resend the whole current frame (glasses reconnected, or the phone asks). */
   redraw(): Promise<void>
+  /**
+   * The glasses now show the newest frame rendered, although its render rejected (a timed-out
+   * write that landed late, or the glasses' own recovery write): ends the redraw state and
+   * records the reader page. Optional for the glasses wrapper; a no-op unless a draw failed.
+   */
+  frameShown(): void
 }
 
 type HomeView = Extract<GlassesView, { kind: 'home' }>
@@ -105,6 +111,12 @@ interface ReaderState extends ReaderView {
 }
 type View = HomeView | PublicationsState | PostsState | ReaderState
 type ArchiveSource = Extract<PostSource, { host: string }>
+/** One draw: the reader position it shows, `done` once the glasses showed it. */
+interface Drawn {
+  seq: number
+  shown: Omit<Position, 'updatedAt'> | null
+  done: boolean
+}
 
 interface PostEntry {
   post: PostDetail
@@ -295,10 +307,23 @@ export function createController(deps: ControllerDeps): Controller {
 
   /**
    * The latest frame failed to reach the glasses, so they show an older state than the model.
-   * The next action then redraws the model instead of moving past a page or row never shown.
+   * The next gesture that acts on the page or row shown then redraws the model instead of moving
+   * past a page or row never shown (once per failed frame: see onAction).
    */
   let displayStale = false
   let drawSeq = 0
+  /** drawSeq of the forced redraw a gesture on the stale display was turned into (0: none). */
+  let offeredSeq = 0
+  /** The latest draw. */
+  let latest: Drawn | null = null
+
+  /** The glasses showed `drawn` (its render resolved, or frameShown confirmed it). */
+  function accepted(drawn: Drawn) {
+    if (drawn.done) return
+    drawn.done = true
+    if (drawn.seq === drawSeq) displayStale = false
+    if (drawn.shown) afterReaderRender(drawn.shown)
+  }
 
   /** Render the top of the stack; a shown reader page records the position afterwards. */
   function draw(): Promise<void> {
@@ -306,22 +331,24 @@ export function createController(deps: ControllerDeps): Controller {
     frame = page
     notifyPhone()
     const view = top()
-    const shown = view.kind === 'reader' && view.state === 'ready' ? positionShown(view) : null
     drawSeq += 1
-    const seq = drawSeq
+    const drawn: Drawn = { seq: drawSeq, shown: view.kind === 'reader' && view.state === 'ready' ? positionShown(view) : null, done: false }
+    latest = drawn
     let rendered: Promise<void>
     try {
       rendered = Promise.resolve(deps.render(page))
     } catch (error) {
       rendered = Promise.reject(error)
     }
-    return rendered.then(() => {
-      if (seq === drawSeq) displayStale = false
-      if (shown) afterReaderRender(shown)
-    }, error => {
+    return rendered.then(() => accepted(drawn), error => {
       // The glasses wrapper reports write failures; a superseded frame was replaced by a newer one.
-      if (seq === drawSeq && !isSupersededRender(error)) displayStale = true
+      if (drawn.seq === drawSeq && !drawn.done && !isSupersededRender(error)) displayStale = true
     })
+  }
+
+  /** Gestures whose effect depends on the page or row on the display (Save for later on a list row). */
+  function actsOnShown(action: GlassesAction): boolean {
+    return action === 'next' || action === 'previous' || action === 'select' || (action === 'menu:2' && top().kind === 'posts')
   }
 
   /** Resend the whole current frame. */
@@ -933,10 +960,19 @@ export function createController(deps: ControllerDeps): Controller {
       void resume()
     },
     async onAction(action) {
+      // Before start() the glasses show the startup frame (for example "Loading your library"):
+      // only the root double-tap (the exit dialog) is honoured, so nothing draws over that frame.
+      if (!started) return action === 'back' ? exitApp() : undefined
       interacted = true
-      // The wearer acted on an older frame than the model: show the model first. The root double-tap
-      // still opens the exit dialog, so glasses that keep refusing frames cannot trap the wearer.
-      if (displayStale && !(action === 'back' && stack.length === 1)) return forceRedraw()
+      // The wearer acted on an older frame than the model: show the model first, at most once per
+      // failed frame (when that redraw fails too, the next gesture runs). Back, hold and the other
+      // menu items navigate or act on the whole view, so they always run: glasses that keep
+      // refusing frames never trap the wearer below the root or away from the exit dialog.
+      if (displayStale && offeredSeq !== drawSeq && actsOnShown(action)) {
+        const redraw = forceRedraw()
+        offeredSeq = drawSeq
+        return redraw
+      }
       if (action.startsWith('menu:')) return onMenu(Number(action.slice(5)))
       const view = top()
       switch (view.kind) {
@@ -990,5 +1026,8 @@ export function createController(deps: ControllerDeps): Controller {
       return Promise.resolve()
     },
     redraw: forceRedraw,
+    frameShown() {
+      if (displayStale && latest) accepted(latest)
+    },
   }
 }

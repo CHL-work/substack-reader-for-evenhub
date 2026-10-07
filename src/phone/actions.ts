@@ -51,9 +51,10 @@ export interface PhoneApp {
   /**
    * The stored library is still being read from bridge storage: lists show
    * "Loading your library" and edits are refused, so an empty list never
-   * invites an edit that would race the bridge copy.
+   * invites an edit that would race the bridge copy. `notice` is shown when
+   * the gate is lifted (e.g. because the library could not be read).
    */
-  setLibraryLoading(loading: boolean): void
+  setLibraryLoading(loading: boolean, notice?: string): void
 }
 
 interface RunContext {
@@ -861,10 +862,11 @@ export function createPhoneApp(deps: PhoneDeps): PhoneApp {
     setPhase(phase) {
       root.dataset.phase = phase
     },
-    setLibraryLoading(loading) {
+    setLibraryLoading(loading, message) {
       if (libraryLoading === loading) return
       libraryLoading = loading
       if (!loading && notice === LIBRARY_LOADING) notice = ''
+      if (!loading && message) notice = message
       requestDraw()
     },
   }

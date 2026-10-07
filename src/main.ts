@@ -25,12 +25,17 @@ const MENU_ITEMS: GlassesMenuItem[] = [
 ]
 /** Show "Open this from the Even app" after this long without a bridge. */
 const BRIDGE_GRACE_MS = 4000
-/** controller.start() waits this long at most for the bridge library (glassesMenu resume needs it). */
+/**
+ * controller.start() waits this long at most for the bridge library (glassesMenu resume needs it),
+ * and while the library is still loading, until it was read or the retries ran out.
+ */
 const START_WAIT_MS = 4000
 /** Retries after a failed bridge storage read; foreground and reconnect start a new round. */
 const ATTACH_RETRY_MS = [1000, 3000, 10_000] as const
 /** First glasses frame while the bridge library is still being read and the browser copy was empty. */
 const LOADING_LIBRARY_FRAME = messageFrame(APP_NAME, 'Loading your library\u2026', TEXT.exitFooter)
+/** Phone notice when the loading gate is lifted because every bridge read of a round failed. */
+const LIBRARY_UNREAD = 'Could not load your library from the glasses; edits will be merged later.'
 
 function delay(ms: number): Promise<void> {
   return new Promise(resolve => setTimeout(resolve, ms))
@@ -68,17 +73,26 @@ async function boot(root: HTMLElement): Promise<void> {
     now: () => Date.now(),
   })
   // Nothing in the browser copy: the library may still be in bridge storage.
-  // Until it was read (or there is no bridge), the phone shows "Loading your
-  // library" instead of an empty list that invites edits.
+  // Until it was read, every retry of the first round failed, or there is no
+  // bridge, the phone shows "Loading your library" instead of an empty list
+  // that invites edits, and the glasses keep their loading frame.
   let libraryLoading = store.loadedEmpty()
+  let markKnown = () => undefined as void
+  const libraryKnown = libraryLoading ? new Promise<void>(resolve => { markKnown = resolve }) : Promise.resolve()
   phone.setLibraryLoading(libraryLoading)
   phone.draw()
   phone.setPhase('phone')
 
-  function libraryReady() {
+  function libraryReady(notice?: string) {
     if (!libraryLoading) return
     libraryLoading = false
-    phone?.setLibraryLoading(false)
+    markKnown()
+    phone?.setLibraryLoading(false, notice)
+  }
+
+  /** The glasses lists and frame follow the library; a throw here must not keep the gate shut. */
+  function libraryChanged() {
+    try { controller.configurationChanged() } catch { /* Drawn again on the next action. */ }
   }
 
   // -------------------------------------------------------------------------
@@ -105,17 +119,21 @@ async function boot(root: HTMLElement): Promise<void> {
     store.attachBridge(bridgeKV(storage), changed => {
       // Before the write-back: the glasses and phone show the library at once.
       // While loading, the glasses may still show the "Loading your library" frame.
-      if (changed || libraryLoading) controller.configurationChanged()
+      const wasLoading = libraryLoading
       libraryReady()
+      if (changed || wasLoading) libraryChanged()
       if (changed) phone?.draw()
       markApplied()
     }).then(() => {
       retries = 0
     }, () => {
-      // Nothing was written. Edits now go to the browser copy; a later attach merges them.
-      if (libraryLoading) controller.configurationChanged()
-      libraryReady()
+      // Nothing was written. While retries remain, the library stays "loading" (an edit on an
+      // apparently empty library would only race the bridge copy). Once they ran out, edits go to
+      // the browser copy, and a later attach (foreground, reconnect) merges them.
       scheduleRetry()
+      if (!libraryLoading || retryTimer !== undefined) return
+      libraryReady(LIBRARY_UNREAD)
+      libraryChanged()
     }).catch(() => undefined).finally(() => {
       attachRunning = false
       markApplied()
@@ -182,11 +200,16 @@ async function boot(root: HTMLElement): Promise<void> {
     onLaunchSource: source => controller.onLaunchSource(source),
     onRawEvent: summary => phone?.logEvent(summary),
     onExit: async () => { await store.flush() },
+    onStorageLate: () => store.resync(),
+    onFrameShown: () => controller.frameShown(),
   }).then(async connected => {
     clearTimeout(grace)
     glasses = connected
-    // A glassesMenu launch resumes lastOpen, which may only be in bridge storage.
+    // A glassesMenu launch resumes lastOpen, which may only be in bridge storage. An empty browser
+    // copy keeps the "Loading your library" frame until the library was read or the retries ran out
+    // (bounded: every read times out after 4 s), instead of drawing the first-run screen.
     await Promise.race([attachApplied, delay(START_WAIT_MS)])
+    await libraryKnown
     await controller.start()
     phone?.setPhase('glasses')
     phone?.draw()

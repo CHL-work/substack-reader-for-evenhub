@@ -7,8 +7,8 @@ import { test } from 'node:test'
 import assert from 'node:assert/strict'
 import type { EvenHubEvent } from '@evenrealities/even_hub_sdk'
 import {
-  OsEvent, SCREEN_TIMEOUT_MS, STORAGE_TIMEOUT_MS, SupersededRenderError, createBridgeQueue, createLinkTracker,
-  describeEvent, mapEvent, type BridgeCallKind,
+  OsEvent, SCREEN_TIMEOUT_MS, STORAGE_TIMEOUT_MS, SupersededRenderError, UPGRADE_RETRY_MS, createBridgeQueue, createDisplay,
+  createLinkTracker, describeEvent, mapEvent, type BridgeCallKind, type Display, type FrameField, type GlassesPage,
 } from '../../src/events'
 import { flushPromises } from './helpers'
 
@@ -149,14 +149,19 @@ function queueFixture() {
   const timers = fakeTimers()
   const errors: unknown[] = []
   const late: BridgeCallKind[] = []
+  /** `kind:label` of every late answer. */
+  const lateLabels: string[] = []
   let closed = false
   const queue = createBridgeQueue({
     closed: () => closed,
     schedule: timers.schedule,
     onScreenError: error => errors.push(error),
-    onLate: kind => late.push(kind),
+    onLate: (kind, label) => {
+      late.push(kind)
+      lateLabels.push(`${kind}:${label}`)
+    },
   })
-  return { queue, timers, errors, late, close() { closed = true } }
+  return { queue, timers, errors, late, lateLabels, close() { closed = true } }
 }
 
 test('bridge calls run one at a time in order, and a failed call never blocks the next', async () => {
@@ -276,4 +281,242 @@ test('a reconnect asks for a full redraw after a disconnect or a failed write, w
   link.writeFailed()
   link.written()
   assert.equal(link.connected(), false)
+})
+
+test('a storage write that lands after its timeout is reported with its label', async () => {
+  const { queue, timers, errors, lateLabels } = queueFixture()
+  const stalled = deferred<boolean>()
+  const write = outcome(queue.run('storage', STORAGE_TIMEOUT_MS, () => stalled.promise, 'set'))
+  await flushPromises()
+  timers.advance(STORAGE_TIMEOUT_MS)
+  assert.equal((await write)?.name, 'BridgeTimeoutError')
+  stalled.resolve(true)
+  await flushPromises()
+  assert.deepEqual(lateLabels, ['storage:set'], 'the store can write the newest documents again')
+  assert.deepEqual(errors, [])
+})
+
+test('page creation waits for storage calls ahead of it, and later calls wait for it at most the hold', async () => {
+  const { queue, timers, errors, late } = queueFixture()
+  const log: string[] = []
+  const read = deferred<string>()
+  const reading = queue.run('storage', STORAGE_TIMEOUT_MS, () => { log.push('read'); return read.promise }, 'get')
+  const page = deferred<number>()
+  const created = queue.hold('screen', 8000, () => { log.push('create'); return page.promise }, 'create')
+  const write = queue.run('storage', STORAGE_TIMEOUT_MS, async () => { log.push('write'); return true }, 'set')
+  await flushPromises()
+  assert.deepEqual(log, ['read'], 'the page is never created while a storage call runs')
+  read.resolve('x')
+  assert.equal(await reading, 'x')
+  await flushPromises()
+  assert.deepEqual(log, ['read', 'create'])
+  timers.advance(7999)
+  await flushPromises()
+  assert.deepEqual(log, ['read', 'create'], 'a storage write waits for the page...')
+  timers.advance(1)
+  assert.equal(await write, true)
+  assert.deepEqual(log, ['read', 'create', 'write'], '...for at most the hold')
+  let answered = false
+  void created.then(() => { answered = true })
+  await flushPromises()
+  assert.equal(answered, false, 'the caller still waits for the page itself, unbounded')
+  page.resolve(0)
+  assert.equal(await created, 0)
+  assert.deepEqual(errors, [])
+  assert.deepEqual(late, [])
+  assert.equal(timers.pending(), 0)
+})
+
+// ---------------------------------------------------------------------------
+// Display state: field-by-field records, invalidation epochs, late answers
+
+const frame = (n: number): GlassesPage => ({ title: `T${n}`, body: `B${n}`, footer: `F${n}` })
+
+function displayFixture() {
+  const timers = fakeTimers()
+  const errors: string[] = []
+  const calls: Array<{ field: FrameField; content: string; answer(ok: boolean): void }> = []
+  const queue = createBridgeQueue({
+    closed: () => false,
+    schedule: timers.schedule,
+    onScreenError: (_error, label) => errors.push(label),
+    onLate: (kind, label) => { if (kind === 'screen') display.late(label) },
+  })
+  let frames = 0
+  /** onFrame's `newest` flag of every accepted frame. */
+  const newest: boolean[] = []
+  const display: Display = createDisplay({
+    queue,
+    schedule: timers.schedule,
+    upgrade: (field, content) => new Promise<boolean>(resolve => { calls.push({ field, content, answer: resolve }) }),
+    onFrame: flag => {
+      frames += 1
+      newest.push(flag)
+    },
+  })
+  return {
+    display, queue, timers, errors, calls, newest,
+    frames: () => frames,
+    /** Fields sent from call `from` on. */
+    sent: (from = 0) => calls.slice(from).map(call => call.field),
+    /** Answer call `index`, then let the frame go on. */
+    async answer(index: number, ok = true) {
+      calls[index]!.answer(ok)
+      await flushPromises()
+    },
+  }
+}
+
+test('a frame records each field once the glasses accept it, and sends only the fields that changed', async () => {
+  const f = displayFixture()
+  f.display.created(frame(0))
+  const first = outcome(f.display.render({ ...frame(0), body: 'B1' }))
+  await flushPromises()
+  assert.deepEqual(f.sent(), ['body'], 'title and footer are already on the display')
+  await f.answer(0)
+  assert.equal(await first, null)
+  assert.deepEqual(f.display.shown(), { ...frame(0), body: 'B1' })
+  // A refused update is tried once more after a short pause; a second refusal fails the frame.
+  const refused = outcome(f.display.render(frame(2)))
+  await flushPromises()
+  await f.answer(1, false)
+  assert.deepEqual(f.sent(1), ['body'], 'no retry before the pause')
+  f.timers.advance(UPGRADE_RETRY_MS)
+  await flushPromises()
+  await f.answer(2, false)
+  assert.match((await refused)?.message ?? '', /rejected the body/)
+  assert.deepEqual(f.display.shown(), { title: 'T0', footer: 'F0' }, 'the refused field is unknown; the others are kept')
+  assert.deepEqual(f.errors, ['render'])
+  assert.equal(f.frames(), 1)
+})
+
+test('each container update is bounded on its own, so a slow but working link never times out a frame', async () => {
+  const f = displayFixture()
+  f.display.created(frame(0))
+  const slow = outcome(f.display.render(frame(1)))
+  for (let index = 0; index < 3; index += 1) {
+    await flushPromises()
+    f.timers.advance(SCREEN_TIMEOUT_MS - 1000) // Each update takes 4 s: 12 s for the whole frame.
+    await f.answer(index)
+  }
+  assert.equal(await slow, null)
+  assert.deepEqual(f.sent(), ['body', 'title', 'footer'])
+  assert.deepEqual(f.errors, [])
+  assert.deepEqual(f.display.shown(), frame(1))
+  assert.equal(f.timers.pending(), 0, 'every per-update timer is cleared')
+})
+
+test('a redraw asked for while a frame is written resends what was written before or during the invalidation', async () => {
+  const f = displayFixture()
+  f.display.created(frame(0))
+  const first = outcome(f.display.render(frame(1)))
+  await flushPromises()
+  await f.answer(0) // body
+  assert.deepEqual(f.sent(), ['body', 'title'])
+  // The G2 reports Connected while the title update is in flight: what it shows is unknown.
+  f.display.invalidate()
+  const redraw = outcome(f.display.render(frame(1)))
+  await f.answer(1) // title, accepted after the invalidation: not known to be shown
+  await f.answer(2) // footer, sent after it: shown
+  assert.equal(await first, null)
+  await flushPromises()
+  assert.deepEqual(f.sent(3), ['body'], 'the redraw does not trust what the interrupted frame wrote')
+  await f.answer(3)
+  await f.answer(4)
+  assert.equal(await redraw, null)
+  assert.deepEqual(f.sent(3), ['body', 'title'])
+  assert.deepEqual(f.display.shown(), frame(1))
+})
+
+test('an update that times out and lands during a newer frame makes it resend that field, once per frame', async () => {
+  const f = displayFixture()
+  f.display.created(frame(0))
+  const r11 = outcome(f.display.render(frame(11)))
+  await flushPromises()
+  f.timers.advance(SCREEN_TIMEOUT_MS) // The body update of page 11 hangs.
+  assert.equal((await r11)?.name, 'BridgeTimeoutError')
+  assert.deepEqual(f.errors, ['render'])
+  assert.deepEqual(f.display.shown(), { title: 'T0', footer: 'F0' })
+  const r12 = outcome(f.display.render(frame(12)))
+  await flushPromises()
+  assert.deepEqual(f.sent(), ['body', 'body'])
+  await f.answer(0) // Page 11's body lands after all, maybe over page 12's.
+  await f.answer(1)
+  await f.answer(2)
+  await f.answer(3)
+  assert.equal(await r12, null)
+  assert.deepEqual(f.sent(2), ['title', 'footer', 'body'], 'page 12 is sent again: only its body, which the late answer may have overwritten')
+  // The resend's own update hangs and lands late too: no further resend for the same frame.
+  f.timers.advance(SCREEN_TIMEOUT_MS)
+  await flushPromises()
+  assert.deepEqual(f.errors, ['render', 'render'])
+  await f.answer(4)
+  await flushPromises()
+  assert.equal(f.calls.length, 5, 'a slow link cannot loop on late answers')
+  assert.deepEqual(f.display.shown(), {})
+  // The next frame the controller asks for resends every field.
+  const r13 = outcome(f.display.render(frame(13)))
+  await flushPromises()
+  await f.answer(5)
+  await f.answer(6)
+  await f.answer(7)
+  assert.equal(await r13, null)
+  assert.deepEqual(f.sent(5), ['body', 'title', 'footer'])
+})
+
+test('an exit dialog that answers late is never drawn over; the next frame resends every field', async () => {
+  const f = displayFixture()
+  f.display.created(frame(1))
+  const dialog = deferred<boolean>()
+  const exit = outcome(f.queue.run('screen', SCREEN_TIMEOUT_MS, async () => {
+    if (!(await dialog.promise)) throw new Error('refused')
+    f.display.invalidate()
+  }, 'exit'))
+  await flushPromises()
+  f.timers.advance(SCREEN_TIMEOUT_MS)
+  assert.equal((await exit)?.name, 'BridgeTimeoutError')
+  assert.deepEqual(f.errors, ['exit'])
+  dialog.resolve(true) // The OS exit dialog appears now.
+  await flushPromises()
+  assert.deepEqual(f.calls, [], 'nothing is written over the dialog')
+  assert.deepEqual(f.display.shown(), {})
+  // The wearer cancels and acts: that frame resends every field.
+  const next = outcome(f.display.render(frame(1)))
+  await flushPromises()
+  await f.answer(0)
+  await f.answer(1)
+  await f.answer(2)
+  assert.equal(await next, null)
+  assert.deepEqual(f.sent(), ['body', 'title', 'footer'])
+})
+
+test('a frame counts as the newest shown only when nothing newer was asked for, also after a late recovery (K2)', async () => {
+  const f = displayFixture()
+  f.display.created(frame(0))
+  const r1 = outcome(f.display.render(frame(1)))
+  await flushPromises()
+  const r2 = outcome(f.display.render(frame(2))) // Asked for while frame 1 is being written.
+  await f.answer(0)
+  await f.answer(1)
+  await f.answer(2)
+  assert.equal(await r1, null)
+  assert.deepEqual(f.newest, [false], 'frame 1 is on the display, but frame 2 was asked for since')
+  await f.answer(3)
+  await f.answer(4)
+  await f.answer(5)
+  assert.equal(await r2, null)
+  assert.deepEqual(f.newest, [false, true])
+  // Frame 3's body update times out (its render rejects), then lands; the recovery writes frame 3.
+  const r3 = outcome(f.display.render(frame(3)))
+  await flushPromises()
+  f.timers.advance(SCREEN_TIMEOUT_MS)
+  assert.equal((await r3)?.name, 'BridgeTimeoutError')
+  await f.answer(6)
+  await f.answer(7)
+  await f.answer(8)
+  await f.answer(9)
+  assert.deepEqual(f.sent(6), ['body', 'body', 'title', 'footer'])
+  assert.deepEqual(f.newest, [false, true, true], 'the app learns that the frame whose render failed is shown after all')
+  assert.deepEqual(f.display.shown(), frame(3))
+  assert.deepEqual(f.errors, ['render'])
 })

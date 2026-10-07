@@ -202,7 +202,7 @@ const CORS_JSON = {
 // ---------------------------------------------------------------------------
 // Bridge stub (runs in the page before the app)
 
-function installBridge({ seed, bridgeOnly }) {
+function installBridge({ seed, bridgeOnly, failReads }) {
   const BRIDGE = 'ci-bridge:'
   window.__g2Pages = []
   window.__g2State = {}
@@ -212,6 +212,10 @@ function installBridge({ seed, bridgeOnly }) {
   window.__g2Launch = null
   window.__g2LastWrite = -Infinity
   window.__g2LastSent = {}
+  // failReads: the first N bridge storage reads fail (the Even app did not answer).
+  window.__g2FailReads = failReads
+  window.__g2FailedReads = 0
+  window.__g2FirstRunAfter = null
   // Keep the SDK's classes real; replace only the native host boundary.
   const host = {
     _ready: true,
@@ -241,6 +245,11 @@ function installBridge({ seed, bridgeOnly }) {
       return () => { if (window.__g2Launch === callback) window.__g2Launch = null }
     },
     async getLocalStorage(key) {
+      if (window.__g2FailReads > 0) {
+        window.__g2FailReads -= 1
+        window.__g2FailedReads += 1
+        throw new Error('ci: bridge storage read failed')
+      }
       return sessionStorage.getItem(BRIDGE + key) ?? ''
     },
     async setLocalStorage(key, value) {
@@ -266,6 +275,14 @@ function installBridge({ seed, bridgeOnly }) {
     }
   }
   sessionStorage.setItem('ci-seeded', '1')
+  // How many bridge reads had failed when the phone first showed an empty library ("Get started").
+  if (failReads > 0) {
+    new MutationObserver(() => {
+      if (window.__g2FirstRunAfter === null && document.querySelector('#app')?.textContent?.includes('Get started')) {
+        window.__g2FirstRunAfter = window.__g2FailedReads
+      }
+    }).observe(document, { childList: true, subtree: true })
+  }
   /**
    * Deliver one glasses event, spaced like a human would: the app's gesture
    * filter drops same-direction scrolls within 300 ms, scrolls within 80 ms of
@@ -301,7 +318,7 @@ async function openPhone(options = {}) {
   const origin = options.unconfigured ? unconfigured.origin : configured.origin
   const context = await browser.newContext({ viewport: { width: 393, height: 852 }, isMobile: true, hasTouch: true, serviceWorkers: 'block' })
   const fixture = { context, page: null, origin, unexpected: [], pageErrors: [], relayRequests: [], override: options.override ?? null }
-  await context.addInitScript(installBridge, { seed: options.seed ?? null, bridgeOnly: options.bridgeOnly === true })
+  await context.addInitScript(installBridge, { seed: options.seed ?? null, bridgeOnly: options.bridgeOnly === true, failReads: options.failReads ?? 0 })
   await context.route('**/*', async route => {
     const request = route.request()
     let url
@@ -339,13 +356,13 @@ async function openPhone(options = {}) {
   page.on('pageerror', error => fixture.pageErrors.push(error.stack || error.message))
   fixture.page = page
   await page.goto(origin, { waitUntil: 'load' })
-  await ready(page)
+  await ready(page, options.readyTimeout)
   return fixture
 }
 
 /** The app connected to the stub bridge, attached bridge storage and drew its first frame. */
-async function ready(page) {
-  await expect(page.locator('#app[data-phase="glasses"]')).toHaveCount(1, { timeout: 15_000 })
+async function ready(page, timeout = 15_000) {
+  await expect(page.locator('#app[data-phase="glasses"]')).toHaveCount(1, { timeout })
 }
 
 async function verifyInvariants(fixture) {
@@ -856,6 +873,53 @@ try {
     // The browser mirror is refreshed from the bridge; the bridge copy is not rewritten.
     await expect.poll(async () => (await storedDoc(page, PREFS_KEY)).local?.publications?.map(pub => pub.host)).toEqual([ALPHA])
     assert.equal((await storedDoc(page, PREFS_KEY)).bridge?.savedAt, 1000)
+    assert.deepEqual(relayRequests, [])
+  })
+
+  await scenario('12d bridge reads fail twice: the library stays loading through the retries, never shown empty', { seed: SEED_ALPHA, bridgeOnly: true, failReads: 2 }, async ({ page, relayRequests }) => {
+    const [created] = await page.evaluate(() => window.__g2Pages)
+    const text = Object.fromEntries(created.textObject.map(box => [box.containerName, box.content]))
+    assert.ok(text.body.includes('Loading your library'), `The first frame waits for the library: ${JSON.stringify(text.body)}`)
+    assert.equal(await page.evaluate(() => window.__g2FailReads), 0, 'Both failed reads were retried.')
+    await expectBody(page, 'Publications (1)')
+    await expect(page.locator('[data-testid="library-loading"]')).toHaveCount(0)
+    await expect(page.locator('[data-testid="notice"]')).toHaveCount(0)
+    assert.equal(await page.evaluate(() => window.__g2FirstRunAfter), null, 'The phone never showed an empty library that invites edits.')
+    await openTab(page, 'publications')
+    assert.deepEqual(await rowValues(page, '[data-pub-row]', 'data-pub-row'), [ALPHA])
+    await expect.poll(async () => (await storedDoc(page, PREFS_KEY)).local?.publications?.map(pub => pub.host)).toEqual([ALPHA])
+    assert.equal((await storedDoc(page, PREFS_KEY)).bridge?.savedAt, 1000, 'The bridge copy is not rewritten.')
+    assert.deepEqual(relayRequests, [])
+  })
+
+  await scenario('12e every bridge read of a round fails: a notice, edits go to the browser copy, a later attach merges them', {
+    seed: { [PREFS_KEY]: prefsSeed({ publications: [ALPHA_PUB], settings: { invertSwipe: true } }) },
+    bridgeOnly: true,
+    failReads: 99,
+    readyTimeout: 30_000,
+  }, async ({ page, relayRequests }) => {
+    const [created] = await page.evaluate(() => window.__g2Pages)
+    assert.ok(created.textObject.find(box => box.containerName === 'body').content.includes('Loading your library'))
+    // Read at once, then after 1, 3 and 10 s: only the fourth failure lifts the gate.
+    await expect.poll(() => page.evaluate(() => window.__g2FirstRunAfter ?? -1)).toBeGreaterThanOrEqual(4)
+    await expect(page.locator('[data-testid="notice"]')).toContainText('Could not load your library from the glasses; edits will be merged later.')
+    await expect(page.locator('[data-testid="library-loading"]')).toHaveCount(0)
+    await expectBody(page, 'No publications yet.')
+    await openTab(page, 'settings')
+    await page.locator('[data-action="set"][data-key="linesPerPage"][data-value="5"]').click()
+    await expect(page.locator('[data-action="set"][data-key="linesPerPage"][data-value="5"]')).toHaveAttribute('aria-pressed', 'true')
+    await expect.poll(async () => (await storedDoc(page, PREFS_KEY)).local?.settings?.linesPerPage).toBe(5)
+    assert.equal((await storedDoc(page, PREFS_KEY)).bridge?.savedAt, 1000, 'Nothing is written to the unread bridge copy.')
+    // The Even app answers again; the next foreground attaches and merges field by field.
+    await page.evaluate(() => {
+      window.__g2FailReads = 0
+      document.dispatchEvent(new Event('visibilitychange'))
+    })
+    const pick = settings => settings && { linesPerPage: settings.linesPerPage, invertSwipe: settings.invertSwipe }
+    await expect.poll(async () => pick((await storedDoc(page, PREFS_KEY)).bridge?.settings)).toEqual({ linesPerPage: 5, invertSwipe: true })
+    assert.deepEqual((await storedDoc(page, PREFS_KEY)).bridge?.publications?.map(pub => pub.host), [ALPHA])
+    await expect.poll(async () => pick((await storedDoc(page, PREFS_KEY)).local?.settings)).toEqual({ linesPerPage: 5, invertSwipe: true })
+    await expectBody(page, 'Publications (1)')
     assert.deepEqual(relayRequests, [])
   })
 

@@ -11,6 +11,8 @@ The app keeps two small documents in the Even app's plugin storage (the Even bri
 | `sr:prefs:v1` | The publications you follow (name, host, Substack id, date added, whether it feeds Latest), your saved posts and your settings |
 | `sr:progress:v1` | Reading positions (post id, character offset, page, a version string, time), recently opened posts (history), ids of posts you finished, and the last opened post |
 
+The WebView's `localStorage` also holds `sr:sync:v1`: two save times that tell which version of the Even app's copy the WebView copy last matched (no content).
+
 A saved post, history entry or "last opened" entry is a reference only: post id, host, slug, title, publication name, publication date, paid flag and word count. **Article text and HTML are never stored.** They are kept in memory while the app runs (up to 10 converted posts, plus the recent posts of a feed fallback) and are gone when the app closes.
 
 You can clear history and positions, or reset everything, in the phone's Settings panel. The Diagnostics panel keeps the last 30 glasses events (envelope, event type, input source and time only, never text) in memory.
