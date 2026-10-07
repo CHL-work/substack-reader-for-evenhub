@@ -1,0 +1,136 @@
+name: Deploy relay
+
+# Cloudflare option (docs/relay.md). Manually run; deploys worker/relay.ts with
+# wrangler.toml to the account in the repository secrets CLOUDFLARE_API_TOKEN
+# (Workers Scripts: Edit) and CLOUDFLARE_ACCOUNT_ID. When the repository
+# variable VITE_RELAY_ORIGIN is set, the deployed relay is then asked to probe
+# Substack once (/v1/health?probe=1) and the result is written to the job summary.
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: deploy-relay
+  cancel-in-progress: false
+
+jobs:
+  deploy:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - name: Check out source
+        uses: actions/checkout@v7
+        with:
+          persist-credentials: false
+
+      - name: Set up Node.js
+        uses: actions/setup-node@v7
+        with:
+          node-version: '22'
+          package-manager-cache: false
+
+      - name: Set up pnpm
+        uses: pnpm/action-setup@v6
+        with:
+          version: 10.32.1
+
+      - name: Install locked dependencies
+        run: pnpm install --frozen-lockfile
+
+      - name: Check types
+        run: pnpm run check
+
+      - name: Unit tests (Node)
+        env:
+          CI: 'true'
+        run: pnpm run test:ci
+
+      - name: Require Cloudflare credentials
+        shell: bash
+        env:
+          CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
+          CLOUDFLARE_ACCOUNT_ID: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}
+        run: |
+          if [ -z "$CLOUDFLARE_API_TOKEN" ] || [ -z "$CLOUDFLARE_ACCOUNT_ID" ]; then
+            echo "::error::Add the repository secrets CLOUDFLARE_API_TOKEN and CLOUDFLARE_ACCOUNT_ID (see docs/relay.md)."
+            exit 1
+          fi
+
+      - name: Deploy Worker
+        shell: bash
+        env:
+          CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
+          CLOUDFLARE_ACCOUNT_ID: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}
+        run: pnpm dlx wrangler@4.148.0 deploy --var "REVISION:${GITHUB_SHA::7}"
+
+      - name: Probe Substack reachability from the relay
+        if: vars.VITE_RELAY_ORIGIN != ''
+        shell: bash
+        env:
+          VITE_RELAY_ORIGIN: ${{ vars.VITE_RELAY_ORIGIN }}
+        run: |
+          node scripts/check-relay-origin.mjs --require
+          node --input-type=module <<'NODE'
+          import { appendFileSync } from 'node:fs'
+
+          const origin = new URL(process.env.VITE_RELAY_ORIGIN.trim()).origin
+          const expected = (process.env.GITHUB_SHA || '').slice(0, 7)
+          const sleep = ms => new Promise(resolve => setTimeout(resolve, ms))
+
+          async function health(probe) {
+            const response = await fetch(`${origin}/v1/health${probe ? '?probe=1' : ''}`, {
+              headers: { accept: 'application/json' },
+              signal: AbortSignal.timeout(45_000),
+            })
+            const json = await response.json().catch(() => null)
+            if (!response.ok || !json || json.ok !== true || json.data?.service !== 'substack-reader-relay') {
+              throw new Error(`HTTP ${response.status}, not a Reader for Substack relay response`)
+            }
+            return json.data
+          }
+
+          // Wait (about 1 minute at most) for the new deployment to answer.
+          let data = null
+          for (let attempt = 1; attempt <= 12; attempt += 1) {
+            try {
+              data = await health(false)
+              if (data.revision === expected) break
+              console.log(`Attempt ${attempt}: revision ${data.revision}, waiting for ${expected}`)
+            } catch (error) {
+              console.log(`Attempt ${attempt}: ${error.message}`)
+            }
+            await sleep(5_000)
+          }
+          if (!data) {
+            console.log(`::error::${origin}/v1/health did not answer. Check that VITE_RELAY_ORIGIN is this Worker's URL.`)
+            process.exit(1)
+          }
+          if (data.protocol !== 1) {
+            console.log(`::error::The relay reports protocol ${data.protocol}; this app needs protocol 1.`)
+            process.exit(1)
+          }
+          if (data.revision !== expected) {
+            console.log(`::warning::The relay at ${origin} reports revision ${data.revision}, not ${expected}. VITE_RELAY_ORIGIN may point at another deployment.`)
+          }
+
+          // One probe: the relay fetches one *.substack.com archive, one custom-domain archive and substack.com search.
+          const probed = await health(true)
+          const rows = Array.isArray(probed.probes) ? probed.probes : []
+          const lines = [
+            `### Relay ${origin} (revision ${probed.revision ?? 'none'}, protocol ${probed.protocol})`,
+            '',
+            '| Target | Status | Content type | Challenge | ms |',
+            '| --- | --- | --- | --- | --- |',
+          ]
+          for (const row of rows) {
+            lines.push(`| ${row.target} | ${row.status} | ${row.contentType} | ${row.challenge} | ${row.ms} |`)
+            if (row.status !== 200) {
+              console.log(`::warning::Substack answered the relay's ${row.target} probe with HTTP ${row.status} (${row.contentType}${row.challenge ? ', challenge' : ''}). Reading from that kind of host may fail; see docs/relay.md.`)
+            }
+          }
+          console.log(lines.join('\n'))
+          if (process.env.GITHUB_STEP_SUMMARY) appendFileSync(process.env.GITHUB_STEP_SUMMARY, lines.join('\n') + '\n')
+          NODE

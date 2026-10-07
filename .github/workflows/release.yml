@@ -1,0 +1,106 @@
+name: Release package
+
+# Publishing a GitHub release (tag vX.Y.Z or vX.Y.Z-alpha.N, matching
+# package.json) re-runs every check on that tag and attaches the .ehpk.
+
+on:
+  release:
+    types: [published]
+
+permissions:
+  contents: write
+
+concurrency:
+  group: release-${{ github.event.release.tag_name }}
+  cancel-in-progress: false
+
+jobs:
+  package-and-attach:
+    runs-on: ubuntu-latest
+    timeout-minutes: 25
+    steps:
+      - name: Check out release tag
+        uses: actions/checkout@v7
+        with:
+          ref: ${{ github.event.release.tag_name }}
+          persist-credentials: false
+
+      - name: Set up Node.js
+        uses: actions/setup-node@v7
+        with:
+          node-version: '22'
+          package-manager-cache: false
+
+      - name: Require tag to match package.json version
+        shell: bash
+        env:
+          RELEASE_TAG: ${{ github.event.release.tag_name }}
+        run: |
+          version="$(node -p "require('./package.json').version")"
+          case "$RELEASE_TAG" in
+            "v$version" | "v$version"-*) echo "Tag $RELEASE_TAG matches version $version." ;;
+            *) echo "::error::Release tag $RELEASE_TAG does not match package.json version $version (expected v$version or v$version-alpha.N)."; exit 1 ;;
+          esac
+
+      - name: Set up pnpm
+        uses: pnpm/action-setup@v6
+        with:
+          version: 10.32.1
+
+      - name: Install locked dependencies
+        run: pnpm install --frozen-lockfile
+
+      - name: Check types
+        run: pnpm run check
+
+      - name: Unit tests (Node)
+        env:
+          CI: 'true'
+        run: pnpm run test:ci
+
+      - name: Install CI Chromium
+        run: pnpm exec playwright install --with-deps chromium
+
+      - name: Browser tests (Chromium, network blocked)
+        env:
+          CI: 'true'
+        run: pnpm run test:browser:ci
+
+      - name: Phone and glasses flows (Chromium, bridge stub)
+        env:
+          CI: 'true'
+        run: pnpm run test:ui:ci
+
+      - name: Require relay origin
+        shell: bash
+        env:
+          VITE_RELAY_ORIGIN: ${{ vars.VITE_RELAY_ORIGIN }}
+        run: node scripts/check-relay-origin.mjs --require
+
+      - name: Build production bundle
+        env:
+          VITE_RELAY_ORIGIN: ${{ vars.VITE_RELAY_ORIGIN }}
+          VITE_ENABLE_RSS2JSON_FALLBACK: ${{ vars.ENABLE_RSS2JSON_FALLBACK }}
+        run: pnpm run build
+
+      - name: Package .ehpk
+        env:
+          VITE_RELAY_ORIGIN: ${{ vars.VITE_RELAY_ORIGIN }}
+          VITE_ENABLE_RSS2JSON_FALLBACK: ${{ vars.ENABLE_RSS2JSON_FALLBACK }}
+          ENABLE_RSS2JSON_FALLBACK: ${{ vars.ENABLE_RSS2JSON_FALLBACK }}
+        run: pnpm run pack
+
+      - name: Attach package to GitHub Release
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+          RELEASE_TAG: ${{ github.event.release.tag_name }}
+        shell: bash
+        run: |
+          shopt -s nullglob
+          packages=(artifacts/*.ehpk)
+          if [ "${#packages[@]}" -eq 0 ]; then
+            echo 'No .ehpk package was produced.' >&2
+            exit 1
+          fi
+          gh release upload "$RELEASE_TAG" "${packages[@]}" --clobber

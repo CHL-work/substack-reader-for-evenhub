@@ -1,0 +1,992 @@
+import { test } from 'node:test'
+import assert from 'node:assert/strict'
+import relayDefault, { CACHE_ORIGIN, USER_AGENT, createRelay, type CacheLike, type Env, type Relay, type RelayOptions } from '../../worker/relay'
+import { version } from '../../package.json'
+import type {
+  ArchivePage,
+  HealthResponse,
+  PostDetail,
+  PostResponse,
+  PostSummary,
+  Profile,
+  PubMeta,
+  RelayEnvelope,
+  RelayError,
+  RelayMeta,
+  RelayUpstreamInfo,
+  SearchResponse,
+} from '../../src/substack/types'
+import { createFakeClock, fetchCalls, jsonResponse, stubFetch } from './helpers'
+import archiveFixture from '../fixtures/relay/archive.json'
+import postFreeFixture from '../fixtures/relay/post-free.json'
+import postPaidPreviewFixture from '../fixtures/relay/post-paid-preview.json'
+import postPaidNullFixture from '../fixtures/relay/post-paid-null.json'
+import byIdFixture from '../fixtures/relay/by-id.json'
+import profileFixture from '../fixtures/relay/profile.json'
+import topSearchFixture from '../fixtures/relay/top-search.json'
+
+/* ------------------------------------------------------------------ helpers */
+
+const RELAY_ORIGIN = 'https://relay.example.com'
+const FINGERPRINT: Record<string, string> = { 'x-served-by': 'Substack', 'x-cluster': 'substack' }
+const TARGET = 'target.substack-custom-domains.com'
+const CNAME_TO_TARGET = [{ type: 5, data: `${TARGET}.` }]
+const JSON_TYPE = 'application/json; charset=utf-8'
+
+type Handler = (init: RequestInit | undefined) => Response | Promise<Response>
+
+function newRelay(options: RelayOptions = {}): Relay {
+  return createRelay({ cache: null, ...options })
+}
+
+/** Stub globalThis.fetch with an exact-URL table; any other URL fails the test. */
+async function withUpstream(table: Record<string, Handler>, body: () => Promise<void>): Promise<void> {
+  const unexpected: string[] = []
+  const restore = stubFetch((url, init) => {
+    const handler = Object.prototype.hasOwnProperty.call(table, url) ? table[url] : undefined
+    if (!handler) {
+      unexpected.push(url)
+      throw new TypeError(`Unexpected upstream request in test: ${url}`)
+    }
+    return handler(init)
+  })
+  try {
+    await body()
+  } finally {
+    restore()
+  }
+  assert.deepEqual(unexpected, [])
+}
+
+function substackJson(data: unknown, status = 200, headers: Record<string, string> = {}): Response {
+  return jsonResponse(data, status, { ...FINGERPRINT, 'set-cookie': 'ab_testing_id=synthetic; Path=/; Secure', ...headers })
+}
+
+function redirectTo(location: string | null, status = 301, headers: Record<string, string> = FINGERPRINT): Response {
+  return new Response(null, { status, headers: location === null ? headers : { ...headers, location } })
+}
+
+function html(body: string, status: number, headers: Record<string, string> = {}): Response {
+  return new Response(body, { status, headers: { 'content-type': 'text/html; charset=utf-8', ...headers } })
+}
+
+function dns(answers: Array<{ type: number; data: string }>, status = 0): Response {
+  const body = { Status: status, TC: false, RD: true, RA: true, AD: false, CD: false, Answer: answers.map(answer => ({ name: 'synthetic.', TTL: 300, ...answer })) }
+  return new Response(JSON.stringify(body), { headers: { 'content-type': 'application/dns-json' } })
+}
+
+function dohUrl(name: string, type: 'CNAME' | 'A' | 'AAAA'): string {
+  return `https://cloudflare-dns.com/dns-query?name=${name}&type=${type}`
+}
+
+function archiveUrl(host: string, offset = 0, limit = 12, sort = 'new'): string {
+  return `https://${host}/api/v1/archive?sort=${sort}&search=&offset=${offset}&limit=${limit}`
+}
+
+function proofUrl(host: string): string {
+  return `https://${host}/api/v1/archive?sort=new&offset=0&limit=1`
+}
+
+const TARGET_DNS: Record<string, Handler> = {
+  [dohUrl(TARGET, 'A')]: () => dns([{ type: 1, data: '198.51.100.7' }]),
+  [dohUrl(TARGET, 'AAAA')]: () => dns([{ type: 28, data: '2001:db8::7' }]),
+}
+
+/** DNS for a host that neither CNAMEs to the target nor shares its addresses. */
+function plainDns(host: string): Record<string, Handler> {
+  return {
+    [dohUrl(host, 'CNAME')]: () => dns([]),
+    [dohUrl(host, 'A')]: () => dns([{ type: 1, data: '203.0.113.10' }]),
+    [dohUrl(host, 'AAAA')]: () => dns([]),
+  }
+}
+
+function assertCommonHeaders(res: Response): void {
+  assert.equal(res.headers.get('access-control-allow-origin'), '*')
+  assert.equal(res.headers.get('access-control-allow-methods'), 'GET, OPTIONS')
+  assert.equal(res.headers.get('access-control-max-age'), '86400')
+  assert.equal(res.headers.get('x-content-type-options'), 'nosniff')
+  assert.equal(res.headers.get('referrer-policy'), 'no-referrer')
+  assert.equal(res.headers.get('access-control-allow-credentials'), null)
+  assert.equal(res.headers.get('set-cookie'), null)
+}
+
+function assertUpstreamInit(init: RequestInit | undefined, accept: string): void {
+  if (!init) throw new Error('fetch must receive an init object')
+  assert.equal(init.method, 'GET')
+  assert.equal(init.redirect, 'manual')
+  assert.ok(init.signal instanceof AbortSignal)
+  assert.equal(init.body, undefined)
+  assert.equal(init.credentials, undefined)
+  assert.deepEqual(init.headers, { 'User-Agent': USER_AGENT, Accept: accept })
+}
+
+async function call(relay: Relay, path: string, init: RequestInit = {}, env?: Env): Promise<{ res: Response; text: string }> {
+  const res = await relay.fetch(new Request(`${RELAY_ORIGIN}${path}`, init), env)
+  assertCommonHeaders(res)
+  return { res, text: await res.text() }
+}
+
+async function expectOk<T>(relay: Relay, path: string, init: RequestInit = {}, env?: Env): Promise<{ res: Response; data: T; meta: RelayMeta }> {
+  const { res, text } = await call(relay, path, init, env)
+  assert.equal(res.status, 200, text)
+  assert.equal(res.headers.get('content-type'), JSON_TYPE)
+  const body = JSON.parse(text) as RelayEnvelope<T>
+  if (!body.ok) throw new Error(`Expected success for ${path}, got ${text}`)
+  return { res, data: body.data, meta: body.meta }
+}
+
+async function expectError(relay: Relay, path: string, status: number, code: string, init: RequestInit = {}, env?: Env): Promise<{ res: Response; error: RelayError; text: string }> {
+  const { res, text } = await call(relay, path, init, env)
+  assert.equal(res.status, status, `${path}: ${text}`)
+  assert.equal(res.headers.get('content-type'), JSON_TYPE)
+  assert.equal(res.headers.get('cache-control'), 'no-store')
+  const body = JSON.parse(text) as RelayEnvelope<unknown>
+  if (body.ok) throw new Error(`Expected ${code} for ${path}, got ${text}`)
+  assert.equal(body.error.code, code, `${path}: ${text}`)
+  assert.equal(typeof body.error.message, 'string')
+  return { res, error: body.error, text }
+}
+
+/* ------------------------------------------------------------------ expected shapes */
+
+const EXAMPLE_LETTERS: PubMeta = {
+  id: 424242,
+  name: 'Example Letters',
+  subdomain: 'exampleletters',
+  customDomain: 'news.example.com',
+  host: 'news.example.com',
+}
+
+const ARCHIVE_POSTS: PostSummary[] = [
+  {
+    id: 9001,
+    publicationId: 424242,
+    slug: 'the-first-synthetic-post',
+    title: 'The First Synthetic Post',
+    subtitle: 'An invented subtitle for testing.',
+    postDate: '2026-10-01T12:00:00.000Z',
+    audience: 'everyone',
+    isPaywalled: false,
+    type: 'newsletter',
+    wordcount: 1150,
+    canonicalUrl: 'https://news.example.com/p/the-first-synthetic-post',
+    authors: ['Ada Example', 'Bo Sample'],
+    podcastDurationSec: null,
+  },
+  {
+    id: 9002,
+    publicationId: 424242,
+    slug: 'second-synthetic-post',
+    title: 'Second Synthetic Post',
+    subtitle: null,
+    postDate: '2026-09-24T08:30:00.000Z',
+    audience: 'only_paid',
+    isPaywalled: true,
+    type: 'podcast',
+    wordcount: 300,
+    canonicalUrl: 'https://news.example.com/p/second-synthetic-post',
+    authors: ['Ada Example'],
+    podcastDurationSec: 1835,
+  },
+  {
+    id: 9003,
+    publicationId: 424242,
+    slug: 'third-synthetic-post',
+    title: 'Third Synthetic Post',
+    subtitle: null,
+    postDate: '2026-09-20T18:00:00.000Z',
+    audience: 'founding',
+    isPaywalled: true,
+    type: 'thread',
+    wordcount: null,
+    canonicalUrl: 'https://news.example.com/p/third-synthetic-post',
+    authors: [],
+    podcastDurationSec: null,
+  },
+]
+
+/* ------------------------------------------------------------------ tests */
+
+test('upstream User-Agent is exactly SubstackReaderForEvenHub/<version> with no URL (C2)', () => {
+  assert.equal(USER_AGENT, `SubstackReaderForEvenHub/${version}`)
+  assert.doesNotMatch(USER_AGENT, /https?:|\/\/|\(|\)|\s/)
+})
+
+test('archive: a 301 to a verified custom domain is followed; posts and publication are trimmed exactly', async () => {
+  const relay = newRelay({ now: createFakeClock(1_700_000_000_000).now })
+  await withUpstream({
+    [archiveUrl('exampleletters.substack.com')]: () => redirectTo(archiveUrl('news.example.com')),
+    [dohUrl('news.example.com', 'CNAME')]: () => dns(CNAME_TO_TARGET),
+    [archiveUrl('news.example.com')]: () => substackJson(archiveFixture),
+  }, async () => {
+    const { res, data, meta } = await expectOk<ArchivePage>(relay, '/v1/archive?host=exampleletters.substack.com')
+    assert.equal(res.headers.get('cache-control'), 'public, max-age=60')
+    assert.deepEqual(meta, { host: 'news.example.com', cached: false, fetchedAt: new Date(1_700_000_000_000).toISOString() })
+    assert.deepEqual(data, { publication: EXAMPLE_LETTERS, posts: ARCHIVE_POSTS, nextOffset: 3 })
+    assert.deepEqual(fetchCalls.map(entry => entry.url), [
+      archiveUrl('exampleletters.substack.com'),
+      dohUrl('news.example.com', 'CNAME'),
+      archiveUrl('news.example.com'),
+    ])
+    for (const entry of fetchCalls) {
+      assertUpstreamInit(entry.init, entry.url.startsWith('https://cloudflare-dns.com/') ? 'application/dns-json' : 'application/json')
+    }
+  })
+})
+
+test('archive: limit is clamped to 1..20, short pages still page on, only an empty page ends (C1)', async () => {
+  const relay = newRelay()
+  const host = 'exampleletters.substack.com'
+  await withUpstream({
+    [archiveUrl(host, 24, 20, 'top')]: () => substackJson(archiveFixture),
+    [archiveUrl(host, 0, 1)]: () => substackJson([]),
+    [archiveUrl(host, 12, 12)]: () => substackJson([...archiveFixture, { id: 'not-a-number', slug: 'junk' }, { id: 9004 }]),
+    [archiveUrl(host, 4999, 12)]: () => substackJson(archiveFixture),
+  }, async () => {
+    const short = await expectOk<ArchivePage>(relay, `/v1/archive?host=${host}&offset=24&limit=25&sort=top`)
+    assert.equal(short.meta.host, host)
+    assert.equal(short.data.posts.length, 3)
+    assert.equal(short.data.nextOffset, 27, 'fewer posts than the limit is not the end of the list')
+    assert.equal(short.data.posts[2].canonicalUrl, `https://${host}/p/third-synthetic-post`, 'missing canonical_url falls back to the host')
+    const empty = await expectOk<ArchivePage>(relay, `/v1/archive?host=${host}&limit=0`)
+    assert.deepEqual(empty.data, { publication: null, posts: [], nextOffset: null })
+    const junk = await expectOk<ArchivePage>(relay, `/v1/archive?host=${host}&offset=12`)
+    assert.deepEqual(junk.data.posts.map(post => post.id), [9001, 9002, 9003])
+    assert.equal(junk.data.nextOffset, 17, 'the offset advances by every upstream item, kept or not')
+    const last = await expectOk<ArchivePage>(relay, `/v1/archive?host=${host}&offset=4999`)
+    assert.equal(last.data.nextOffset, null, 'never point past the relay offset limit')
+  })
+})
+
+test('every route validates its parameters before any upstream request', async () => {
+  const relay = newRelay()
+  const cases: Array<[string, string]> = [
+    ['/v1/archive', 'INVALID_HOST'],
+    ['/v1/archive?host=', 'INVALID_HOST'],
+    ['/v1/archive?host=https%3A%2F%2Fexampleletters.substack.com', 'INVALID_HOST'],
+    ['/v1/archive?host=exampleletters.substack.com%2Fevil', 'INVALID_HOST'],
+    ['/v1/archive?host=exampleletters.substack.com%3A8443', 'INVALID_HOST'],
+    ['/v1/archive?host=user%40exampleletters.substack.com', 'INVALID_HOST'],
+    ['/v1/archive?host=127.0.0.1', 'INVALID_HOST'],
+    ['/v1/archive?host=%5B%3A%3A1%5D', 'INVALID_HOST'],
+    ['/v1/archive?host=localhost', 'INVALID_HOST'],
+    ['/v1/archive?host=printer.local', 'INVALID_HOST'],
+    ['/v1/archive?host=metadata.internal', 'INVALID_HOST'],
+    ['/v1/archive?host=pub.test', 'INVALID_HOST'],
+    ['/v1/archive?host=pub.invalid', 'INVALID_HOST'],
+    ['/v1/archive?host=substack.com', 'INVALID_HOST'],
+    ['/v1/archive?host=www.substack.com', 'INVALID_HOST'],
+    ['/v1/archive?host=exampleletters.substack.com&offset=-1', 'INVALID_PARAM'],
+    ['/v1/archive?host=exampleletters.substack.com&offset=1.5', 'INVALID_PARAM'],
+    ['/v1/archive?host=exampleletters.substack.com&offset=5001', 'INVALID_PARAM'],
+    ['/v1/archive?host=exampleletters.substack.com&limit=ten', 'INVALID_PARAM'],
+    ['/v1/archive?host=exampleletters.substack.com&sort=old', 'INVALID_PARAM'],
+    ['/v1/post', 'INVALID_PARAM'],
+    ['/v1/post?slug=a-post', 'INVALID_HOST'],
+    ['/v1/post?host=exampleletters.substack.com', 'INVALID_SLUG'],
+    ['/v1/post?host=exampleletters.substack.com&slug=..', 'INVALID_SLUG'],
+    ['/v1/post?host=exampleletters.substack.com&slug=a%2Fb', 'INVALID_SLUG'],
+    ['/v1/post?host=exampleletters.substack.com&slug=%2e%2e%2fadmin', 'INVALID_SLUG'],
+    [`/v1/post?host=exampleletters.substack.com&slug=${'a'.repeat(201)}`, 'INVALID_SLUG'],
+    ['/v1/post?id=0', 'INVALID_PARAM'],
+    ['/v1/post?id=-5', 'INVALID_PARAM'],
+    ['/v1/post?id=1e5', 'INVALID_PARAM'],
+    ['/v1/post?id=9007199254740993', 'INVALID_PARAM'],
+    ['/v1/post?id=9001&host=exampleletters.substack.com&slug=a-post', 'INVALID_PARAM'],
+    ['/v1/profile', 'INVALID_HANDLE'],
+    ['/v1/profile?handle=..', 'INVALID_HANDLE'],
+    ['/v1/profile?handle=.', 'INVALID_HANDLE'],
+    ['/v1/profile?handle=a%2Fb', 'INVALID_HANDLE'],
+    ['/v1/profile?handle=two%20words', 'INVALID_HANDLE'],
+    [`/v1/profile?handle=${'h'.repeat(65)}`, 'INVALID_HANDLE'],
+    ['/v1/search', 'INVALID_QUERY'],
+    ['/v1/search?q=a', 'INVALID_QUERY'],
+    ['/v1/search?q=%20%20a%20%20', 'INVALID_QUERY'],
+    [`/v1/search?q=${'q'.repeat(101)}`, 'INVALID_QUERY'],
+    ['/v1/search?q=ab%00cd', 'INVALID_QUERY'],
+    ['/v1/feed', 'INVALID_HOST'],
+    ['/v1/feed?host=substack.com', 'INVALID_HOST'],
+    ['/v1/feed?host=bad_host.com', 'INVALID_HOST'],
+  ]
+  await withUpstream({}, async () => {
+    for (const [path, code] of cases) await expectError(relay, path, 400, code)
+    assert.equal(fetchCalls.length, 0)
+  })
+})
+
+test('OPTIONS is 204, other methods are 405 and unknown paths 404, all with CORS headers', async () => {
+  const relay = newRelay()
+  await withUpstream({}, async () => {
+    const preflight = await call(relay, '/v1/archive?host=exampleletters.substack.com', { method: 'OPTIONS' })
+    assert.equal(preflight.res.status, 204)
+    assert.equal(preflight.text, '')
+    for (const method of ['POST', 'PUT', 'DELETE', 'PATCH', 'HEAD']) {
+      const { res } = await expectError(relay, '/v1/archive?host=exampleletters.substack.com', 405, 'METHOD_NOT_ALLOWED', { method })
+      assert.equal(res.headers.get('allow'), 'GET, OPTIONS')
+    }
+    await expectError(relay, '/v1/nothing', 404, 'NOT_FOUND')
+    await expectError(relay, '/v1/archive/', 404, 'NOT_FOUND')
+    await expectError(relay, '/api/v1/archive?host=exampleletters.substack.com', 404, 'NOT_FOUND')
+    assert.equal(fetchCalls.length, 0)
+  })
+})
+
+test('GET / and /privacy serve static HTML with a strict CSP', async () => {
+  const relay = newRelay()
+  await withUpstream({}, async () => {
+    for (const path of ['/', '/privacy']) {
+      const { res, text } = await call(relay, path)
+      assert.equal(res.status, 200)
+      assert.equal(res.headers.get('content-type'), 'text/html; charset=utf-8')
+      assert.equal(res.headers.get('content-security-policy'), "default-src 'none'; style-src 'unsafe-inline'; base-uri 'none'; frame-ancestors 'none'")
+      assert.equal(res.headers.get('cache-control'), 'public, max-age=3600')
+      assert.match(text, /Reader for Substack/)
+      assert.match(text, /not affiliated with Substack/)
+      assert.match(text, /relay\.example\.com/, 'the pages name the relay domain')
+      assert.doesNotMatch(text, /<script/i)
+    }
+    assert.equal(fetchCalls.length, 0)
+  })
+})
+
+test('a Substack response without x-served-by or x-cluster is discarded as HOST_NOT_SUBSTACK', async () => {
+  const relay = newRelay()
+  const url = archiveUrl('exampleletters.substack.com')
+  await withUpstream({ [url]: () => jsonResponse(archiveFixture) }, async () => {
+    const { text, error } = await expectError(relay, '/v1/archive?host=exampleletters.substack.com', 403, 'HOST_NOT_SUBSTACK')
+    assert.deepEqual(error.upstream, { status: 200, contentType: 'application/json', challenge: false })
+    assert.doesNotMatch(text, /Synthetic/)
+  })
+  await withUpstream({ [url]: () => jsonResponse([], 200, { 'X-Cluster': 'SubStack' }) }, async () => {
+    await expectOk<ArchivePage>(relay, '/v1/archive?host=exampleletters.substack.com')
+  })
+  await withUpstream({ [url]: () => jsonResponse([], 200, { 'X-Served-By': 'substack' }) }, async () => {
+    await expectOk<ArchivePage>(relay, '/v1/archive?host=exampleletters.substack.com')
+  })
+})
+
+test('custom domains: CNAME verdicts are cached for 24 h (pass) and 1 h (fail)', async () => {
+  const clock = createFakeClock(1_000_000)
+  const relay = newRelay({ now: clock.now })
+  await withUpstream({
+    [dohUrl('news.example.com', 'CNAME')]: () => dns(CNAME_TO_TARGET),
+    [archiveUrl('news.example.com')]: () => substackJson(archiveFixture),
+    [dohUrl('www.example.org', 'CNAME')]: () => dns([{ type: 5, data: 'elsewhere.example.net.' }]),
+    [dohUrl('www.example.org', 'A')]: () => dns([{ type: 1, data: '192.0.2.10' }]),
+    [dohUrl('www.example.org', 'AAAA')]: () => dns([]),
+    ...TARGET_DNS,
+    [proofUrl('www.example.org')]: () => html('<html>not substack</html>', 200),
+  }, async () => {
+    await expectOk<ArchivePage>(relay, '/v1/archive?host=news.example.com')
+    await expectError(relay, '/v1/archive?host=www.example.org', 403, 'HOST_NOT_SUBSTACK')
+    const urls = fetchCalls.map(entry => entry.url)
+    assert.deepEqual(urls.filter(url => url.includes('news.example.com')), [dohUrl('news.example.com', 'CNAME'), archiveUrl('news.example.com')])
+    assert.deepEqual(urls.filter(url => url.includes('www.example.org')).sort(), [
+      dohUrl('www.example.org', 'A'),
+      dohUrl('www.example.org', 'AAAA'),
+      dohUrl('www.example.org', 'CNAME'),
+      proofUrl('www.example.org'),
+    ].sort())
+    assert.equal(urls.includes(archiveUrl('www.example.org')), false, 'an unverified host is never fetched for content')
+
+    fetchCalls.length = 0
+    clock.advance(59 * 60_000)
+    await expectOk<ArchivePage>(relay, '/v1/archive?host=news.example.com')
+    await expectError(relay, '/v1/archive?host=www.example.org', 403, 'HOST_NOT_SUBSTACK')
+    assert.deepEqual(fetchCalls.map(entry => entry.url), [archiveUrl('news.example.com')], 'both verdicts come from memory')
+
+    fetchCalls.length = 0
+    clock.advance(2 * 60_000) // 61 minutes: the fail verdict expired, the pass verdict did not.
+    await expectOk<ArchivePage>(relay, '/v1/archive?host=news.example.com')
+    await expectError(relay, '/v1/archive?host=www.example.org', 403, 'HOST_NOT_SUBSTACK')
+    assert.equal(fetchCalls.filter(entry => entry.url === dohUrl('news.example.com', 'CNAME')).length, 0)
+    assert.equal(fetchCalls.filter(entry => entry.url === dohUrl('www.example.org', 'CNAME')).length, 1)
+
+    fetchCalls.length = 0
+    clock.advance(24 * 3_600_000)
+    await expectOk<ArchivePage>(relay, '/v1/archive?host=news.example.com')
+    assert.equal(fetchCalls.filter(entry => entry.url === dohUrl('news.example.com', 'CNAME')).length, 1)
+  })
+})
+
+test('custom domains: A/AAAA records shared with the Substack target pass (apex flattening, C4b)', async () => {
+  const relay = newRelay()
+  await withUpstream({
+    [dohUrl('letters.example.net', 'CNAME')]: () => dns([]),
+    [dohUrl('letters.example.net', 'A')]: () => dns([{ type: 1, data: '203.0.113.8' }, { type: 1, data: '198.51.100.7' }]),
+    [dohUrl('letters.example.net', 'AAAA')]: () => dns([]),
+    [dohUrl('chain.example.net', 'CNAME')]: () => dns([{ type: 5, data: 'pub.provider.example.net.' }]),
+    [dohUrl('chain.example.net', 'A')]: () => dns([
+      { type: 5, data: 'pub.provider.example.net.' },
+      { type: 5, data: 'TARGET.substack-custom-domains.com' },
+      { type: 1, data: '203.0.113.99' },
+    ]),
+    [dohUrl('chain.example.net', 'AAAA')]: () => dns([]),
+    ...TARGET_DNS,
+    [archiveUrl('letters.example.net')]: () => substackJson([]),
+    [archiveUrl('chain.example.net')]: () => substackJson([]),
+  }, async () => {
+    const flattened = await expectOk<ArchivePage>(relay, '/v1/archive?host=letters.example.net')
+    assert.equal(flattened.meta.host, 'letters.example.net')
+    assert.deepEqual(flattened.data, { publication: null, posts: [], nextOffset: null })
+    const chained = await expectOk<ArchivePage>(relay, '/v1/archive?host=chain.example.net')
+    assert.equal(chained.meta.host, 'chain.example.net')
+    assert.equal(fetchCalls.some(entry => entry.url.endsWith('&offset=0&limit=1')), false, 'no mapping proof was needed')
+  })
+})
+
+test('custom domains: Substack mapping proof passes when S.substack.com redirects to the host (C4c)', async () => {
+  const relay = newRelay()
+  const host = 'apex.example.net'
+  const claim = [{
+    id: 1,
+    publication_id: 4343,
+    slug: 'claim-post',
+    title: 'Claim',
+    audience: 'everyone',
+    publishedBylines: [{
+      id: 9,
+      name: 'Ann Example',
+      publicationUsers: [{
+        id: 3,
+        publication_id: 4343,
+        publication: { id: 4343, name: 'Apex Pub', subdomain: 'apexpub', custom_domain: host, custom_domain_optional: false },
+      }],
+    }],
+  }]
+  await withUpstream({
+    ...plainDns(host),
+    ...TARGET_DNS,
+    [proofUrl(host)]: () => substackJson(claim),
+    [proofUrl('apexpub.substack.com')]: () => redirectTo(proofUrl(host), 301),
+    [archiveUrl(host)]: () => substackJson(claim),
+  }, async () => {
+    const { meta, data } = await expectOk<ArchivePage>(relay, `/v1/archive?host=${host}`)
+    assert.equal(meta.host, host)
+    assert.deepEqual(data.publication, { id: 4343, name: 'Apex Pub', subdomain: 'apexpub', customDomain: host, host })
+    for (const entry of fetchCalls) {
+      assertUpstreamInit(entry.init, entry.url.startsWith('https://cloudflare-dns.com/') ? 'application/dns-json' : 'application/json')
+    }
+  })
+})
+
+test('custom domains: a failed proof is HOST_NOT_SUBSTACK; lookup outages are 503 and not cached', async () => {
+  const relay = newRelay()
+  const claimFor = (host: string, subdomain: string) => [{
+    id: 2,
+    publication_id: 77,
+    slug: 'claim',
+    publishedBylines: [{ id: 1, name: 'X', publicationUsers: [{ id: 1, publication_id: 77, publication: { id: 77, name: 'X', subdomain, custom_domain: host, custom_domain_optional: false } }] }],
+  }]
+  const offline = (): Response => {
+    throw new TypeError('network down')
+  }
+  await withUpstream({
+    ...TARGET_DNS,
+    ...plainDns('mirror.example.net'),
+    [proofUrl('mirror.example.net')]: () => substackJson(claimFor('mirror.example.net', 'mirrorpub')),
+    // A relative Location resolves against the request URL, i.e. back to mirrorpub.substack.com.
+    [proofUrl('mirrorpub.substack.com')]: () => redirectTo('/api/v1/archive?sort=new&offset=0&limit=1', 302),
+    ...plainDns('plain.example.net'),
+    [proofUrl('plain.example.net')]: () => jsonResponse(claimFor('plain.example.net', 'plainpub')),
+    [dohUrl('down.example.net', 'CNAME')]: offline,
+    [dohUrl('down.example.net', 'A')]: offline,
+    [dohUrl('down.example.net', 'AAAA')]: offline,
+    [proofUrl('down.example.net')]: offline,
+  }, async () => {
+    await expectError(relay, '/v1/archive?host=mirror.example.net', 403, 'HOST_NOT_SUBSTACK')
+    await expectError(relay, '/v1/archive?host=plain.example.net', 403, 'HOST_NOT_SUBSTACK')
+    assert.equal(fetchCalls.some(entry => entry.url === proofUrl('plainpub.substack.com')), false, 'an unfingerprinted claim is never followed up')
+    await expectError(relay, '/v1/archive?host=down.example.net', 503, 'UPSTREAM_UNAVAILABLE')
+    await expectError(relay, '/v1/archive?host=down.example.net', 503, 'UPSTREAM_UNAVAILABLE')
+    assert.equal(fetchCalls.filter(entry => entry.url === dohUrl('down.example.net', 'CNAME')).length, 2)
+  })
+})
+
+test('redirects: same-path hops to allowed hosts are followed, at most 3', async () => {
+  const relay = newRelay()
+  const path = '/api/v1/posts/a-post'
+  const request = '/v1/post?host=one.substack.com&slug=a-post'
+  await withUpstream({
+    [`https://one.substack.com${path}`]: () => redirectTo(`//two.substack.com${path}`, 302),
+    [`https://two.substack.com${path}`]: () => redirectTo(`https://three.substack.com${path}`, 307),
+    [`https://three.substack.com${path}`]: () => redirectTo(`https://four.substack.com${path}`, 308),
+    [`https://four.substack.com${path}`]: () => substackJson(postFreeFixture),
+  }, async () => {
+    const { meta, data } = await expectOk<PostResponse>(relay, request)
+    assert.equal(meta.host, 'four.substack.com')
+    assert.equal(data.post.id, 9001)
+    assert.equal(fetchCalls.length, 4)
+  })
+  await withUpstream({
+    [`https://one.substack.com${path}`]: () => redirectTo(`https://two.substack.com${path}`),
+    [`https://two.substack.com${path}`]: () => redirectTo(`https://three.substack.com${path}`),
+    [`https://three.substack.com${path}`]: () => redirectTo(`https://four.substack.com${path}`),
+    [`https://four.substack.com${path}`]: () => redirectTo(`https://five.substack.com${path}`),
+  }, async () => {
+    await expectError(relay, request, 502, 'TOO_MANY_REDIRECTS')
+    assert.equal(fetchCalls.length, 4)
+  })
+})
+
+test('redirects: other paths, schemes, ports, hosts and substack.com are refused', async () => {
+  const relay = newRelay()
+  const url = 'https://one.substack.com/api/v1/posts/a-post'
+  const request = '/v1/post?host=one.substack.com&slug=a-post'
+  const cases: Array<{ reply: () => Response; status: number; code: string }> = [
+    { reply: () => redirectTo('https://one.substack.com/p/a-post'), status: 502, code: 'REDIRECT_NOT_ALLOWED' },
+    { reply: () => redirectTo('/'), status: 502, code: 'REDIRECT_NOT_ALLOWED' },
+    { reply: () => redirectTo('http://two.substack.com/api/v1/posts/a-post'), status: 502, code: 'REDIRECT_NOT_ALLOWED' },
+    { reply: () => redirectTo('https://two.substack.com:8443/api/v1/posts/a-post'), status: 502, code: 'REDIRECT_NOT_ALLOWED' },
+    { reply: () => redirectTo('https://10.0.0.1/api/v1/posts/a-post'), status: 502, code: 'REDIRECT_NOT_ALLOWED' },
+    { reply: () => redirectTo('https://metadata.internal/api/v1/posts/a-post'), status: 502, code: 'REDIRECT_NOT_ALLOWED' },
+    { reply: () => redirectTo('https://a.b.substack.com/api/v1/posts/a-post'), status: 502, code: 'REDIRECT_NOT_ALLOWED' },
+    { reply: () => redirectTo(null), status: 502, code: 'REDIRECT_NOT_ALLOWED' },
+    // C4: an unknown subdomain bounces to substack.com: there is no such publication.
+    { reply: () => redirectTo('https://substack.com/'), status: 404, code: 'PUBLICATION_NOT_FOUND' },
+    { reply: () => redirectTo('https://substack.com/@ghost', 302), status: 404, code: 'PUBLICATION_NOT_FOUND' },
+    { reply: () => redirectTo('https://two.substack.com/api/v1/posts/a-post', 301, {}), status: 403, code: 'HOST_NOT_SUBSTACK' },
+  ]
+  let reply: () => Response = () => redirectTo(null)
+  await withUpstream({ [url]: () => reply() }, async () => {
+    for (const entry of cases) {
+      reply = entry.reply
+      fetchCalls.length = 0
+      const { error } = await expectError(relay, request, entry.status, entry.code)
+      assert.equal(error.upstream?.status, entry.reply().status)
+      assert.equal(fetchCalls.length, 1, `${entry.code}: no hop is fetched`)
+    }
+  })
+})
+
+test('upstream failures map to honest codes with bounded diagnostics and never echo bodies', async () => {
+  const relay = newRelay({ now: createFakeClock(Date.parse('2026-10-06T00:00:00Z')).now })
+  const url = 'https://exampleletters.substack.com/api/v1/posts/a-post'
+  const request = '/v1/post?host=exampleletters.substack.com&slug=a-post'
+  const SECRET = 'UPSTREAM-BODY-MUST-NOT-LEAK'
+  const cases: Array<{ reply: () => Response; status: number; code: string; upstream?: RelayUpstreamInfo; retryAfterSeconds?: number }> = [
+    { reply: () => html(`<html>${SECRET}</html>`, 403), status: 503, code: 'UPSTREAM_BLOCKED', upstream: { status: 403, contentType: 'text/html', challenge: false } },
+    { reply: () => html(SECRET, 403, { 'cf-mitigated': 'challenge' }), status: 503, code: 'UPSTREAM_BLOCKED', upstream: { status: 403, contentType: 'text/html', challenge: true } },
+    { reply: () => html(SECRET, 429, { 'Retry-After': '120', ...FINGERPRINT }), status: 503, code: 'UPSTREAM_RATE_LIMITED', upstream: { status: 429, contentType: 'text/html', challenge: false }, retryAfterSeconds: 120 },
+    { reply: () => html(SECRET, 429, { 'Retry-After': '99999999' }), status: 503, code: 'UPSTREAM_RATE_LIMITED', retryAfterSeconds: 86_400 },
+    { reply: () => html(SECRET, 429, { 'Retry-After': 'Tue, 06 Oct 2026 00:01:30 GMT' }), status: 503, code: 'UPSTREAM_RATE_LIMITED', retryAfterSeconds: 90 },
+    { reply: () => html(SECRET, 429, { 'Retry-After': SECRET }), status: 503, code: 'UPSTREAM_RATE_LIMITED' },
+    { reply: () => html(SECRET, 500, FINGERPRINT), status: 503, code: 'UPSTREAM_UNAVAILABLE', upstream: { status: 500, contentType: 'text/html', challenge: false } },
+    { reply: () => html(SECRET, 503), status: 503, code: 'UPSTREAM_UNAVAILABLE' },
+    { reply: () => substackJson({ error: 'Post not found', type: 'single' }, 404), status: 404, code: 'POST_NOT_FOUND', upstream: { status: 404, contentType: 'application/json', challenge: false } },
+    { reply: () => new Response(null, { status: 404, headers: FINGERPRINT }), status: 404, code: 'PUBLICATION_NOT_FOUND', upstream: { status: 404, contentType: 'missing', challenge: false } },
+    { reply: () => html(SECRET, 404), status: 403, code: 'HOST_NOT_SUBSTACK' },
+    { reply: () => substackJson({ error: SECRET }, 400), status: 502, code: 'UPSTREAM_ERROR', upstream: { status: 400, contentType: 'application/json', challenge: false } },
+    { reply: () => html(SECRET, 200, FINGERPRINT), status: 502, code: 'UPSTREAM_INVALID', upstream: { status: 200, contentType: 'text/html', challenge: false } },
+    { reply: () => html(SECRET, 200), status: 403, code: 'HOST_NOT_SUBSTACK', upstream: { status: 200, contentType: 'text/html', challenge: false } },
+    { reply: () => new Response(`{${SECRET}`, { headers: { 'content-type': 'application/json', ...FINGERPRINT } }), status: 502, code: 'UPSTREAM_INVALID' },
+    { reply: () => substackJson([SECRET]), status: 502, code: 'UPSTREAM_INVALID' },
+    { reply: () => substackJson({ slug: 'a-post', title: SECRET }), status: 502, code: 'UPSTREAM_INVALID' },
+    {
+      reply: () => {
+        throw new TypeError(SECRET)
+      },
+      status: 503,
+      code: 'UPSTREAM_UNAVAILABLE',
+    },
+  ]
+  let reply: () => Response = () => html('', 500)
+  await withUpstream({ [url]: () => reply() }, async () => {
+    for (const entry of cases) {
+      reply = entry.reply
+      const { res, error, text } = await expectError(relay, request, entry.status, entry.code)
+      assert.doesNotMatch(text, new RegExp(SECRET))
+      if (entry.upstream) assert.deepEqual(error.upstream, entry.upstream)
+      assert.equal(error.retryAfterSeconds, entry.retryAfterSeconds, `${entry.code} retryAfterSeconds`)
+      assert.equal(res.headers.get('retry-after'), entry.retryAfterSeconds === undefined ? null : String(entry.retryAfterSeconds))
+    }
+  })
+})
+
+test('responses over the route cap are UPSTREAM_TOO_LARGE, streamed or declared', async () => {
+  const relay = newRelay()
+  const url = archiveUrl('exampleletters.substack.com')
+  const stream = (total: number): ReadableStream<Uint8Array> => {
+    let sent = 0
+    return new ReadableStream<Uint8Array>({
+      pull(controller) {
+        if (sent >= total) {
+          controller.close()
+          return
+        }
+        const size = Math.min(65_536, total - sent)
+        sent += size
+        controller.enqueue(new Uint8Array(size).fill(0x20))
+      },
+    })
+  }
+  let reply: () => Response = () => new Response(stream(1024 * 1024 + 1), { headers: { 'content-type': 'application/json', ...FINGERPRINT } })
+  await withUpstream({ [url]: () => reply() }, async () => {
+    const streamed = await expectError(relay, '/v1/archive?host=exampleletters.substack.com', 502, 'UPSTREAM_TOO_LARGE')
+    assert.deepEqual(streamed.error.upstream, { status: 200, contentType: 'application/json', challenge: false })
+    reply = () => new Response('[]', { headers: { 'content-type': 'application/json', 'content-length': String(2 * 1024 * 1024), ...FINGERPRINT } })
+    await expectError(relay, '/v1/archive?host=exampleletters.substack.com', 502, 'UPSTREAM_TOO_LARGE')
+    reply = () => new Response(stream(1024 * 1024), { headers: { 'content-type': 'application/json', ...FINGERPRINT } })
+    // Exactly at the cap is read in full (then fails JSON parsing, which is a different error).
+    await expectError(relay, '/v1/archive?host=exampleletters.substack.com', 502, 'UPSTREAM_INVALID')
+  })
+})
+
+test('a hung upstream answers UPSTREAM_TIMEOUT', async () => {
+  const relay = newRelay({ timeoutMs: 25 })
+  await withUpstream({
+    [archiveUrl('exampleletters.substack.com')]: init => new Promise<Response>((_resolve, reject) => {
+      const signal = init?.signal
+      if (!signal) {
+        reject(new Error('The relay must pass an AbortSignal.'))
+        return
+      }
+      signal.addEventListener('abort', () => reject(new DOMException('The operation was aborted.', 'AbortError')), { once: true })
+    }),
+  }, async () => {
+    const { error } = await expectError(relay, '/v1/archive?host=exampleletters.substack.com', 504, 'UPSTREAM_TIMEOUT')
+    assert.equal(error.upstream, undefined)
+  })
+})
+
+test('post: free, paid preview and paid-without-preview bodies are trimmed exactly (C11)', async () => {
+  const relay = newRelay()
+  const base = 'https://exampleletters.substack.com/api/v1/posts/'
+  await withUpstream({
+    [`${base}the-first-synthetic-post`]: () => substackJson(postFreeFixture),
+    [`${base}a-paid-synthetic-post`]: () => substackJson(postPaidPreviewFixture),
+    [`${base}hidden-synthetic-thread`]: () => substackJson(postPaidNullFixture),
+  }, async () => {
+    const free = await expectOk<PostResponse>(relay, '/v1/post?host=exampleletters.substack.com&slug=the-first-synthetic-post')
+    assert.equal(free.res.headers.get('cache-control'), 'public, max-age=300')
+    assert.equal(free.meta.host, 'exampleletters.substack.com')
+    const expectedFree: PostDetail = {
+      ...ARCHIVE_POSTS[0],
+      authors: ['Ada Example'],
+      bodyHtml: '<p>Synthetic paragraph one.</p><p>Synthetic paragraph two with <em>emphasis</em>.</p>',
+      truncated: false,
+    }
+    assert.deepEqual(free.data, { post: expectedFree, publication: EXAMPLE_LETTERS })
+
+    const preview = await expectOk<PostResponse>(relay, '/v1/post?host=exampleletters.substack.com&slug=a-paid-synthetic-post')
+    const expectedPreview: PostDetail = {
+      id: 9101,
+      publicationId: 424242,
+      slug: 'a-paid-synthetic-post',
+      title: 'A Paid Synthetic Post',
+      subtitle: 'Invented paid subtitle',
+      postDate: '2026-09-30T07:15:00.000Z',
+      audience: 'only_paid',
+      isPaywalled: true,
+      type: 'newsletter',
+      wordcount: 1859,
+      canonicalUrl: 'https://news.example.com/p/a-paid-synthetic-post',
+      authors: ['Ada Example'],
+      podcastDurationSec: null,
+      bodyHtml: '<p>Invented free preview paragraph.</p>',
+      truncated: true,
+    }
+    assert.deepEqual(preview.data, { post: expectedPreview, publication: EXAMPLE_LETTERS })
+
+    const hidden = await expectOk<PostResponse>(relay, '/v1/post?host=exampleletters.substack.com&slug=hidden-synthetic-thread')
+    const expectedHidden: PostDetail = {
+      id: 9102,
+      publicationId: 424242,
+      slug: 'hidden-synthetic-thread',
+      title: 'Hidden Synthetic Thread',
+      subtitle: null,
+      postDate: '2026-09-28T21:00:00.000Z',
+      audience: 'only_paid',
+      isPaywalled: true,
+      type: 'thread',
+      wordcount: 20,
+      canonicalUrl: 'https://news.example.com/p/hidden-synthetic-thread',
+      authors: [],
+      podcastDurationSec: null,
+      bodyHtml: null,
+      truncated: true,
+    }
+    assert.deepEqual(hidden.data, { post: expectedHidden, publication: null })
+  })
+})
+
+test('post by id: substack.com by-id is allowed and meta.host is the publication host', async () => {
+  const relay = newRelay()
+  await withUpstream({ 'https://substack.com/api/v1/posts/by-id/9201': () => substackJson(byIdFixture) }, async () => {
+    const { data, meta, res } = await expectOk<PostResponse>(relay, '/v1/post?id=9201')
+    assert.equal(res.headers.get('cache-control'), 'public, max-age=300')
+    assert.equal(meta.host, 'news.example.com')
+    const expected: PostDetail = {
+      id: 9201,
+      publicationId: 424242,
+      slug: 'shared-by-id',
+      title: 'Shared By Id',
+      subtitle: 'Reached through a share link',
+      postDate: '2026-10-03T09:45:00.000Z',
+      audience: 'everyone',
+      isPaywalled: false,
+      type: 'newsletter',
+      wordcount: 640,
+      canonicalUrl: 'https://news.example.com/p/shared-by-id',
+      authors: ['Ada Example'],
+      podcastDurationSec: null,
+      bodyHtml: '<p>Invented body reached by numeric id.</p>',
+      truncated: false,
+    }
+    assert.deepEqual(data, { post: expected, publication: EXAMPLE_LETTERS })
+    assert.equal(fetchCalls.length, 1, 'substack.com needs no DNS check')
+    assertUpstreamInit(fetchCalls[0].init, 'application/json')
+  })
+})
+
+test('profile: public subscriptions and the primary publication follow the host rules', async () => {
+  const relay = newRelay()
+  await withUpstream({
+    'https://substack.com/api/v1/user/adaexample/public_profile': () => substackJson(profileFixture),
+    'https://substack.com/api/v1/user/ghost/public_profile': () => substackJson({ error: 'User not found' }, 404),
+    'https://substack.com/api/v1/user/elsewhere/public_profile': () => redirectTo('https://www.substack.com/api/v1/user/elsewhere/public_profile'),
+  }, async () => {
+    const { data, meta, res } = await expectOk<Profile>(relay, '/v1/profile?handle=%40adaexample')
+    assert.equal(res.headers.get('cache-control'), 'public, max-age=600')
+    assert.equal(meta.host, 'substack.com')
+    const expected: Profile = {
+      handle: 'adaexample',
+      name: 'Ada Example',
+      primaryPublication: EXAMPLE_LETTERS,
+      subscriptions: [
+        { id: 555, name: 'Plain Example', subdomain: 'plainexample', customDomain: null, host: 'plainexample.substack.com' },
+        { id: 556, name: 'Optional Domain Example', subdomain: 'optionalexample', customDomain: null, host: 'optionalexample.substack.com' },
+        { id: 559, name: 'Custom Example', subdomain: 'customexample', customDomain: 'letters.example.org', host: 'letters.example.org' },
+      ],
+    }
+    assert.deepEqual(data, expected)
+    await expectError(relay, '/v1/profile?handle=ghost', 404, 'PROFILE_NOT_FOUND')
+    await expectError(relay, '/v1/profile?handle=elsewhere', 502, 'REDIRECT_NOT_ALLOWED')
+  })
+})
+
+test('search: top/search groups become deduped PubMeta, comments are ignored (C3)', async () => {
+  const relay = newRelay()
+  const many = {
+    items: [{
+      type: 'profileSearchResults',
+      results: Array.from({ length: 30 }, (_value, index) => ({
+        id: index + 1,
+        primaryPublication: { id: 1000 + index, name: `Pub ${index}`, subdomain: `pub${index}`, custom_domain: null, custom_domain_optional: false },
+      })),
+    }],
+  }
+  await withUpstream({
+    'https://substack.com/api/v1/top/search?query=example%20letters': () => substackJson(topSearchFixture),
+    'https://substack.com/api/v1/top/search?query=many%20pubs': () => substackJson(many),
+    'https://substack.com/api/v1/top/search?query=odd%20shape': () => substackJson({ results: [] }),
+  }, async () => {
+    const { data, meta, res } = await expectOk<SearchResponse>(relay, '/v1/search?q=%20example%20letters%20')
+    assert.equal(res.headers.get('cache-control'), 'public, max-age=600')
+    assert.equal(meta.host, 'substack.com')
+    assert.deepEqual(data, {
+      results: [
+        EXAMPLE_LETTERS,
+        { id: 888, name: 'Cy Writes', subdomain: 'cywrites', customDomain: null, host: 'cywrites.substack.com' },
+        { id: 321, name: 'Base Url Example', subdomain: 'baseurlexample', customDomain: 'read.example.org', host: 'read.example.org' },
+        { id: 322, name: 'Optional Base', subdomain: 'optionalbase', customDomain: null, host: 'optionalbase.substack.com' },
+      ],
+    })
+    assertUpstreamInit(fetchCalls[0].init, 'application/json')
+    const capped = await expectOk<SearchResponse>(relay, '/v1/search?q=many%20pubs')
+    assert.equal(capped.data.results.length, 20)
+    assert.equal(capped.data.results[19].host, 'pub19.substack.com')
+    await expectError(relay, '/v1/search?q=odd%20shape', 502, 'UPSTREAM_INVALID')
+  })
+})
+
+test('feed: RSS XML is passed through with the XML content type; other types are refused', async () => {
+  const relay = newRelay()
+  const xml = '<?xml version="1.0" encoding="UTF-8"?><rss version="2.0"><channel><title>Example Letters</title></channel></rss>'
+  let reply: () => Response = () => new Response(xml, { headers: { 'content-type': 'application/xml; charset=utf-8', ...FINGERPRINT } })
+  await withUpstream({ 'https://exampleletters.substack.com/feed': () => reply() }, async () => {
+    const { res, text } = await call(relay, '/v1/feed?host=exampleletters.substack.com')
+    assert.equal(res.status, 200)
+    assert.equal(res.headers.get('content-type'), 'application/xml; charset=utf-8')
+    assert.equal(res.headers.get('cache-control'), 'public, max-age=120')
+    assert.equal(text, xml)
+    assertUpstreamInit(fetchCalls[0].init, 'application/rss+xml, application/xml;q=0.9')
+    reply = () => new Response(xml, { headers: { 'content-type': 'text/xml', ...FINGERPRINT } })
+    assert.equal((await call(relay, '/v1/feed?host=exampleletters.substack.com')).res.status, 200)
+    reply = () => html(xml, 200, FINGERPRINT)
+    await expectError(relay, '/v1/feed?host=exampleletters.substack.com', 502, 'UPSTREAM_INVALID')
+    reply = () => new Response('{"not":"xml"}', { headers: { 'content-type': 'application/xml', ...FINGERPRINT } })
+    await expectError(relay, '/v1/feed?host=exampleletters.substack.com', 502, 'UPSTREAM_INVALID')
+  })
+})
+
+test('health reports the protocol and echoes the Origin without touching the network', async () => {
+  const relay = newRelay({ now: createFakeClock(5_000).now })
+  await withUpstream({}, async () => {
+    const { data, meta, res } = await expectOk<HealthResponse>(relay, '/v1/health', { headers: { Origin: 'https://webview.example.com' } })
+    assert.equal(res.headers.get('cache-control'), 'no-store')
+    assert.deepEqual(data, { service: 'substack-reader-relay', protocol: 1, revision: null, origin: 'https://webview.example.com' })
+    assert.deepEqual(meta, { host: 'relay.example.com', cached: false, fetchedAt: new Date(5_000).toISOString() })
+    const nullOrigin = await expectOk<HealthResponse>(relay, '/v1/health', { headers: { Origin: 'null' } }, { REVISION: 'abc1234' })
+    assert.equal(nullOrigin.data.origin, 'null')
+    assert.equal(nullOrigin.data.revision, 'abc1234')
+    const none = await expectOk<HealthResponse>(relay, '/v1/health?probe=0')
+    assert.equal(none.data.origin, null)
+    assert.equal(none.data.probes, undefined)
+    const long = await expectOk<HealthResponse>(relay, '/v1/health', { headers: { Origin: `https://${'o'.repeat(200)}.example.com` } })
+    assert.equal(long.data.origin?.length, 128)
+    assert.equal(fetchCalls.length, 0)
+  })
+})
+
+test('health probe=1 reports status-only probes of the three upstream kinds', async () => {
+  const relay = newRelay({ now: createFakeClock(5_000).now })
+  await withUpstream({
+    'https://on.substack.com/api/v1/archive?sort=new&offset=0&limit=1': () => substackJson([{ id: 1 }]),
+    'https://www.slowboring.com/api/v1/archive?sort=new&offset=0&limit=1': () => html('blocked', 403, { 'cf-mitigated': 'challenge' }),
+    'https://substack.com/api/v1/top/search?query=substack': () => {
+      throw new TypeError('offline')
+    },
+  }, async () => {
+    const { data } = await expectOk<HealthResponse>(relay, '/v1/health?probe=1')
+    assert.deepEqual(data.probes, [
+      { target: 'subdomain', status: 200, contentType: 'application/json', challenge: false, ms: 0 },
+      { target: 'customDomain', status: 403, contentType: 'text/html', challenge: true, ms: 0 },
+      { target: 'substackCom', status: 0, contentType: 'missing', challenge: false, ms: 0 },
+    ])
+    for (const entry of fetchCalls) assertUpstreamInit(entry.init, 'application/json')
+  })
+})
+
+test('the local limiter allows 60 requests per minute per client and route (fake clock)', async () => {
+  const clock = createFakeClock(0)
+  const relay = newRelay({ now: clock.now })
+  const ip = { 'CF-Connecting-IP': '203.0.113.50' }
+  await withUpstream({ [archiveUrl('exampleletters.substack.com')]: () => substackJson([]) }, async () => {
+    for (let index = 0; index < 60; index += 1) await expectOk<HealthResponse>(relay, '/v1/health', { headers: ip })
+    const limited = await expectError(relay, '/v1/health', 429, 'RATE_LIMITED', { headers: ip })
+    assert.equal(limited.error.retryAfterSeconds, 1)
+    assert.equal(limited.res.headers.get('retry-after'), '1')
+    await expectOk<HealthResponse>(relay, '/v1/health', { headers: { 'CF-Connecting-IP': '203.0.113.51' } })
+    await expectOk<ArchivePage>(relay, '/v1/archive?host=exampleletters.substack.com', { headers: ip })
+    clock.advance(1_000)
+    await expectOk<HealthResponse>(relay, '/v1/health', { headers: ip })
+    await expectError(relay, '/v1/health', 429, 'RATE_LIMITED', { headers: ip })
+    clock.advance(60_000)
+    for (let index = 0; index < 60; index += 1) await expectOk<HealthResponse>(relay, '/v1/health', { headers: ip })
+    await expectError(relay, '/v1/health', 429, 'RATE_LIMITED', { headers: ip })
+  })
+})
+
+test('with the RL binding the relay asks it with ip:route keys and honours a refusal', async () => {
+  const keys: string[] = []
+  const env: Env = {
+    RL: {
+      async limit({ key }) {
+        keys.push(key)
+        return { success: keys.length < 2 }
+      },
+    },
+  }
+  const relay = newRelay()
+  const headers = { 'CF-Connecting-IP': '198.51.100.20' }
+  await withUpstream({}, async () => {
+    await expectOk<HealthResponse>(relay, '/v1/health', { headers }, env)
+    const { error, res } = await expectError(relay, '/v1/health', 429, 'RATE_LIMITED', { headers }, env)
+    assert.equal(error.retryAfterSeconds, 60)
+    assert.equal(res.headers.get('retry-after'), '60')
+    assert.deepEqual(keys, ['198.51.100.20:health', '198.51.100.20:health'])
+  })
+})
+
+interface StoredEntry {
+  status: number
+  body: string
+  headers: Headers
+}
+
+function memoryCache(): CacheLike & { entries: Map<string, StoredEntry> } {
+  const entries = new Map<string, StoredEntry>()
+  return {
+    entries,
+    async match(key) {
+      const entry = entries.get(key)
+      return entry ? new Response(entry.body, { status: entry.status, headers: entry.headers }) : undefined
+    },
+    async put(key, response) {
+      entries.set(key, { status: response.status, body: await response.text(), headers: new Headers(response.headers) })
+    },
+  }
+}
+
+test('edge cache: hits skip upstream and set meta.cached; 404s are kept 60 s; failures are never cached', async () => {
+  const cache = memoryCache()
+  const clock = createFakeClock(1_000)
+  const relay = newRelay({ cache, now: clock.now })
+  const post = (slug: string) => `https://exampleletters.substack.com/api/v1/posts/${slug}`
+  await withUpstream({
+    [archiveUrl('exampleletters.substack.com')]: () => redirectTo(archiveUrl('news.example.com')),
+    [dohUrl('news.example.com', 'CNAME')]: () => dns(CNAME_TO_TARGET),
+    [archiveUrl('news.example.com')]: () => substackJson(archiveFixture),
+    [archiveUrl('news.example.com', 12)]: () => substackJson([]),
+    [post('missing-post')]: () => substackJson({ error: 'Post not found', type: 'single' }, 404),
+    [post('blocked-post')]: () => html('blocked', 403),
+  }, async () => {
+    const first = await expectOk<ArchivePage>(relay, '/v1/archive?host=exampleletters.substack.com')
+    assert.equal(first.meta.cached, false)
+    assert.equal(fetchCalls.length, 3)
+    const requestedKey = `${CACHE_ORIGIN}/v1/archive?host=exampleletters.substack.com&offset=0&limit=12&sort=new`
+    const finalKey = `${CACHE_ORIGIN}/v1/archive?host=news.example.com&offset=0&limit=12&sort=new`
+    assert.deepEqual([...cache.entries.keys()].filter(key => key.includes('/v1/archive')).sort(), [finalKey, requestedKey].sort())
+    assert.equal(cache.entries.get(requestedKey)?.headers.get('cache-control'), 'public, max-age=300')
+    assert.equal(cache.entries.get(requestedKey)?.headers.get('set-cookie'), null)
+    const verdict = cache.entries.get(`${CACHE_ORIGIN}/host-verdict?host=news.example.com`)
+    assert.deepEqual(verdict && JSON.parse(verdict.body), { verdict: 'pass', expires: 1_000 + 24 * 3_600_000 })
+
+    const second = await expectOk<ArchivePage>(relay, '/v1/archive?host=exampleletters.substack.com')
+    assert.equal(second.meta.cached, true)
+    assert.equal(second.meta.fetchedAt, first.meta.fetchedAt)
+    assert.equal(second.meta.host, 'news.example.com')
+    assert.deepEqual(second.data, first.data)
+    assert.equal(second.res.headers.get('cache-control'), 'public, max-age=60')
+    const alias = await expectOk<ArchivePage>(relay, '/v1/archive?host=news.example.com')
+    assert.equal(alias.meta.cached, true)
+    assert.equal(fetchCalls.length, 3, 'cache hits make no upstream requests')
+
+    // Another isolate sharing the edge cache reuses the stored verdict instead of asking DNS again.
+    fetchCalls.length = 0
+    const otherIsolate = newRelay({ cache, now: clock.now })
+    await expectOk<ArchivePage>(otherIsolate, '/v1/archive?host=news.example.com&offset=12')
+    assert.deepEqual(fetchCalls.map(entry => entry.url), [archiveUrl('news.example.com', 12)])
+
+    fetchCalls.length = 0
+    await expectError(relay, '/v1/post?host=exampleletters.substack.com&slug=missing-post', 404, 'POST_NOT_FOUND')
+    await expectError(relay, '/v1/post?host=exampleletters.substack.com&slug=missing-post', 404, 'POST_NOT_FOUND')
+    assert.equal(fetchCalls.filter(entry => entry.url === post('missing-post')).length, 1)
+    const notFound = cache.entries.get(`${CACHE_ORIGIN}/v1/post?host=exampleletters.substack.com&slug=missing-post`)
+    assert.equal(notFound?.status, 404)
+    assert.equal(notFound?.headers.get('cache-control'), 'public, max-age=60')
+
+    await expectError(relay, '/v1/post?host=exampleletters.substack.com&slug=blocked-post', 503, 'UPSTREAM_BLOCKED')
+    await expectError(relay, '/v1/post?host=exampleletters.substack.com&slug=blocked-post', 503, 'UPSTREAM_BLOCKED')
+    assert.equal(fetchCalls.filter(entry => entry.url === post('blocked-post')).length, 2)
+    assert.equal([...cache.entries.keys()].some(key => key.includes('blocked-post')), false)
+  })
+})
+
+test('the default export is a ready relay that looks up globalThis.fetch per call', async () => {
+  await withUpstream({
+    'https://on.substack.com/api/v1/archive?sort=new&offset=0&limit=1': () => substackJson([]),
+    'https://www.slowboring.com/api/v1/archive?sort=new&offset=0&limit=1': () => substackJson([]),
+    'https://substack.com/api/v1/top/search?query=substack': () => substackJson({ items: [] }),
+  }, async () => {
+    const res = await relayDefault.fetch(new Request(`${RELAY_ORIGIN}/v1/health?probe=1`))
+    assertCommonHeaders(res)
+    assert.equal(res.status, 200)
+    const body = JSON.parse(await res.text()) as RelayEnvelope<HealthResponse>
+    if (!body.ok) throw new Error('health failed')
+    assert.deepEqual(body.data.probes?.map(probe => probe.status), [200, 200, 200])
+    assert.equal(fetchCalls.length, 3)
+  })
+})

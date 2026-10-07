@@ -1,0 +1,145 @@
+{
+  "items": [
+    {
+      "type": "profileSearchResults",
+      "query": "example letters",
+      "hasMore": false,
+      "expansionUrl": "/search/example%20letters?searching=all_profiles",
+      "trackingParameters": {},
+      "results": [
+        {
+          "id": 501,
+          "name": "Ada Example",
+          "handle": "adaexample",
+          "photo_url": null,
+          "bio": "An invented bio.",
+          "followerCount": 42,
+          "subscriptions": [],
+          "primaryPublication": {
+            "id": 424242,
+            "name": "Example Letters ",
+            "subdomain": "exampleletters",
+            "custom_domain": "news.example.com",
+            "custom_domain_optional": false,
+            "author_id": 501,
+            "explicit": false,
+            "handles_enabled": true,
+            "logo_url": null,
+            "payments_state": "enabled",
+            "primary_user_id": 501,
+            "user_id": 501
+          }
+        },
+        {
+          "id": 503,
+          "name": "Cy Person",
+          "handle": "cyperson",
+          "photo_url": null,
+          "bio": null,
+          "primaryPublication": {
+            "id": 888,
+            "name": " Cy Writes",
+            "subdomain": "cywrites",
+            "custom_domain": null,
+            "custom_domain_optional": false,
+            "logo_url": null,
+            "payments_state": "disabled"
+          }
+        },
+        {
+          "id": 504,
+          "name": "No Publication",
+          "handle": "nopublication",
+          "photo_url": null,
+          "bio": null,
+          "primaryPublication": null
+        }
+      ]
+    },
+    {
+      "type": "post",
+      "entity_key": "p-9001",
+      "canReply": true,
+      "isMuted": false,
+      "context": { "type": "search" },
+      "trackingParameters": {},
+      "post": {
+        "id": 9001,
+        "slug": "the-first-synthetic-post",
+        "publication_id": 424242,
+        "audience": "everyone",
+        "type": "newsletter",
+        "title": "The First Synthetic Post",
+        "body_html": ""
+      },
+      "publication": {
+        "id": 424242,
+        "name": "Example Letters ",
+        "subdomain": "exampleletters",
+        "custom_domain": "news.example.com",
+        "custom_domain_optional": false,
+        "base_url": "https://news.example.com",
+        "hostname": "news.example.com"
+      }
+    },
+    {
+      "type": "comment",
+      "entity_key": "c-12345",
+      "comment": { "id": 12345, "body": "An invented note." },
+      "publication": {
+        "id": 999,
+        "name": "Comment Only Pub",
+        "subdomain": "commentonly",
+        "custom_domain": null,
+        "custom_domain_optional": false,
+        "base_url": "https://commentonly.substack.com",
+        "hostname": "commentonly.substack.com"
+      }
+    },
+    {
+      "type": "post",
+      "entity_key": "p-9301",
+      "post": {
+        "id": 9301,
+        "slug": "base-url-post",
+        "publication_id": 321,
+        "audience": "everyone",
+        "type": "newsletter",
+        "title": "Base Url Post"
+      },
+      "publication": {
+        "id": 321,
+        "name": "Base Url Example",
+        "subdomain": "baseurlexample",
+        "custom_domain": "read.example.org",
+        "custom_domain_optional": false,
+        "base_url": "https://read.example.org",
+        "hostname": "read.example.org"
+      }
+    },
+    {
+      "type": "post",
+      "entity_key": "p-9302",
+      "post": {
+        "id": 9302,
+        "slug": "optional-base-post",
+        "publication_id": 322,
+        "audience": "only_paid",
+        "type": "newsletter",
+        "title": "Optional Base Post"
+      },
+      "publication": {
+        "id": 322,
+        "name": "Optional Base",
+        "subdomain": "optionalbase",
+        "custom_domain": "www.optional-base.com",
+        "custom_domain_optional": true,
+        "base_url": "https://optionalbase.substack.com",
+        "hostname": "optionalbase.substack.com"
+      }
+    }
+  ],
+  "originalCursorTimestamp": "2026-10-06T23:50:00.000Z",
+  "nextCursor": null,
+  "trackingParameters": {}
+}

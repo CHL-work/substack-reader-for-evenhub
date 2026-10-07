@@ -1,0 +1,7 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24" width="512" height="512" shape-rendering="crispEdges">
+  <title>Reader for Substack</title>
+  <rect width="24" height="24" fill="#141414"/>
+  <path d="M4 2h12v2h2v2h2v16H4z" fill="#e6e6e6"/>
+  <path d="M16 2h2v2h2v2h-4z" fill="#8a8a8a"/>
+  <path d="M8 8h8v2H8zM8 12h8v2H8zM8 16h6v2H8z" fill="#141414"/>
+</svg>

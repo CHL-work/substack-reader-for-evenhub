@@ -1,0 +1,97 @@
+name: CI
+
+# Runtime tests run only here (project rule: never locally). Without the
+# repository variable VITE_RELAY_ORIGIN the job still checks, tests and
+# builds, but packs no .ehpk.
+
+on:
+  push:
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  check-test-package:
+    runs-on: ubuntu-latest
+    timeout-minutes: 25
+    steps:
+      - name: Check out source
+        uses: actions/checkout@v7
+        with:
+          persist-credentials: false
+
+      - name: Set up Node.js
+        uses: actions/setup-node@v7
+        with:
+          node-version: '22'
+          package-manager-cache: false
+
+      - name: Set up pnpm
+        uses: pnpm/action-setup@v6
+        with:
+          version: 10.32.1
+
+      - name: Install locked dependencies
+        run: pnpm install --frozen-lockfile
+
+      - name: Check types
+        run: pnpm run check
+
+      - name: Unit tests (Node)
+        env:
+          CI: 'true'
+        run: pnpm run test:ci
+
+      - name: Install CI Chromium
+        run: pnpm exec playwright install --with-deps chromium
+
+      - name: Browser tests (Chromium, network blocked)
+        env:
+          CI: 'true'
+        run: pnpm run test:browser:ci
+
+      - name: Phone and glasses flows (Chromium, bridge stub)
+        env:
+          CI: 'true'
+        run: pnpm run test:ui:ci
+
+      # The relay origin and build flags are set per step, so test builds never see them.
+      - name: Validate relay origin
+        id: relay
+        shell: bash
+        env:
+          VITE_RELAY_ORIGIN: ${{ vars.VITE_RELAY_ORIGIN }}
+        run: node scripts/check-relay-origin.mjs >> "$GITHUB_OUTPUT"
+
+      - name: Build production bundle
+        env:
+          VITE_RELAY_ORIGIN: ${{ vars.VITE_RELAY_ORIGIN }}
+          VITE_ENABLE_RSS2JSON_FALLBACK: ${{ vars.ENABLE_RSS2JSON_FALLBACK }}
+        run: pnpm run build
+
+      - name: Package .ehpk
+        if: steps.relay.outputs.configured == 'true'
+        env:
+          VITE_RELAY_ORIGIN: ${{ vars.VITE_RELAY_ORIGIN }}
+          VITE_ENABLE_RSS2JSON_FALLBACK: ${{ vars.ENABLE_RSS2JSON_FALLBACK }}
+          ENABLE_RSS2JSON_FALLBACK: ${{ vars.ENABLE_RSS2JSON_FALLBACK }}
+        run: pnpm run pack
+
+      - name: Explain missing package
+        if: steps.relay.outputs.configured != 'true'
+        run: echo "::warning::Repository variable VITE_RELAY_ORIGIN is not set, so no .ehpk was packed. Deploy the relay and set the variable."
+
+      - name: Upload package
+        if: steps.relay.outputs.configured == 'true'
+        uses: actions/upload-artifact@v7
+        with:
+          name: substack-reader-ehpk
+          path: artifacts/*.ehpk
+          if-no-files-found: error
+          retention-days: 14

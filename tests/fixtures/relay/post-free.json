@@ -1,0 +1,71 @@
+{
+  "id": 9001,
+  "editor_v2": false,
+  "publication_id": 424242,
+  "title": "The First Synthetic Post",
+  "social_title": "Synthetic social title",
+  "type": "newsletter",
+  "slug": "the-first-synthetic-post",
+  "post_date": "2026-10-01T12:00:00.000Z",
+  "audience": "everyone",
+  "audience_before_archived": null,
+  "exempt_from_archive_paywall": false,
+  "podcast_duration": null,
+  "canonical_url": "https://news.example.com/p/the-first-synthetic-post",
+  "subtitle": "An invented subtitle for testing.",
+  "cover_image": null,
+  "description": "An invented subtitle for testing.",
+  "body_json": null,
+  "body_html": "<p>Synthetic paragraph one.</p><p>Synthetic paragraph two with <em>emphasis</em>.</p>",
+  "truncated_body_text": "",
+  "wordcount": 1150,
+  "post_preview_limit": null,
+  "language": "en",
+  "has_shareable_clips": false,
+  "is_published": true,
+  "live_stream_id": null,
+  "meter_type": "none",
+  "next_post_slug": "second-synthetic-post",
+  "previous_post_slug": null,
+  "podcast_art_url": null,
+  "section_pins": [],
+  "show_guest_bios": false,
+  "themeVariables": {},
+  "unlockedWithCampaign": false,
+  "unlockedWithIP": false,
+  "updated_at": "2026-10-01T12:30:00.000Z",
+  "publishedBylines": [
+    {
+      "id": 501,
+      "name": "Ada Example",
+      "handle": "adaexample",
+      "photo_url": null,
+      "bio": null,
+      "publicationUsers": [
+        {
+          "id": 7002,
+          "user_id": 501,
+          "publication_id": 424242,
+          "role": "admin",
+          "public": true,
+          "is_primary": true,
+          "publication": {
+            "id": 424242,
+            "name": "Example Letters ",
+            "subdomain": "exampleletters",
+            "custom_domain": "news.example.com",
+            "custom_domain_optional": false,
+            "logo_url": null,
+            "author_id": 501,
+            "payments_state": "enabled",
+            "homepage_type": "newspaper"
+          }
+        }
+      ],
+      "is_guest": false,
+      "bestseller_tier": null
+    }
+  ],
+  "reaction_count": 12,
+  "comment_count": 3
+}

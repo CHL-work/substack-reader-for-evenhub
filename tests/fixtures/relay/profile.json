@@ -1,0 +1,154 @@
+{
+  "id": 501,
+  "name": "Ada Example ",
+  "handle": "adaexample",
+  "photo_url": "https://substackcdn.com/image/fetch/synthetic-ada.png",
+  "bio": "An invented bio.",
+  "profile_set_up_at": "2024-01-01T00:00:00.000Z",
+  "reader_installed_at": null,
+  "tos_accepted_at": "2024-01-01T00:00:00.000Z",
+  "profile_disabled": false,
+  "userLinks": [],
+  "publicationUsers": [],
+  "theme": {},
+  "subscriptions": [
+    {
+      "id": 1,
+      "user_id": 501,
+      "visibility": "public",
+      "membership_state": "subscribed",
+      "type": "free",
+      "is_founding": false,
+      "publication": {
+        "id": 555,
+        "name": "Plain Example ",
+        "subdomain": "plainexample",
+        "custom_domain": null,
+        "custom_domain_optional": false,
+        "hero_text": "Invented.",
+        "logo_url": null,
+        "author_id": 601,
+        "primary_user_id": 601,
+        "payments_state": "disabled",
+        "homepage_type": "newspaper",
+        "language": "en",
+        "explicit": false
+      }
+    },
+    {
+      "id": 2,
+      "user_id": 501,
+      "visibility": "public",
+      "membership_state": "subscribed",
+      "type": "free",
+      "is_founding": false,
+      "publication": {
+        "id": 556,
+        "name": "Optional Domain Example",
+        "subdomain": "optionalexample",
+        "custom_domain": "www.example.net",
+        "custom_domain_optional": true,
+        "logo_url": null,
+        "author_id": 602,
+        "payments_state": "enabled"
+      }
+    },
+    {
+      "id": 3,
+      "user_id": 501,
+      "visibility": "private",
+      "membership_state": "subscribed",
+      "type": "free",
+      "is_founding": false,
+      "publication": {
+        "id": 557,
+        "name": "Hidden Example",
+        "subdomain": "hiddenexample",
+        "custom_domain": null,
+        "custom_domain_optional": false
+      }
+    },
+    {
+      "id": 4,
+      "user_id": 501,
+      "visibility": "public",
+      "membership_state": "subscribed",
+      "type": "free",
+      "is_founding": false,
+      "publication": {
+        "id": 558,
+        "name": "Broken Example",
+        "subdomain": "Not A Label!",
+        "custom_domain": null,
+        "custom_domain_optional": false
+      }
+    },
+    {
+      "id": 5,
+      "user_id": 501,
+      "visibility": "public",
+      "membership_state": "subscribed",
+      "type": "free",
+      "is_founding": false,
+      "publication": {
+        "id": 555,
+        "name": "Plain Example duplicate",
+        "subdomain": "plainexample",
+        "custom_domain": null,
+        "custom_domain_optional": false
+      }
+    },
+    {
+      "id": 6,
+      "user_id": 501,
+      "visibility": "public",
+      "membership_state": "subscribed",
+      "type": "paid",
+      "is_founding": false,
+      "publication": {
+        "id": 559,
+        "name": "Custom Example",
+        "subdomain": "customexample",
+        "custom_domain": "letters.example.org",
+        "custom_domain_optional": false,
+        "logo_url": null,
+        "author_id": 603,
+        "payments_state": "enabled"
+      }
+    }
+  ],
+  "subscriptionsTruncated": false,
+  "primaryPublication": {
+    "id": 424242,
+    "name": "Example Letters ",
+    "subdomain": "exampleletters",
+    "custom_domain": "news.example.com",
+    "custom_domain_optional": false,
+    "author_id": 501,
+    "explicit": false,
+    "handles_enabled": true,
+    "has_reply_rules": false,
+    "ios_app_payments_enabled": false,
+    "is_personal_mode": false,
+    "logo_url": null,
+    "payments_state": "enabled",
+    "pledges_enabled": false,
+    "primary_user_id": 501,
+    "user_id": 501
+  },
+  "max_pub_tier": 0,
+  "hasPosts": true,
+  "hasActivity": true,
+  "hasLikes": false,
+  "lists": [],
+  "rough_num_free_subscribers": "Hundreds",
+  "rough_num_free_subscribers_int": 300,
+  "bestseller_tier": null,
+  "followerCount": 42,
+  "slug": "adaexample",
+  "visibleSubscriptionsCount": 5,
+  "isSubscribed": false,
+  "isFollowing": false,
+  "followsViewer": false,
+  "can_dm": false
+}

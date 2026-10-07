@@ -1,0 +1,58 @@
+{
+  "status": "ok",
+  "feed": {
+    "url": "https://fieldnotes.substack.com/feed",
+    "title": "Synthetic Field Notes",
+    "link": "https://fieldnotes.substack.com",
+    "author": "",
+    "description": "Invented text for the feed parser tests.",
+    "image": "https://substackcdn.com/image/fetch/synthetic-logo.png"
+  },
+  "items": [
+    {
+      "title": "A free essay about tidy gardens",
+      "pubDate": "2026-10-05 15:03:24",
+      "link": "https://fieldnotes.substack.com/p/a-free-essay-about-tidy-gardens",
+      "guid": "https://fieldnotes.substack.com/p/a-free-essay-about-tidy-gardens",
+      "author": "Ada Example",
+      "thumbnail": "",
+      "description": "<p>Why the rows lean east &#8212; a subtitle</p>",
+      "content": "<p>The first paragraph of an invented essay.</p><p>A second paragraph ends the free post.</p>",
+      "enclosure": {
+        "link": "https://substack-post-media.s3.amazonaws.com/public/images/synthetic_1456x1048.png",
+        "type": "image/jpeg",
+        "length": 0
+      },
+      "categories": []
+    },
+    {
+      "title": "Paid notes on compost",
+      "pubDate": "2026-10-04 09:00:00",
+      "link": "https://fieldnotes.substack.com/p/paid-notes-on-compost",
+      "guid": "https://fieldnotes.substack.com/p/paid-notes-on-compost",
+      "author": "Ada Example",
+      "thumbnail": "",
+      "description": "Only the opening is public",
+      "content": "<p>The public opening of an invented paid post.</p>\n      <p>\n          <a href=\"https://fieldnotes.substack.com/p/paid-notes-on-compost\">\n              Read more\n          </a>\n      </p>\n   ",
+      "enclosure": {},
+      "categories": []
+    },
+    {
+      "title": "Episode 12: Soil, slowly",
+      "pubDate": "2026-10-03 07:30:00",
+      "link": "https://fieldnotes.substack.com/p/episode-12-soil",
+      "guid": "https://fieldnotes.substack.com/p/episode-12-soil",
+      "author": "Ada Example",
+      "thumbnail": "",
+      "description": "Listen now (36 mins) | A synthetic episode",
+      "content": "<p>Show notes for an invented episode.</p>",
+      "enclosure": {
+        "link": "https://api.substack.com/feed/podcast/1/synthetic.mp3",
+        "type": "audio/mpeg",
+        "length": 0,
+        "duration": 2170
+      },
+      "categories": []
+    }
+  ]
+}

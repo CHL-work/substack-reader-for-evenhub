@@ -1,0 +1,48 @@
+{
+  "id": 9101,
+  "editor_v2": false,
+  "publication_id": 424242,
+  "title": "A Paid Synthetic Post",
+  "type": "newsletter",
+  "slug": "a-paid-synthetic-post",
+  "post_date": "2026-09-30T07:15:00.000Z",
+  "audience": "only_paid",
+  "audience_before_archived": null,
+  "podcast_duration": null,
+  "canonical_url": "https://news.example.com/p/a-paid-synthetic-post",
+  "subtitle": "Invented paid subtitle",
+  "description": "Invented paid subtitle",
+  "body_json": null,
+  "body_html": "<p>Invented free preview paragraph.</p>",
+  "truncated_body_text": "Invented free preview paragraph.",
+  "wordcount": 1859,
+  "post_preview_limit": null,
+  "language": "en",
+  "is_published": true,
+  "meter_type": "none",
+  "publishedBylines": [
+    {
+      "id": 501,
+      "name": "Ada Example",
+      "handle": "adaexample",
+      "publicationUsers": [
+        {
+          "id": 7002,
+          "user_id": 501,
+          "publication_id": 424242,
+          "role": "admin",
+          "public": true,
+          "is_primary": true,
+          "publication": {
+            "id": 424242,
+            "name": "Example Letters ",
+            "subdomain": "exampleletters",
+            "custom_domain": "news.example.com",
+            "custom_domain_optional": false
+          }
+        }
+      ],
+      "is_guest": false
+    }
+  ]
+}

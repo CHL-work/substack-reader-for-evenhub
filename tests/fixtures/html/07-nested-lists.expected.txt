@@ -1,0 +1,28 @@
+Packing list for the trip:
+
+• Clothes
+   – Shirts
+      · Linen
+      · Cotton
+   – Socks
+• Documents
+   1. Passport
+   2. Tickets
+
+Steps, continued from last week:
+
+7. Check the oven.
+8. Preheat to 220 degrees.
+   0. Zero-based sub-step.
+   1. Next sub-step.
+9. Bake for 40 minutes.
+   Do not open the door.
+
+> • Quoted bullet one
+> • Quoted bullet two
+
+• Loose item without a paragraph
+• Second loose item
+   – Nested loose item
+
+That is all.

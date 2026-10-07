@@ -1,0 +1,26 @@
+{
+  "_comment": "Synthetic relay data for scripts/ui-ci.mjs (relay protocol 1 envelopes are built by the script). All names and text are invented; post bodies are generated from numbered tokens.",
+  "publications": {
+    "alpha.substack.com": { "id": 1001, "name": "Alpha Notes", "subdomain": "alpha", "customDomain": null, "host": "alpha.substack.com" },
+    "beta.substack.com": { "id": 1002, "name": "Beta Weekly", "subdomain": "beta", "customDomain": null, "host": "beta.substack.com" },
+    "www.gammaletters-ci.com": { "id": 1003, "name": "Gamma Letters", "subdomain": "gammaletters", "customDomain": "www.gammaletters-ci.com", "host": "www.gammaletters-ci.com" },
+    "delta.substack.com": { "id": 1004, "name": "Delta Dispatch", "subdomain": "delta", "customDomain": null, "host": "delta.substack.com" },
+    "epsilon.substack.com": { "id": 1005, "name": "Epsilon Review", "subdomain": "epsilon", "customDomain": null, "host": "epsilon.substack.com" }
+  },
+  "notSubstackHosts": ["gammaletters-ci.com"],
+  "archivePageCap": 3,
+  "posts": [
+    { "id": 5001, "host": "alpha.substack.com", "slug": "first-synthetic-essay", "title": "First synthetic essay", "subtitle": "An invented text long enough for many pages", "postDate": "2026-09-30T08:00:00.000Z", "audience": "everyone", "type": "newsletter", "wordcount": 1600, "authors": ["Ada Example"], "paragraphs": 24 },
+    { "id": 5002, "host": "alpha.substack.com", "slug": "second-synthetic-essay", "title": "Second synthetic essay", "subtitle": null, "postDate": "2026-09-23T08:00:00.000Z", "audience": "everyone", "type": "newsletter", "wordcount": 900, "authors": ["Ada Example"], "paragraphs": 14 },
+    { "id": 5003, "host": "alpha.substack.com", "slug": "members-only-preview", "title": "Members only preview", "subtitle": "Paid post with a public preview", "postDate": "2026-09-16T08:00:00.000Z", "audience": "only_paid", "type": "newsletter", "wordcount": 2400, "authors": ["Ada Example"], "paragraphs": 3 },
+    { "id": 5004, "host": "alpha.substack.com", "slug": "older-synthetic-note", "title": "Older synthetic note", "subtitle": null, "postDate": "2026-08-30T08:00:00.000Z", "audience": "everyone", "type": "newsletter", "wordcount": 300, "authors": ["Ada Example"], "paragraphs": 4 },
+    { "id": 6001, "host": "beta.substack.com", "slug": "beta-first-issue", "title": "Beta first issue", "subtitle": null, "postDate": "2026-09-28T08:00:00.000Z", "audience": "everyone", "type": "newsletter", "wordcount": 500, "authors": ["Bo Sample"], "paragraphs": 5 },
+    { "id": 7001, "host": "www.gammaletters-ci.com", "slug": "gamma-opening-letter", "title": "Gamma opening letter", "subtitle": null, "postDate": "2026-09-20T08:00:00.000Z", "audience": "everyone", "type": "newsletter", "wordcount": 400, "authors": ["Cy Placeholder"], "paragraphs": 4 }
+  ],
+  "profiles": {
+    "ci_reader": { "handle": "ci_reader", "name": "CI Reader", "primary": "alpha.substack.com", "subscriptions": ["beta.substack.com", "delta.substack.com"] }
+  },
+  "searches": {
+    "beta weekly": ["beta.substack.com", "epsilon.substack.com"]
+  }
+}

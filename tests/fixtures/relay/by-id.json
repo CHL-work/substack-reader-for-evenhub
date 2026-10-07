@@ -1,0 +1,44 @@
+{
+  "post": {
+    "id": 9201,
+    "editor_v2": false,
+    "publication_id": 424242,
+    "title": " Shared By Id ",
+    "type": "newsletter",
+    "slug": "shared-by-id",
+    "post_date": "2026-10-03T09:45:00.000Z",
+    "audience": "everyone",
+    "podcast_duration": null,
+    "canonical_url": "https://news.example.com/p/shared-by-id",
+    "subtitle": "Reached through a share link",
+    "body_json": null,
+    "body_html": "<p>Invented body reached by numeric id.</p>",
+    "truncated_body_text": "",
+    "wordcount": 640,
+    "language": "en",
+    "is_published": true,
+    "publishedBylines": [
+      { "id": 501, "name": "Ada Example", "handle": "adaexample", "publicationUsers": [], "is_guest": false }
+    ]
+  },
+  "publication": {
+    "id": 424242,
+    "name": "Example Letters ",
+    "subdomain": "exampleletters",
+    "custom_domain": "news.example.com",
+    "custom_domain_optional": false,
+    "hostname": "news.example.com",
+    "base_url": "https://news.example.com",
+    "hero_text": "Invented letters for tests.",
+    "logo_url": null,
+    "author_id": 501,
+    "author_name": "Ada Example",
+    "author_handle": "adaexample",
+    "language": "en",
+    "payments_state": "enabled",
+    "homepage_type": "newspaper",
+    "first_post_date": "2024-01-02T00:00:00.000Z"
+  },
+  "publicationSettings": { "block_ai_crawlers": false, "enable_prev_next_nav": true },
+  "accountBasedPostMeteringEnabled": false
+}

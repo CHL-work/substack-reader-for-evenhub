@@ -1,0 +1,78 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<rss xmlns:dc="http://purl.org/dc/elements/1.1/" xmlns:content="http://purl.org/rss/1.0/modules/content/" xmlns:atom="http://www.w3.org/2005/Atom" version="2.0" xmlns:itunes="http://www.itunes.com/dtds/podcast-1.0.dtd" xmlns:googleplay="http://www.google.com/schemas/play-podcasts/1.0">
+  <channel>
+    <title><![CDATA[Synthetic Field Notes]]></title>
+    <description><![CDATA[Invented text for the feed parser tests.]]></description>
+    <link>https://fieldnotes.substack.com</link>
+    <image>
+      <url>https://substackcdn.com/image/fetch/synthetic-logo.png</url>
+      <title>Synthetic Field Notes logo</title>
+      <link>https://fieldnotes.substack.com</link>
+    </image>
+    <generator>Substack</generator>
+    <lastBuildDate>Tue, 06 Oct 2026 12:00:00 GMT</lastBuildDate>
+    <atom:link href="https://fieldnotes.substack.com/feed" rel="self" type="application/rss+xml"/>
+    <language><![CDATA[en]]></language>
+    <itunes:author><![CDATA[Ada Example]]></itunes:author>
+    <item>
+      <title><![CDATA[A free essay about tidy gardens]]></title>
+      <description><![CDATA[Why the rows lean east &#8212; a subtitle]]></description>
+      <link>https://fieldnotes.substack.com/p/a-free-essay-about-tidy-gardens</link>
+      <guid isPermaLink="false">https://fieldnotes.substack.com/p/a-free-essay-about-tidy-gardens</guid>
+      <dc:creator><![CDATA[Ada Example]]></dc:creator>
+      <pubDate>Mon, 05 Oct 2026 15:03:24 GMT</pubDate>
+      <enclosure url="https://substack-post-media.s3.amazonaws.com/public/images/synthetic_1456x1048.png" length="0" type="image/jpeg"/>
+      <content:encoded><![CDATA[<p>The first paragraph of an invented essay.</p><p>A second paragraph ends the free post.</p>]]></content:encoded>
+    </item>
+    <item>
+      <title><![CDATA[Paid notes on compost]]></title>
+      <description><![CDATA[Only the opening is public]]></description>
+      <link>https://fieldnotes.substack.com/p/paid-notes-on-compost</link>
+      <guid isPermaLink="false">https://fieldnotes.substack.com/p/paid-notes-on-compost</guid>
+      <dc:creator><![CDATA[Ada Example]]></dc:creator>
+      <pubDate>Sun, 04 Oct 2026 09:00:00 GMT</pubDate>
+      <content:encoded><![CDATA[<p>The public opening of an invented paid post.</p>
+      <p>
+          <a href="https://fieldnotes.substack.com/p/paid-notes-on-compost">
+              Read more
+          </a>
+      </p>
+   ]]></content:encoded>
+    </item>
+    <item>
+      <title><![CDATA[Episode 12: Soil, slowly]]></title>
+      <description><![CDATA[Listen now (36 mins) | A synthetic episode]]></description>
+      <link>https://fieldnotes.substack.com/p/episode-12-soil</link>
+      <guid isPermaLink="false">https://fieldnotes.substack.com/p/episode-12-soil</guid>
+      <dc:creator><![CDATA[Ada Example]]></dc:creator>
+      <pubDate>Sat, 03 Oct 2026 07:30:00 GMT</pubDate>
+      <enclosure url="https://api.substack.com/feed/podcast/1/synthetic.mp3" length="0" type="audio/mpeg"/>
+      <itunes:author>Ada Example</itunes:author>
+      <itunes:explicit>No</itunes:explicit>
+      <itunes:duration>00:36:10</itunes:duration>
+      <content:encoded><![CDATA[<p>Show notes for an invented episode.</p>]]></content:encoded>
+    </item>
+    <item>
+      <title><![CDATA[Links &amp; notes]]></title>
+      <description><![CDATA[]]></description>
+      <link>https://fieldnotes.substack.com/p/weekly-links</link>
+      <guid isPermaLink="false">https://fieldnotes.substack.com/p/weekly-links</guid>
+      <dc:creator><![CDATA[Ada Example]]></dc:creator>
+      <dc:creator><![CDATA[Bo Sample]]></dc:creator>
+      <pubDate>Fri, 02 Oct 2026 18:00:00 GMT</pubDate>
+      <content:encoded><![CDATA[<p>A short free post.</p><p><a href="https://fieldnotes.substack.com/p/a-free-essay-about-tidy-gardens">Read more</a></p>]]></content:encoded>
+    </item>
+    <item>
+      <title><![CDATA[About this publication]]></title>
+      <link>https://fieldnotes.substack.com/about</link>
+      <pubDate>Thu, 01 Oct 2026 10:00:00 GMT</pubDate>
+      <content:encoded><![CDATA[<p>Not a post.</p>]]></content:encoded>
+    </item>
+    <item>
+      <title><![CDATA[Duplicate of the first essay]]></title>
+      <link>https://fieldnotes.substack.com/p/a-free-essay-about-tidy-gardens</link>
+      <pubDate>Thu, 01 Oct 2026 09:00:00 GMT</pubDate>
+      <content:encoded><![CDATA[<p>Duplicate.</p>]]></content:encoded>
+    </item>
+  </channel>
+</rss>

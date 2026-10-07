@@ -1,0 +1,17 @@
+GLYPH CHECK
+
+Non breaking, zerowidth, softhyphen, “smart” ‘quotes’ — dashes – and…ellipsis.
+
+Non-breaking hyphen, figure-dash, micro 5μm, fine ligature, check √ done, › pointer.
+
+Emoji: 😀 ok, ❤ ok, 👍 toned, rocket, flag, family. Legend: (red) GOP, (blue) Dem.
+
+Scripts: Café, Cu, Ελλάδα, Москва, 東京, [?], done.
+
+Thanks to Jane Example for the tip.
+
+UPDATE
+
+Prices changed.
+
+> Bake early, bake often.

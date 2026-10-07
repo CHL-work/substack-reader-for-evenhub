@@ -1,0 +1,26 @@
+INGREDIENTS
+
+• Flour
+• Water, about 70%
+   – warm, not hot
+   – filtered if possible
+• Salt
+   Use fine salt.
+
+3. Mix everything.
+4. Wait.
+
+Run bake --dry-run first. Water is H₂O, the area is r², and s_i is the i-th sample. The 1st loaf was ~perfect~ fine.
+
+[Code: python]
+def bake(t):
+    if t > 250:
+        return 'burnt'
+    return "ok"
+
+[Code]
+$ make bread
+
+[Formula: T_final = T₀ · e^(-kt) + (a)/(b)]
+
+Done.
