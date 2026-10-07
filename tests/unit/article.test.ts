@@ -1,5 +1,7 @@
 import { test } from 'node:test'
 import assert from 'node:assert/strict'
+import { readdirSync, readFileSync } from 'node:fs'
+import { join } from 'node:path'
 import { defaultSettings, type Settings } from '../../src/app/types'
 import { CONVERTER_VERSION, type HtmlToReaderTextOptions, type ReaderTextResult } from '../../src/substack/html'
 import type { PostDetail, PubMeta } from '../../src/substack/types'
@@ -105,6 +107,17 @@ test('isCovered uses the firmware font metrics', () => {
   assert.equal(isCovered(0x2022), true)
   assert.equal(isCovered(0x05E9), false) // Hebrew is not in the G2 fonts
   assert.equal(isCovered(0x05E9), false) // memoized path
+  assert.equal(isCovered(0x20B9), false) // rupee sign: html.ts spells it INR (C5)
+  assert.equal(isCovered(0x2610), false) // ballot box: html.ts writes [ ]
+})
+
+test('WebView code has no regex lookbehind (WKWebView before iOS 16.4 cannot parse the bundle, C2)', () => {
+  // Source scan from the repository root (process.cwd() in CI). worker/ runs on V8 and is not scanned.
+  const LOOKBEHIND_RE = /\(\?<[=!]/
+  const files = readdirSync(join(process.cwd(), 'src'), { recursive: true, encoding: 'utf8' }).filter(name => /\.(?:ts|js)$/.test(name))
+  assert.ok(files.some(name => /html\.ts$/.test(name)), 'the scan sees src/substack/html.ts')
+  const offenders = files.filter(name => LOOKBEHIND_RE.test(readFileSync(join(process.cwd(), 'src', name), 'utf8')))
+  assert.deepEqual(offenders, [])
 })
 
 test('paid preview: header note, gated audience passed through', () => {

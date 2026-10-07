@@ -1,7 +1,8 @@
 name: Deploy relay
 
 # Cloudflare option (docs/relay.md). Manually run; deploys worker/relay.ts with
-# wrangler.toml to the account in the repository secrets CLOUDFLARE_API_TOKEN
+# wrangler.toml, using the wrangler version locked in pnpm-lock.yaml (a
+# devDependency), to the account in the repository secrets CLOUDFLARE_API_TOKEN
 # (Workers Scripts: Edit) and CLOUDFLARE_ACCOUNT_ID. When the repository
 # variable VITE_RELAY_ORIGIN is set, the deployed relay is then asked to probe
 # Substack once (/v1/health?probe=1) and the result is written to the job summary.
@@ -64,7 +65,8 @@ jobs:
         env:
           CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
           CLOUDFLARE_ACCOUNT_ID: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}
-        run: pnpm dlx wrangler@4.148.0 deploy --var "REVISION:${GITHUB_SHA::7}"
+        # The locked devDependency (pnpm-lock.yaml), never a fresh dlx resolution, runs with the token.
+        run: pnpm exec wrangler deploy --var "REVISION:${GITHUB_SHA::7}"
 
       - name: Probe Substack reachability from the relay
         if: vars.VITE_RELAY_ORIGIN != ''

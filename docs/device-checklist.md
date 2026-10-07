@@ -33,6 +33,7 @@ Even app version ______ · glasses firmware ______ · phone and OS ______ · dat
 - [ ] R1 ring: swipe and tap work the same as the temple touchpads. Record the event sources shown in Diagnostics: ______
 - [ ] The raw event log shows which envelope (sys, text or list) carries taps, double-taps and scrolls. Record it: ______
 - [ ] "Load older posts…" loads more posts and the list keeps going past short pages.
+- [ ] On the end card of the last loaded post in a publication's list, Tap (or menu Next post) loads the older posts and opens the next one.
 - [ ] The phone remote (Prev, Select, Next, Back) drives the glasses.
 
 ## Display
@@ -46,6 +47,7 @@ Even app version ______ · glasses firmware ______ · phone and OS ______ · dat
 ## Lifecycle and errors
 
 - [ ] Lock the phone for 5 minutes while reading, then unlock: the page is still shown and the app responds.
+- [ ] Take the glasses out of range (or switch them off) while reading, then reconnect: the current page is drawn again in full, and the next swipe turns exactly one page.
 - [ ] Android: after the Even app is killed in the background, a cold start resumes at the same page.
 - [ ] Launch from the glasses menu with a post in progress: the app goes straight to that post at the saved page.
 - [ ] Paid post: the preview, then the paid end card ("The free preview ends here.").

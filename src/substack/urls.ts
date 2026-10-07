@@ -11,7 +11,8 @@ export type ParsedInput =
   | { kind: 'postId'; id: number }
   | { kind: 'handle'; handle: string }
   | { kind: 'search'; query: string }
-  | { kind: 'invalid'; reason: string }
+  /** `skipped`: parseMany only, the share-text line (whitespace collapsed) that was not used. */
+  | { kind: 'invalid'; reason: string; skipped?: string }
 
 /** A public DNS host name (the same rule the relay applies). */
 export const HOST_RE = PUBLIC_HOST_RE
@@ -24,6 +25,10 @@ export const MAX_PASTE_CHARS = 65536
 export const MAX_LINES = 50
 export const SEARCH_MIN_CHARS = 2
 export const SEARCH_MAX_CHARS = 100
+/** parseMany: a paste of at most this many lines, exactly one with a link, is share text. */
+export const SHARE_TEXT_MAX_LINES = 3
+/** parseMany: characters of a skipped line quoted in its reason. */
+export const SKIPPED_PREVIEW_CHARS = 40
 
 /** Phone-facing reasons for `{ kind: 'invalid' }`. */
 export const INVALID_REASONS = {
@@ -45,10 +50,12 @@ export const INVALID_REASONS = {
   handle: 'That @handle is not valid.',
   searchShort: 'Type at least 2 characters to search.',
   searchLong: 'Search text is too long (100 characters at most).',
+  shareText: 'Text next to a link is read as share text. Paste it alone to search.',
 } as const
 
 const CONTROL_RE = /[\x00-\x08\x0b\x0c\x0e-\x1f\x7f-\x9f]/
-const UNSAFE_SCHEME_RE = /(?:^|[^a-z0-9+.-])(?:javascript|vbscript|data|file|blob):/i
+/** A scheme token only when something follows the colon: "Big Data: why" and "data: privacy" are text. */
+const UNSAFE_SCHEME_RE = /(?:^|[^a-z0-9+.-])(?:javascript|vbscript|data|file|blob):(?=\S)/i
 const HAS_SCHEME_RE = /[a-z][a-z0-9+.-]*:\/\//i
 /** scheme://... up to whitespace or a quoting/bracketing delimiter used in share text. */
 const SCHEME_URL_RE = /[a-z][a-z0-9+.-]*:\/\/[^\s<>"'\x60\u{ab}\u{bb}\u{2018}\u{2019}\u{201c}\u{201d}\u{300c}-\u{300f}\u{3010}\u{3011}\u{ff08}\u{ff09}]+/giu
@@ -58,7 +65,9 @@ const HANDLE_TRAILING_RE = /[.,!?;:)\]}>]+$/
 const LINE_SPLIT_RE = /\r\n|[\r\n\u{2028}\u{2029}]/u
 const IPV4_RE = /^\d+(?:\.\d+){3}$/
 const SUBDOMAIN_LABEL_RE = /^[a-z0-9-]{1,63}$/
-const POST_ID_RE = /^[1-9]\d{0,15}$/
+const POST_ID_RE = /^[1-9]\d{0,9}$/
+/** Substack's by-id lookup takes a signed 32-bit id (the relay refuses larger ones too). */
+export const MAX_POST_ID = 2_147_483_647
 /** Top-level names that never belong to a public Substack publication. */
 const RESERVED_TLDS = new Set(['localhost', 'local', 'internal', 'test', 'invalid', 'example', 'onion', 'arpa', 'home', 'corp', 'lan'])
 const RESERVED_DOMAIN_RE = /(?:^|\.)example\.(?:com|net|org)$/
@@ -107,8 +116,9 @@ export function wwwAlternative(host: string): string | null {
   return normalizeHost(`www.${value}`)
 }
 
+/** Substack handles are lowercase and its profile lookup is case-sensitive. */
 function parseHandle(raw: string): ParsedInput {
-  const handle = raw.replace(HANDLE_TRAILING_RE, '')
+  const handle = raw.replace(HANDLE_TRAILING_RE, '').toLowerCase()
   return HANDLE_RE.test(handle) ? { kind: 'handle', handle } : invalid(INVALID_REASONS.handle)
 }
 
@@ -122,7 +132,7 @@ function parseSearch(text: string): ParsedInput {
 function postIdOf(digits: string | null | undefined): ParsedInput {
   if (!digits || !POST_ID_RE.test(digits)) return invalid(INVALID_REASONS.postId)
   const id = Number(digits)
-  return Number.isSafeInteger(id) ? { kind: 'postId', id } : invalid(INVALID_REASONS.postId)
+  return id <= MAX_POST_ID ? { kind: 'postId', id } : invalid(INVALID_REASONS.postId)
 }
 
 /** Any path on a publication host: /p/<slug>[/...] is a post, everything else the publication. */
@@ -217,6 +227,19 @@ export function parseSubstackInput(input: string): ParsedInput {
   return parseSearch(text)
 }
 
+/** A line parseSubstackInput would read as search text: no link, no @handle, no bare domain. */
+function isPlainText(line: string): boolean {
+  return !HAS_SCHEME_RE.test(line) && !line.startsWith('@') && (/\s/.test(line) || !line.includes('.'))
+}
+
+/** A share-text line that is shown as not added: `Skipped "<first 40 characters>". <shareText>` */
+function skipped(line: string): ParsedInput {
+  const text = line.replace(/[\s\x00-\x1f\x7f-\x9f]+/g, ' ').trim()
+  const chars = Array.from(text)
+  const shown = chars.length > SKIPPED_PREVIEW_CHARS ? `${chars.slice(0, SKIPPED_PREVIEW_CHARS - 1).join('').trimEnd()}\u2026` : text
+  return { kind: 'invalid', reason: `Skipped "${shown}". ${INVALID_REASONS.shareText}`, skipped: text }
+}
+
 function resultKey(parsed: ParsedInput): string | null {
   switch (parsed.kind) {
     case 'publication': return `publication ${parsed.host}`
@@ -224,26 +247,26 @@ function resultKey(parsed: ParsedInput): string | null {
     case 'postId': return `postId ${parsed.id}`
     case 'handle': return `handle ${parsed.handle.toLowerCase()}`
     case 'search': return `search ${parsed.query.toLowerCase()}`
-    case 'invalid': return null
+    case 'invalid': return parsed.skipped === undefined ? null : `skipped ${parsed.skipped.toLowerCase()}`
   }
 }
 
 /**
  * One result per non-empty line (at most MAX_LINES), duplicates removed.
- * When the paste contains a link, plain-text lines are share-text
- * decoration (a title, "Check this out") and are dropped instead of being
- * turned into searches.
+ * Share text (exactly one line with a link, at most SHARE_TEXT_MAX_LINES
+ * lines) carries a title or blurb next to its link: those plain-text lines
+ * become `skipped` results (shown, never searched or validated). In any
+ * other paste every line counts, plain text included (a search).
  */
 export function parseMany(input: string): ParsedInput[] {
   if (typeof input !== 'string' || !input.trim()) return []
   if (input.length > MAX_PASTE_CHARS) return [invalid(INVALID_REASONS.tooLong)]
   const lines = input.split(LINE_SPLIT_RE).map(line => line.trim()).filter(Boolean)
-  const hasLink = lines.some(line => HAS_SCHEME_RE.test(line))
+  const shareText = lines.length <= SHARE_TEXT_MAX_LINES && lines.filter(line => HAS_SCHEME_RE.test(line)).length === 1
   const results: ParsedInput[] = []
   const seen = new Set<string>()
   for (const line of lines) {
-    const parsed = parseSubstackInput(line)
-    if (hasLink && parsed.kind === 'search') continue
+    const parsed = shareText && isPlainText(line) ? skipped(line) : parseSubstackInput(line)
     const key = resultKey(parsed)
     if (key !== null) {
       if (seen.has(key)) continue

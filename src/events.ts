@@ -1,7 +1,8 @@
 /**
- * Pure G2 event mapping, kept apart from glasses.ts so Node unit tests never
- * load the SDK runtime (its obfuscated bundle installs timer and window hooks
- * at import time). Only a type is imported from the SDK; esbuild/tsc erase it.
+ * Pure G2 event mapping and the bridge call queue, kept apart from glasses.ts
+ * so Node unit tests never load the SDK runtime (its obfuscated bundle
+ * installs timer and window hooks at import time). Only a type is imported
+ * from the SDK; esbuild/tsc erase it.
  */
 import type { EvenHubEvent } from '@evenrealities/even_hub_sdk'
 
@@ -136,4 +137,185 @@ export function describeEvent(e: EvenHubEvent): string {
   if (e.menuItemClickEvent) parts.push(`menu:${menuItemId(e) ?? '?'}`)
   if (e.audioEvent) parts.push('audio')
   return parts.length ? parts.join(' ') : 'empty'
+}
+
+// ---------------------------------------------------------------------------
+// Bridge call queue
+
+/** Bound for one render (up to 3 textContainerUpgrade calls) or shutDownPageContainer. */
+export const SCREEN_TIMEOUT_MS = 5000
+/** Bound for one bridge storage call (getLocalStorage / setLocalStorage). */
+export const STORAGE_TIMEOUT_MS = 4000
+
+/**
+ * A render that a newer render replaced before it reached the glasses. The
+ * frame was never shown; callers must not retry it (the newer one is queued).
+ * Callers test `error.name === 'SupersededRenderError'`, not the class.
+ */
+export class SupersededRenderError extends Error {
+  constructor() {
+    super('A newer G2 frame replaced this one before it was shown.')
+    this.name = 'SupersededRenderError'
+  }
+}
+
+/** A bridge call that did not answer within its bound. The queue moves on. */
+export class BridgeTimeoutError extends Error {
+  constructor(what: string) {
+    super(what === 'storage' ? 'The Even app did not answer a storage request in time.' : 'G2 did not answer in time.')
+    this.name = 'BridgeTimeoutError'
+  }
+}
+
+export type BridgeCallKind = 'screen' | 'storage'
+/** `live()` turns false once the call timed out (or the reader closed): stop issuing bridge calls. */
+export type BridgeOperation<T> = (live: () => boolean) => Promise<T>
+/** setTimeout-like; returns a cancel function. Tests inject a fake clock. */
+export type Schedule = (callback: () => void, ms: number) => () => void
+
+export interface BridgeQueueOptions {
+  /** True once the reader is disposed: calls not yet started reject without reaching the bridge. */
+  closed(): boolean
+  /** A screen call (render or exit) failed or timed out. Never called for superseded renders. */
+  onScreenError?(error: unknown): void
+  /** A call that already timed out settled afterwards: its native effect may have landed late. */
+  onLate?(kind: BridgeCallKind): void
+  schedule?: Schedule
+}
+
+export interface BridgeQueue {
+  /** Run one bridge call after every earlier one settled (or timed out), bounded by `ms`. */
+  run<T>(kind: BridgeCallKind, ms: number, operation: BridgeOperation<T>): Promise<T>
+  /**
+   * A screen call where at most one waits: a render requested while another
+   * is queued and not started replaces it, and the replaced promise rejects
+   * with SupersededRenderError. So anything queued after it (exit, storage)
+   * waits for at most one render.
+   */
+  render(ms: number, operation: BridgeOperation<void>): Promise<void>
+  /** A render is queued and has not started. */
+  renderPending(): boolean
+}
+
+function defaultSchedule(callback: () => void, ms: number): () => void {
+  const timer = setTimeout(callback, ms)
+  return () => clearTimeout(timer)
+}
+
+/**
+ * The single serialized chain for every bridge call (SPEC 3.1 item 7), with a
+ * per-call timeout: the SDK has none, and one call that never settles would
+ * otherwise freeze page turns, the exit dialog and storage for good.
+ */
+export function createBridgeQueue(options: BridgeQueueOptions): BridgeQueue {
+  const schedule = options.schedule ?? defaultSchedule
+  let tail: Promise<unknown> = Promise.resolve()
+  let waiting: { operation: BridgeOperation<void>; resolve(): void; reject(error: unknown): void } | null = null
+
+  function late(kind: BridgeCallKind) {
+    try { options.onLate?.(kind) } catch { /* Observer errors are isolated. */ }
+  }
+
+  function bounded<T>(kind: BridgeCallKind, ms: number, operation: BridgeOperation<T>): Promise<T> {
+    return new Promise<T>((resolve, reject) => {
+      let settled = false
+      let timedOut = false
+      const cancel = schedule(() => {
+        if (settled) return
+        settled = true
+        timedOut = true
+        reject(new BridgeTimeoutError(kind))
+      }, ms)
+      let native: Promise<T>
+      try {
+        native = Promise.resolve(operation(() => !timedOut && !options.closed()))
+      } catch (error) {
+        native = Promise.reject(error)
+      }
+      const finish = (ok: boolean, value: unknown) => {
+        if (settled) {
+          if (timedOut) late(kind)
+          return
+        }
+        settled = true
+        cancel()
+        if (ok) resolve(value as T)
+        else reject(value)
+      }
+      native.then(value => finish(true, value), error => finish(false, error))
+    })
+  }
+
+  function run<T>(kind: BridgeCallKind, ms: number, operation: BridgeOperation<T>): Promise<T> {
+    const result = tail.then(() => {
+      if (options.closed()) throw new Error('The G2 reader is closed.')
+      return bounded(kind, ms, operation)
+    })
+    // Keep a fulfilled tail while the caller gets the rejection: a failed or
+    // hung call must never block later page turns.
+    tail = result.catch(error => {
+      if (kind !== 'screen' || error instanceof SupersededRenderError) return
+      try { options.onScreenError?.(error) } catch { /* Observer errors are isolated. */ }
+    })
+    return result
+  }
+
+  function render(ms: number, operation: BridgeOperation<void>): Promise<void> {
+    return new Promise<void>((resolve, reject) => {
+      if (waiting) {
+        const replaced = waiting
+        replaced.reject(new SupersededRenderError())
+        replaced.operation = operation
+        replaced.resolve = resolve
+        replaced.reject = reject
+        return
+      }
+      const slot = { operation, resolve, reject }
+      waiting = slot
+      const release = () => { if (waiting === slot) waiting = null }
+      run('screen', ms, live => {
+        release()
+        return slot.operation(live)
+      }).then(() => {
+        release()
+        slot.resolve()
+      }, error => {
+        release()
+        slot.reject(error)
+      })
+    })
+  }
+
+  return { run, render, renderPending: () => waiting !== null }
+}
+
+/**
+ * When the glasses need a full redraw after the link comes back: after a
+ * disconnect, or after a screen write failed. Decided from device events, not
+ * from the reported status, because a render while disconnected may report
+ * 'error' or even 'ready' in between, and a repeated 'ready' is de-duplicated.
+ */
+export interface LinkTracker {
+  disconnected(): void
+  writeFailed(): void
+  /** A frame was fully written (clears a failed write, not a disconnect). */
+  written(): void
+  /** The device reports Connected: true when what it shows is unknown. */
+  connected(): boolean
+}
+
+export function createLinkTracker(): LinkTracker {
+  let lost = false
+  let failed = false
+  return {
+    disconnected() { lost = true },
+    writeFailed() { failed = true },
+    written() { failed = false },
+    connected() {
+      const stale = lost || failed
+      lost = false
+      failed = false
+      return stale
+    },
+  }
 }

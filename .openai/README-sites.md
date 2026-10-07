@@ -45,7 +45,7 @@ To update the relay later, repeat steps 3 to 6. The origin stays the same, so th
 ## Differences from Cloudflare
 
 - **No rate-limit binding.** The relay falls back to an in-memory bucket of 60 requests per minute per client and route, per isolate, which is weaker when many isolates run.
-- **Client IP header unverified.** The relay keys rate limits on `CF-Connecting-IP`. If Sites does not pass it, all clients share one bucket per route (60 per minute in total per isolate). Check this before sharing the app widely.
+- **One shared rate-limit key.** The relay trusts `CF-Connecting-IP` only when the request carries Cloudflare's `request.cf` object (a client could set the header anywhere else). If Sites requests have no `request.cf`, all clients share one bucket per route (60 per minute in total per isolate, and 10 per minute for custom-domain mapping proofs and health probes). Check this before sharing the app widely.
 - **No `REVISION` variable** unless Sites lets you set runtime values, so `/v1/health` reports `revision: null`.
 - **Edge cache unverified.** The relay uses `caches.default` when present and works without it.
 - **Same kind of egress.** Sites runs on Cloudflare too, so Substack may treat its requests like a Worker's. Compare the health probes with the Cloudflare deployment.

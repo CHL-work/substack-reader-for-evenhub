@@ -3,8 +3,9 @@ import assert from 'node:assert/strict'
 import { LIMITS, defaultSettings, emptyState, type Position, type PostRef, type Publication } from '../../src/app/types'
 import {
   KEYS, MAX_KEY_CHARS, SAVE_DEBOUNCE_MS, addPublication, addSaved, browserKV, bridgeKV, clearReading, createStore,
-  markRead, mirroredKV, normalizePrefs, normalizeProgress, recordHistory, recordPosition, refKey, rehostPost,
-  rehostPublication, reorderItem, serializeProgress, type KV,
+  markRead, mergePrefs, mergeProgress, mirroredKV, normalizePrefs, normalizeProgress, prefsFit, recordHistory,
+  recordPosition, refKey, rehostPost, rehostPublication, reorderItem, serializePrefs, serializeProgress,
+  type AddResult, type KV,
 } from '../../src/storage'
 import { flushPromises, installLocalStorage } from './helpers'
 
@@ -188,16 +189,20 @@ test('mirroredKV reads the newest savedAt (primary on ties) and writes both back
   assert.equal(await kv.set('w2', 'v'), false, 'The bridge is the source of truth.')
   assert.equal(local.data.get('w2'), 'v')
   assert.equal(await mirroredKV(null, local.kv).set('w3', 'v'), true)
+
+  const failing: KV = { name: 'bridge', async get() { throw new Error('bridge read failed') }, async set() { return true } }
+  await assert.rejects(mirroredKV(failing, local.kv).get(KEYS.prefs), /bridge read failed/,
+    'A failed primary read is not replaced by the mirror copy or by an absent key.')
 })
 
-test('bridgeKV treats an empty string as absent, refuses oversized values and contains bridge errors', async () => {
+test('bridgeKV treats an empty or missing value as absent, refuses oversized values and lets read failures through', async () => {
   const calls: string[] = []
-  const values = new Map<string, string>([['blank', '']])
+  const values = new Map<string, unknown>([['blank', ''], ['null', null], ['number', 42]])
   const kv = bridgeKV({
     async storageGet(key) {
       calls.push(`get:${key}`)
       if (key === 'boom') throw new Error('bridge failed')
-      return values.get(key) ?? ''
+      return (values.has(key) ? values.get(key) : '') as string
     },
     async storageSet(key, value) {
       calls.push(`set:${key}`)
@@ -209,7 +214,9 @@ test('bridgeKV treats an empty string as absent, refuses oversized values and co
   assert.equal(kv.name, 'bridge')
   assert.equal(await kv.get('missing'), '')
   assert.equal(await kv.get('blank'), '')
-  assert.equal(await kv.get('boom'), '')
+  assert.equal(await kv.get('null'), '', 'null counts as absent')
+  await assert.rejects(kv.get('boom'), /bridge failed/, 'A failed read is never mistaken for an absent key.')
+  await assert.rejects(kv.get('number'), /unreadable/, 'A non-string value is a failed read.')
   assert.equal(await kv.set('big', 'x'.repeat(MAX_KEY_CHARS + 1)), false)
   assert.ok(!calls.includes('set:big'), 'Oversized values never reach the bridge.')
   assert.equal(await kv.set('a', 'ok'), true)
@@ -346,7 +353,9 @@ test('stored documents never contain article text or HTML', async () => {
   }
 })
 
-test('attachBridge adopts newer bridge documents, keeps newer local ones and persists to both', async () => {
+const hosts = (items: Array<{ host: string }>) => items.map(item => item.host)
+
+test('attachBridge merges bridge and browser documents item by item and writes the union to both', async () => {
   const scheduler = fakeScheduler()
   let clock = 1_000
   const local = memoryKV('localStorage', {
@@ -359,34 +368,171 @@ test('attachBridge adopts newer bridge documents, keeps newer local ones and per
   })
   const store = createStore({ now: () => clock, schedule: scheduler.schedule })
   await store.load(local.kv)
-  assert.deepEqual(store.state.publications.map(item => item.host), ['local.substack.com'])
+  assert.equal(store.loadedEmpty(), false)
+  assert.deepEqual(hosts(store.state.publications), ['local.substack.com'])
   const state = store.state
   clock = 2_000
-  const changed = await store.attachBridge(mirroredKV(bridge.kv, local.kv))
+  const applied: Array<[boolean, number]> = []
+  const changed = await store.attachBridge(bridge.kv, value => applied.push([value, bridge.writes.length]))
   assert.equal(changed, true)
+  assert.deepEqual(applied, [[true, 0]], 'onApplied runs once, before anything is written')
   assert.equal(store.state, state, 'The state object keeps its identity.')
-  assert.deepEqual(store.state.publications.map(item => item.host), ['bridge.substack.com'])
+  assert.deepEqual(hosts(store.state.publications), ['bridge.substack.com', 'local.substack.com'],
+    'the newer (bridge) order first, then what only the browser copy had')
   assert.equal(store.state.settings.linesPerPage, 5)
-  assert.deepEqual(store.state.read, [1], 'local progress (900) is newer than the bridge copy (700)')
+  assert.deepEqual(store.state.read, [1, 2], 'the newer (browser) read ids first, then the bridge ones')
   for (const backend of [bridge, local]) {
     const prefs = JSON.parse(backend.data.get(KEYS.prefs)!)
     const progress = JSON.parse(backend.data.get(KEYS.progress)!)
-    assert.deepEqual(prefs.publications.map((item: { host: string }) => item.host), ['bridge.substack.com'])
-    assert.deepEqual(progress.read, [1])
+    assert.deepEqual(hosts(prefs.publications), ['bridge.substack.com', 'local.substack.com'])
+    assert.deepEqual(progress.read, [1, 2])
     assert.equal(prefs.savedAt, 2_000)
+    assert.equal(progress.savedAt, 2_000)
   }
   assert.equal(store.backend(), 'bridge+localStorage')
+  assert.equal(store.attached(), true)
+  assert.equal(store.pending(), false)
+  const writes = bridge.writes.length
+  assert.equal(await store.attachBridge(bridge.kv), false, 'Attaching again is a no-op.')
+  assert.equal(bridge.writes.length, writes)
+})
 
-  // Unsaved phone edits made before the bridge arrived beat an older bridge copy.
-  const edited = createStore({ now: () => clock, schedule: scheduler.schedule })
+const BRIDGE_PREFS = JSON.stringify({
+  schemaVersion: 1, savedAt: 800, publications: [{ host: 'bridge.substack.com', name: 'Bridge' }], saved: [ref(5)], settings: { linesPerPage: 5 },
+})
+const BRIDGE_PROGRESS = JSON.stringify({ schemaVersion: 1, savedAt: 700, read: [2], lastOpen: ref(5) })
+
+test('attachBridge adopts the bridge library when the browser copy was lost, and refreshes only the mirror', async () => {
+  const scheduler = fakeScheduler()
+  const local = memoryKV('localStorage')
+  const bridge = memoryKV('bridge', { [KEYS.prefs]: BRIDGE_PREFS, [KEYS.progress]: BRIDGE_PROGRESS })
+  const store = createStore({ now: () => 2_000, schedule: scheduler.schedule })
+  await store.load(local.kv)
+  assert.equal(store.loadedEmpty(), true)
+  assert.equal(await store.attachBridge(bridge.kv), true)
+  assert.deepEqual(hosts(store.state.publications), ['bridge.substack.com'])
+  assert.equal(store.state.saved[0]!.postId, 5)
+  assert.equal(store.state.settings.linesPerPage, 5)
+  assert.equal(store.state.lastOpen?.postId, 5)
+  assert.deepEqual(bridge.writes, [], 'The adopted documents are not written back to the bridge.')
+  assert.equal(local.data.get(KEYS.prefs), BRIDGE_PREFS)
+  assert.equal(local.data.get(KEYS.progress), BRIDGE_PROGRESS)
+  assert.equal(store.pending(), false)
+  assert.deepEqual(store.sizes(), { prefs: BRIDGE_PREFS.length, progress: BRIDGE_PROGRESS.length })
+})
+
+test('a failed bridge read writes nothing and keeps the browser copy in charge; a later attach merges', async () => {
+  const scheduler = fakeScheduler()
+  const local = memoryKV('localStorage')
+  const bridge = memoryKV('bridge', { [KEYS.prefs]: BRIDGE_PREFS, [KEYS.progress]: BRIDGE_PROGRESS })
+  let failReads = 1
+  const flaky: KV = {
+    name: 'bridge',
+    async get(key) {
+      if (failReads > 0) {
+        failReads -= 1
+        throw new Error('getLocalStorage timed out')
+      }
+      return bridge.kv.get(key)
+    },
+    set: (key, value) => bridge.kv.set(key, value),
+  }
+  const store = createStore({ now: () => 3_000, schedule: scheduler.schedule })
+  await store.load(local.kv)
+  const applied: boolean[] = []
+  await assert.rejects(store.attachBridge(flaky, value => applied.push(value)), /timed out/)
+  assert.deepEqual(applied, [])
+  assert.deepEqual(bridge.writes, [], 'The unread bridge library is never overwritten.')
+  assert.equal(store.backend(), 'localStorage')
+  assert.equal(store.attached(), false)
+  assert.equal(store.pending(), false)
+  assert.deepEqual(store.state, emptyState())
+
+  // An edit while unattached goes to the browser copy only...
+  store.state.publications.push(publication('mine.substack.com'))
+  store.save('prefs')
+  assert.equal(await store.flush(), true)
+  assert.deepEqual(bridge.writes, [])
+  // ...and the next attempt merges it into the bridge library instead of replacing it.
+  assert.equal(await store.attachBridge(flaky), true)
+  assert.deepEqual(hosts(store.state.publications), ['mine.substack.com', 'bridge.substack.com'])
+  assert.deepEqual(hosts(JSON.parse(bridge.data.get(KEYS.prefs)!).publications), ['mine.substack.com', 'bridge.substack.com'])
+  assert.equal(store.state.saved[0]!.postId, 5)
+  assert.equal(store.state.settings.linesPerPage, 5, 'Default settings in the browser copy never override chosen ones.')
+  assert.equal(store.state.lastOpen?.postId, 5)
+  assert.equal(store.backend(), 'bridge+localStorage')
+})
+
+test('phone edits made before the bridge arrived are merged into the bridge library, never replace it', async () => {
+  const scheduler = fakeScheduler()
+  const bridge = memoryKV('bridge', {
+    [KEYS.prefs]: JSON.stringify({ schemaVersion: 1, savedAt: 2_000, publications: [{ host: 'bridge.substack.com' }], saved: [], settings: { linesPerPage: 5 } }),
+    [KEYS.progress]: JSON.stringify({ schemaVersion: 1, savedAt: 2_000, read: [1] }),
+  })
+  const edited = createStore({ now: () => 3_000, schedule: scheduler.schedule })
   await edited.load(memoryKV('localStorage').kv)
-  clock = 3_000
   edited.state.publications.push(publication('mine.substack.com'))
   edited.save('prefs')
-  assert.equal(await edited.attachBridge(mirroredKV(bridge.kv, memoryKV('localStorage').kv)), true, 'bridge progress (2000) was adopted')
-  assert.deepEqual(edited.state.read, [1])
-  assert.deepEqual(edited.state.publications.map(item => item.host), ['mine.substack.com'])
-  assert.deepEqual(JSON.parse(bridge.data.get(KEYS.prefs)!).publications.map((item: { host: string }) => item.host), ['mine.substack.com'])
+  assert.equal(await edited.attachBridge(bridge.kv), true)
+  assert.deepEqual(edited.state.read, [1], 'bridge progress was adopted')
+  assert.deepEqual(hosts(edited.state.publications), ['mine.substack.com', 'bridge.substack.com'])
+  assert.equal(edited.state.settings.linesPerPage, 5)
+  assert.deepEqual(hosts(JSON.parse(bridge.data.get(KEYS.prefs)!).publications), ['mine.substack.com', 'bridge.substack.com'])
+  assert.equal(JSON.parse(bridge.data.get(KEYS.progress)!).savedAt, 2_000, 'an adopted document is not written back')
+  assert.equal(edited.pending(), false)
+})
+
+test('attaching never writes the pristine defaults, and copies already in sync need no write', async () => {
+  const scheduler = fakeScheduler()
+  const bridge = memoryKV('bridge')
+  const local = memoryKV('localStorage')
+  const fresh = createStore({ now: () => 5_000, schedule: scheduler.schedule })
+  await fresh.load(local.kv)
+  assert.equal(await fresh.attachBridge(bridge.kv), false)
+  assert.equal(bridge.writes.length, 0, 'Nothing to write: memory still holds the defaults.')
+  assert.equal(local.writes.length, 0)
+  assert.equal(fresh.backend(), 'bridge+localStorage')
+  fresh.state.publications.push(publication('first.substack.com'))
+  fresh.save('prefs')
+  assert.equal(await fresh.flush(), true)
+  assert.deepEqual(bridge.writes.map(([key]) => key), [KEYS.prefs])
+  assert.deepEqual(local.writes.map(([key]) => key), [KEYS.prefs])
+
+  // The usual relaunch: both copies hold the same documents.
+  const synced = memoryKV('localStorage', Object.fromEntries(bridge.data))
+  const again = createStore({ now: () => 6_000, schedule: scheduler.schedule })
+  await again.load(synced.kv)
+  const before = bridge.writes.length
+  assert.equal(await again.attachBridge(bridge.kv), false)
+  assert.equal(bridge.writes.length, before)
+  assert.equal(synced.writes.length, 0)
+  assert.deepEqual(hosts(again.state.publications), ['first.substack.com'])
+})
+
+test('merging keeps the newest position per post, unites lists and never lets default settings win', () => {
+  const newer = normalizeProgress({ savedAt: 20, positions: [position(1, 10), position(2, 50)], history: [ref(2), ref(1)], read: [2], lastOpen: null })
+  const older = normalizeProgress({ savedAt: 10, positions: [position(1, 30, { page: 5 }), position(3, 20)], history: [ref(3), ref(2)], read: [3, 2], lastOpen: ref(3) })
+  const progress = mergeProgress(newer, older)
+  assert.deepEqual(progress.positions.map(item => [item.postId, item.updatedAt]), [[2, 50], [1, 30], [3, 20]])
+  assert.equal(progress.positions[1]!.page, 5)
+  assert.deepEqual(progress.history.map(item => item.postId), [2, 1, 3])
+  assert.deepEqual(progress.read, [2, 3])
+  assert.equal(progress.lastOpen?.postId, 3, 'the older lastOpen fills a missing one')
+  assert.equal(progress.savedAt, 20)
+
+  const a = normalizePrefs({ savedAt: 9, publications: [{ host: 'a.substack.com', id: 7 }, { host: 'b.substack.com' }], saved: [ref(1)], settings: { linesPerPage: 6 } })
+  const b = normalizePrefs({
+    savedAt: 4,
+    publications: [{ host: 'www.a.com', id: 7 }, { host: 'c.substack.com' }, { host: 'b.substack.com' }],
+    saved: [ref(2), ref(1)],
+    settings: { linesPerPage: 5 },
+  })
+  const prefs = mergePrefs(a, b)
+  assert.deepEqual(hosts(prefs.publications), ['a.substack.com', 'b.substack.com', 'c.substack.com'], 'one Substack id is one entry')
+  assert.deepEqual(prefs.saved.map(item => item.postId), [1, 2])
+  assert.equal(prefs.settings.linesPerPage, 6)
+  assert.equal(prefs.savedAt, 9)
+  assert.equal(mergePrefs(normalizePrefs({ savedAt: 9 }), b).settings.linesPerPage, 5)
 })
 
 test('state helpers keep MRU order, caps and dedupe', () => {
@@ -426,4 +572,36 @@ test('state helpers keep MRU order, caps and dedupe', () => {
   clearReading(state)
   assert.deepEqual([state.positions, state.history, state.read, state.lastOpen], [[], [], [], null])
   assert.equal(state.saved.length, 1, 'clearing reading keeps Saved')
+
+  // One Substack publication can answer on its subdomain and its custom domain.
+  assert.equal(addPublication(state, { id: 7, name: 'Seven', host: 'seven.substack.com', addedAt: 1, inLatest: true }), 'added')
+  assert.equal(addPublication(state, { id: 7, name: 'Seven', host: 'www.seven.com', addedAt: 2, inLatest: true }), 'exists')
+  assert.deepEqual(state.publications.map(item => item.host), ['www.alpha.com', 'seven.substack.com'])
+})
+
+test('adds that would push the prefs document past 48k are refused as full, so it stays storable', () => {
+  const state = emptyState()
+  const big = (id: number) => ref(id, { slug: 's'.repeat(200), title: 'T'.repeat(200), pubName: 'P'.repeat(120) })
+  let result: AddResult = 'added'
+  let id = 0
+  while (result === 'added') {
+    id += 1
+    result = addSaved(state, big(id))
+  }
+  assert.equal(result, 'full')
+  assert.ok(state.saved.length < LIMITS.saved, `${state.saved.length} long saved posts fill the document`)
+  assert.equal(state.saved.length, id - 1, 'the refused post is not kept')
+  assert.ok(prefsFit(state))
+  assert.ok(serializePrefs(state, 1_000)!.length <= MAX_KEY_CHARS)
+
+  let added: AddResult = 'added'
+  let count = 0
+  while (added === 'added') {
+    count += 1
+    added = addPublication(state, publication(`p${count}.substack.com`, 'N'.repeat(120)))
+  }
+  assert.equal(added, 'full')
+  assert.ok(state.publications.length < LIMITS.publications)
+  assert.equal(state.publications.length, count - 1)
+  assert.ok(prefsFit(state))
 })

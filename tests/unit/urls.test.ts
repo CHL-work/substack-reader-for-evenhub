@@ -7,6 +7,8 @@ import {
   MAX_INPUT_CHARS,
   MAX_LINES,
   MAX_PASTE_CHARS,
+  SHARE_TEXT_MAX_LINES,
+  SKIPPED_PREVIEW_CHARS,
   SLUG_RE,
   normalizeHost,
   parseMany,
@@ -21,6 +23,7 @@ const postId = (id: number): ParsedInput => ({ kind: 'postId', id })
 const handle = (value: string): ParsedInput => ({ kind: 'handle', handle: value })
 const search = (query: string): ParsedInput => ({ kind: 'search', query })
 const invalid = (reason: string): ParsedInput => ({ kind: 'invalid', reason })
+const skipped = (text: string, shown = text): ParsedInput => ({ kind: 'invalid', reason: `Skipped "${shown}". ${INVALID_REASONS.shareText}`, skipped: text })
 
 function check(cases: [string, ParsedInput][]): void {
   for (const [input, expected] of cases) {
@@ -41,6 +44,22 @@ test('publication inputs (SPEC 3.6 table)', () => {
     ['https://open.substack.com/pub/foo', pub('foo.substack.com')],
     ['b\u{fc}cher.de', pub('xn--bcher-kva.de')],
   ])
+})
+
+test('IDN top-level domains are accepted after punycoding (C6)', () => {
+  const cyrillic = '\u{43f}\u{440}\u{438}\u{43c}\u{435}\u{440}.\u{440}\u{444}' // example.rf in Cyrillic
+  check([
+    [`https://${cyrillic}/p/post`, post('xn--e1afmkfd.xn--p1ai', 'post')],
+    [cyrillic, pub('xn--e1afmkfd.xn--p1ai')],
+    ['https://foo.xn--fiqs8s/', pub('foo.xn--fiqs8s')],
+  ])
+  assert.equal(normalizeHost(cyrillic), 'xn--e1afmkfd.xn--p1ai')
+  assert.equal(wwwAlternative(cyrillic), 'www.xn--e1afmkfd.xn--p1ai')
+  assert.equal(HOST_RE.test('foo.xn--p1ai'), true)
+  assert.equal(HOST_RE.test(`foo.xn--${'a'.repeat(59)}`), true, 'a 63-character TLD label')
+  for (const bad of ['foo.xn--', 'foo.xn---', 'foo.xn--p1ai-', 'foo.xn--p1_ai', `foo.xn--${'a'.repeat(60)}`, 'foo.x1', 'foo.1ai']) {
+    assert.equal(HOST_RE.test(bad), false, `host: ${bad}`)
+  }
 })
 
 test('post inputs, including open.substack.com and share text', () => {
@@ -71,6 +90,15 @@ test('post id inputs', () => {
   ])
 })
 
+test('post ids above the signed 32-bit range Substack accepts are rejected before any request (relay C3)', () => {
+  check([
+    ['https://substack.com/home/post/p-2147483647', postId(2147483647)],
+    ['https://substack.com/home/post/p-2147483648', invalid(INVALID_REASONS.postId)],
+    ['https://substack.com/home/post/p-99999999999', invalid(INVALID_REASONS.postId)],
+    ['substack.com/inbox/post/4294967296', invalid(INVALID_REASONS.postId)],
+  ])
+})
+
 test('handle inputs', () => {
   check([
     ['@thezvi', handle('thezvi')],
@@ -79,6 +107,15 @@ test('handle inputs', () => {
     ['@thezvi.', handle('thezvi')],
     ['https://substack.com/@thezvi.', handle('thezvi')],
   ])
+})
+
+test('handles are lowercased: Substack profile lookups are case-sensitive (relay C1)', () => {
+  check([
+    ['@TheZvi', handle('thezvi')],
+    ['https://substack.com/@TheZvi', handle('thezvi')],
+    ['substack.com/@The.Zvi_1/notes', handle('the.zvi_1')],
+  ])
+  assert.deepEqual(parseMany('@TheZvi\n@thezvi'), [handle('thezvi')], 'case variants are one result')
 })
 
 test('substack.com without a post or handle asks for a publication link', () => {
@@ -111,6 +148,17 @@ test('unsafe schemes, control characters and non-web links are rejected', () => 
     ['foo\x00.substack.com', invalid(INVALID_REASONS.unsafe)],
     ['foo.substack.com\x07', invalid(INVALID_REASONS.unsafe)],
     ['ftp://foo.substack.com/', invalid(INVALID_REASONS.notHttp)],
+    ['blob:https://foo.substack.com/x', invalid(INVALID_REASONS.unsafe)],
+    ['(vbscript:msgbox)', invalid(INVALID_REASONS.unsafe)],
+  ])
+})
+
+test('ordinary words before a colon are text, not unsafe schemes (C3)', () => {
+  check([
+    ['Big Data: why the hype died https://foo.substack.com/p/big-data', post('foo.substack.com', 'big-data')],
+    ['data: privacy', search('data: privacy')],
+    ['JavaScript: weekly', search('JavaScript: weekly')],
+    ['Case file: the archive', search('Case file: the archive')],
   ])
 })
 
@@ -191,8 +239,10 @@ test('exported patterns', () => {
   assert.equal(HANDLE_RE.test('the zvi'), false)
 })
 
-test('parseMany: one result per line, duplicates removed, share-text titles dropped', () => {
+test('parseMany: one result per line, duplicates removed', () => {
+  // Five lines: a list, not share text, so the plain-text line is a search too.
   assert.deepEqual(parseMany('Great read\nhttps://foo.substack.com/p/my-slug\n\n@thezvi\r\nwww.slowboring.com\nWWW.slowboring.com'), [
+    search('Great read'),
     post('foo.substack.com', 'my-slug'),
     handle('thezvi'),
     pub('www.slowboring.com'),
@@ -206,6 +256,55 @@ test('parseMany: one result per line, duplicates removed, share-text titles drop
   assert.deepEqual(parseMany('a.substack.com\u{2028}b.substack.com'), [pub('a.substack.com'), pub('b.substack.com')])
   assert.deepEqual(parseMany(''), [])
   assert.deepEqual(parseMany('  \n \n'), [])
+})
+
+test('parseMany: text next to a single link is share text, shown as skipped (C4, P9)', () => {
+  assert.equal(SHARE_TEXT_MAX_LINES, 3)
+  assert.equal(SKIPPED_PREVIEW_CHARS, 40)
+  // A title over its link: one result per line, the title is reported, not searched.
+  assert.deepEqual(parseMany('Great read\nhttps://foo.substack.com/p/my-slug'), [
+    skipped('Great read'),
+    post('foo.substack.com', 'my-slug'),
+  ])
+  // A link and a name: the name is not dropped silently.
+  assert.deepEqual(parseMany('https://astralcodexten.substack.com\nMatt Yglesias'), [
+    pub('astralcodexten.substack.com'),
+    skipped('Matt Yglesias'),
+  ])
+  // A long blurb and a one-character line: no "too long" / "too short" errors, the blurb is clipped.
+  const blurb = `${'word '.repeat(24)}end`
+  assert.deepEqual(parseMany(`${blurb}\n!\nhttps://www.slowboring.com/p/an-ai-legislator`), [
+    skipped(blurb, 'word word word word word word word word\u{2026}'),
+    skipped('!'),
+    post('www.slowboring.com', 'an-ai-legislator'),
+  ])
+  // Words with a colon are not unsafe schemes (C3); whitespace and controls collapse; repeats once.
+  assert.deepEqual(parseMany('Data: a primer\nhttps://foo.substack.com/p/big-data\ndata:  A\tPRIMER'), [
+    skipped('Data: a primer'),
+    post('foo.substack.com', 'big-data'),
+  ])
+  // Bare domains and @handles next to the link still count.
+  assert.deepEqual(parseMany('https://foo.substack.com/p/my-slug\nwww.slowboring.com\n@thezvi'), [
+    post('foo.substack.com', 'my-slug'),
+    pub('www.slowboring.com'),
+    handle('thezvi'),
+  ])
+  // Single-line share text needs no skipping.
+  assert.deepEqual(parseMany('Big Data: why the hype died https://foo.substack.com/p/big-data'), [post('foo.substack.com', 'big-data')])
+})
+
+test('parseMany: lists with several links or more lines search every plain-text line (P9)', () => {
+  assert.deepEqual(parseMany('https://a.substack.com\nhttps://b.substack.com\nMatt Yglesias'), [
+    pub('a.substack.com'),
+    pub('b.substack.com'),
+    search('Matt Yglesias'),
+  ])
+  assert.deepEqual(parseMany('https://a.substack.com\nMatt Yglesias\nNoah Smith\nx'), [
+    pub('a.substack.com'),
+    search('Matt Yglesias'),
+    search('Noah Smith'),
+    invalid(INVALID_REASONS.searchShort),
+  ])
 })
 
 test('parseMany caps the number of results and the paste size', () => {

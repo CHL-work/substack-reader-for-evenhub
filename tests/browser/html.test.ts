@@ -105,8 +105,8 @@ function checkOutput(label: string, text: string): void {
   }
 }
 
-test('CONVERTER_VERSION is 1', () => {
-  assertEqual(CONVERTER_VERSION, 1)
+test('CONVERTER_VERSION is 2', () => {
+  assertEqual(CONVERTER_VERSION, 2) // 2: "Read more" only as the RSS tail, currency codes, ballot boxes
 })
 
 for (const { name, html, expected } of FIXTURES) {
@@ -242,12 +242,36 @@ test('uppercaseHeadingMax 0 keeps heading case', () => {
     .replace('00:00:00 \u2013 INTRO', '00:00:00 \u2013 Intro'))
 })
 
-test('the RSS "Read more" tail cuts the body and marks it paywalled', () => {
-  const result = htmlToReaderText('<p>Preview text.</p><p><a href="https://x.substack.com/p/y">Read more</a></p><p>Hidden.</p>', {})
-  assertEqual(result.text, `Preview text.\n\n${PREVIEW_NOTE}`)
-  assertEqual(result.paywalled, true)
-  assertEqual(result.wordCount, 2)
-  checkOutput('rss tail', result.text)
+test('the RSS "Read more" tail ends a body that may be gated and marks it paywalled', () => {
+  const tail = '<p>Preview text.</p>\n  <p>\n    <a href="https://x.substack.com/p/y">\n      Read more\n    </a>\n  </p>\n  <!-- end -->\n'
+  for (const opts of [{}, { audience: null }, { audience: 'only_paid' }] as HtmlToReaderTextOptions[]) {
+    const result = htmlToReaderText(tail, opts)
+    assertEqual(result.text, `Preview text.\n\n${PREVIEW_NOTE}`, JSON.stringify(opts))
+    assertEqual(result.paywalled, true)
+    assertEqual(result.wordCount, 2)
+    checkOutput('rss tail', result.text)
+  }
+  const free = htmlToReaderText(tail, { audience: 'everyone' })
+  assertEqual(free.text, 'Preview text.\n\nRead more', 'a known free post keeps its trailing link as text')
+  assertEqual(free.paywalled, false)
+})
+
+test('a "Read more" link inside the body is content, never a cut (C1)', () => {
+  const roundup = '<p>Summary of story A.</p><p><a href="https://nytimes.com/a">Read more</a></p><h3>Story B</h3><p>C.</p>'
+  for (const opts of [{ audience: 'everyone' }, {}] as HtmlToReaderTextOptions[]) {
+    const result = htmlToReaderText(roundup, opts)
+    assertEqual(result.text, 'Summary of story A.\n\nRead more\n\nSTORY B\n\nC.', JSON.stringify(opts))
+    assertEqual(result.paywalled, false)
+  }
+  const list = htmlToReaderText('<ul><li><p>One.</p><p><a href="https://nytimes.com/a">Read more</a></p></li><li><p>Two.</p></li></ul><p>After.</p>', {})
+  assertEqual(list.text, `\u2022 One.\n${N.repeat(3)}Read more\n\u2022 Two.\n\nAfter.`)
+  assertEqual(list.paywalled, false)
+  const nested = htmlToReaderText('<p>Intro.</p><blockquote><p><a href="https://x.substack.com/p/y">Read more</a></p></blockquote>', {})
+  assertEqual(nested.text, 'Intro.\n\n> Read more', 'only a top-level last paragraph is the tail')
+  assertEqual(nested.paywalled, false)
+  const mixed = htmlToReaderText('<p>Text.</p><p><a href="https://x.substack.com/p/y">Read more</a> about it</p>', {})
+  assertEqual(mixed.text, 'Text.\n\nRead more about it')
+  assertEqual(mixed.paywalled, false)
 })
 
 test('gating follows the audience (C11) and empty bodies', () => {
@@ -322,6 +346,27 @@ test('normalizeChars coverage fallback: decompose, drop, or mark runs', () => {
   assertEqual(normalizeChars('\u2014', isCovered), '\u2014')
 })
 
+test('normalizeChars spells out currency signs and ballot boxes the fonts lack (C5)', () => {
+  const signs: [string, string][] = [
+    ['\u20B9', 'INR'], ['\u20BD', 'RUB'], ['\u20BA', 'TRY'], ['\u20B4', 'UAH'], ['\u20A6', 'NGN'], ['\u20B1', 'PHP'],
+    ['\u20AB', 'VND'], ['\u20B8', 'KZT'], ['\u20AA', 'ILS'], ['\u20BC', 'AZN'], ['\u20BE', 'GEL'], ['\u20A1', 'CRC'],
+    ['\u20B2', 'PYG'], ['\u20B5', 'GHS'], ['\u20AD', 'LAK'], ['\u20AE', 'MNT'],
+  ]
+  for (const [sign, code] of signs) {
+    assertEqual(getAdvW(sign.codePointAt(0) ?? 0), 0, `${code}: the sign is missing from the fonts`)
+    assertEqual(normalizeChars(`${sign}5`, isCovered), `${code} 5`)
+  }
+  assertEqual(normalizeChars('costs \u20B9500, \u20BD 90 or 200\u20B4.', isCovered), 'costs INR 500, RUB 90 or 200 UAH.')
+  assertEqual(normalizeChars('\u20B9500'), 'INR 500', 'part of the static table')
+  assertEqual(normalizeChars('\u20AC5 \u20A95 $5', isCovered), '\u20AC5 \u20A95 $5', 'covered signs stay')
+  for (const box of ['\u2610', '\u2611', '\u2612', '\u2666', '\u27A4']) assertEqual(getAdvW(box.codePointAt(0) ?? 0), 0)
+  assertEqual(normalizeChars('\u2610 Buy flour / \u2612 Proof dough / \u2611 Bake', isCovered), '[ ] Buy flour / [x] Proof dough / [\u221A] Bake')
+  assertEqual(normalizeChars('4\u2666 \u27A4 next', isCovered), '4\u25C6 \u2192 next')
+  const article = htmlToReaderText('<ul><li>\u2610 Buy flour</li><li>\u2612 Proof dough</li></ul><p>Rent: \u20B912,000.</p>', { isCovered })
+  assertEqual(article.text, '\u2022 [ ] Buy flour\n\u2022 [x] Proof dough\n\nRent: INR 12,000.')
+  checkOutput('C5 glyphs', article.text)
+})
+
 test('normalizeChars stripEmoji keeps typographic symbols', () => {
   assertEqual(normalizeChars('ok \u{1F600}\u2764\uFE0F \u00A9 2026\u2122', undefined, true), 'ok  \u00A9 2026\u2122')
   assertEqual(normalizeChars('\u{1F534} GOP', undefined, true), '(red) GOP')
@@ -336,4 +381,10 @@ test('latexToText renders common expressions', () => {
   assertEqual(latexToText('R(e) = R_{\\text{task}} - \\lambda(e)N_{\\text{tokens}} '), 'R(e) = R_task - \u03BB(e)N_tokens')
   assertEqual(latexToText('\\sqrt{x^2 + y^2} \\cdot \\pi'), '\u221A(x\u00B2 + y\u00B2) \u00B7 \u03C0')
   assertEqual(latexToText('T_{\\text{final}} = T_0 \\cdot e^{-kt} + \\frac{a}{b}'), 'T_final = T\u2080 \u00B7 e^(-kt) + (a)/(b)')
+})
+
+test('latexToText: alignment & becomes a space, escaped \\& stays (C2: no lookbehind)', () => {
+  assertEqual(latexToText('\\begin{cases} 1 & x > 0 \\\\ 0 & \\text{R\\&D} \\end{cases}'), '1 x > 0 ; 0 R&D')
+  assertEqual(latexToText('a&&b \\&& c'), 'a b & c')
+  assertEqual(latexToText('\\\\&x'), '; x', 'a line break before & is not an escape')
 })

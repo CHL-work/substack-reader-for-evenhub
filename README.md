@@ -39,7 +39,7 @@ Post HTML is converted to plain text on the phone and never inserted into the pa
 
 ## Features
 
-- **Add publications** by pasting a `*.substack.com` link, a custom domain (for example `www.slowboring.com`), a post or share link, an `@handle` (to import that person's public subscriptions), or a name to search for.
+- **Add publications** by pasting a `*.substack.com` link, a custom domain (for example `www.slowboring.com`), a post or share link, an `@handle` (to import that person's public subscriptions), or a name to search for. Several lines are added one by one. In a short share text with a single link (up to 3 lines), the title or blurb next to the link is shown as skipped instead of being searched.
 - **Glasses Home:** Continue (the post you were reading), Latest (newest posts across your publications), Publications, Saved, and History. The items and their order are set on the phone.
 - **Reader:** page counter, percentage and minutes left in the footer. Reading positions are saved, so a post reopens where you stopped, including when you launch the app from the glasses menu.
 - **Gestures:** swipe to move or turn pages, tap to open or turn, double-tap to go back (and to exit from Home), plus a contextual menu (Home, Save for later, Next post, Restart post, Refresh). See [docs/glasses.md](docs/glasses.md).
@@ -56,6 +56,7 @@ Post HTML is converted to plain text on the phone and never inserted into the pa
 - No images, audio or video on the glasses, only placeholders. Podcast posts show their text, if any.
 - Article text is kept in memory only, so there is no offline reading. The Even WebView cannot use the network in the background.
 - Search uses Substack's site-wide search and may return few results for some names. Pasting a link always works.
+- Your library is kept twice: in the Even app's storage (the main copy) and in the WebView. When the two differ, for example after edits made before the Even app's storage answered, they are merged item by item so nothing is lost. The cost: a publication or saved post removed in only one copy can come back; remove it again.
 
 ## Setup
 
@@ -70,12 +71,14 @@ The relay is one file, `worker/relay.ts`. Pick one host:
 - **Cloudflare, from your computer** (PowerShell, portable Node):
   ```powershell
   $env:PATH = "C:\Code\.tools\node;$env:PATH"; $env:COREPACK_ENABLE_DOWNLOAD_PROMPT = "0"
-  pnpm dlx wrangler@4.148.0 login
-  pnpm dlx wrangler@4.148.0 deploy --var REVISION:manual
+  pnpm install --frozen-lockfile
+  pnpm exec wrangler login
+  pnpm exec wrangler deploy --var REVISION:manual
   ```
+  Wrangler is a pinned devDependency (4.148.0 in `pnpm-lock.yaml`), so the deploy runs the locked version, never a freshly resolved one.
 - **OpenAI Sites** (the host used by the LIHKG reader): see [.openai/README-sites.md](.openai/README-sites.md).
 
-Then open `https://<relay-origin>/v1/health?probe=1` in a browser. You should see `"service":"substack-reader-relay"` and `"protocol":1`, plus one probe result per kind of Substack host. [docs/relay.md](docs/relay.md) explains how to read them.
+Then open `https://<relay-origin>/v1/health?probe=1` in a browser. You should see `"service":"substack-reader-relay"` and `"protocol":1`, plus one probe result per kind of Substack host. The relay probes at most once a minute; reloading within that minute shows the same results with `"cached":true`. [docs/relay.md](docs/relay.md) explains how to read them.
 
 ### 2. Set the relay origin
 

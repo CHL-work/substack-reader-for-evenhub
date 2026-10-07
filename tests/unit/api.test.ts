@@ -255,6 +255,7 @@ test('invalid input is rejected before any request', async () => {
   await rejectsWith(api.getPost({ host: 'localhost', slug: 'x' }), 'INVALID_HOST')
   await rejectsWith(api.getPost({ id: 0 }), 'INVALID_PARAM')
   await rejectsWith(api.getPost({ id: 1.5 }), 'INVALID_PARAM')
+  await rejectsWith(api.getPost({ id: 2_147_483_648 }), 'INVALID_PARAM') // Above Substack's by-id range (relay C3).
   await rejectsWith(api.getProfile('bad handle!'), 'INVALID_HANDLE')
   await rejectsWith(api.searchPublications('a'), 'INVALID_QUERY')
   await rejectsWith(api.searchPublications('x'.repeat(101)), 'INVALID_QUERY')
@@ -396,7 +397,7 @@ test('the caller signal is combined with the timeout', async () => {
   assert.equal(rec.calls.length, calls, 'an already-aborted signal sends nothing')
 })
 
-test('getProfile strips @ and normalizes the profile', async () => {
+test('getProfile strips @, lowercases the handle and normalizes the profile', async () => {
   const subscription = (index: number) => ({ id: index, name: `Pub ${index} `, subdomain: `pub${index}`, customDomain: null, host: `pub${index}.substack.com` })
   const rec = recorder(() => ok({
     handle: 'thezvi',
@@ -404,8 +405,8 @@ test('getProfile strips @ and normalizes the profile', async () => {
     primaryPublication: { id: 1, name: 'Thinking Notes', subdomain: 'thezvi', customDomain: null, host: 'thezvi.substack.com' },
     subscriptions: [subscription(2), subscription(2), { host: 'bad host' }, 'junk', subscription(3)],
   }))
-  const profile = await createApi(RELAY, rec.fetch).getProfile('  @thezvi ')
-  assert.equal(rec.calls[0]!.url, `${RELAY}/v1/profile?handle=thezvi`)
+  const profile = await createApi(RELAY, rec.fetch).getProfile('  @TheZvi ')
+  assert.equal(rec.calls[0]!.url, `${RELAY}/v1/profile?handle=thezvi`, 'lowercased: Substack profile lookups are case-sensitive (relay C1)')
   assert.deepEqual(profile, {
     handle: 'thezvi',
     name: 'Zvi',
@@ -431,12 +432,15 @@ test('searchPublications dedupes by host and id and keeps at most 20', async () 
   assert.deepEqual(pubs.map(pub => pub.host), Array.from({ length: 20 }, (_, index) => `pub${index}.substack.com`))
 })
 
-test('getFeedXml returns raw XML; JSON answers are errors', async () => {
+test('getFeedXml returns raw XML (also as text/plain); JSON answers are errors', async () => {
   let respond: () => Response = () => xmlResponse('<rss version="2.0"><channel/></rss>')
   const rec = recorder(() => respond())
   const api = createApi(RELAY, rec.fetch)
   assert.equal(await api.getFeedXml('www.slowboring.com'), '<rss version="2.0"><channel/></rss>')
   assert.equal(rec.calls[0]!.url, `${RELAY}/v1/feed?host=www.slowboring.com`)
+  // The relay serves feeds as sandboxed text/plain (relay S1); the body is still the XML.
+  respond = () => new Response('<rss version="2.0"><channel/></rss>', { status: 200, headers: { 'content-type': 'text/plain; charset=utf-8' } })
+  assert.equal(await api.getFeedXml('www.slowboring.com'), '<rss version="2.0"><channel/></rss>')
 
   respond = () => fail(503, { code: 'UPSTREAM_BLOCKED', message: 'Blocked.' })
   await rejectsWith(api.getFeedXml('www.slowboring.com'), 'UPSTREAM_BLOCKED')

@@ -24,9 +24,9 @@ One page is created once with `createStartUpPageContainer` and is never rebuilt.
 | First run / no relay | — | — | — | Exit (system dialog) | Ignored |
 | Publications | Cursor down | Cursor up | Open that publication's posts | Back | Back |
 | Posts list | Cursor down; past the last post it selects "Load older posts…" when present | Cursor up | Read the post, or load older posts on that row | Back (Home or Publications keeps its selection) | Back |
-| Reader | Next page; after the last page, the end card | Previous page; from the end card, the last page | Next page (setting "Tap in reader: next page"); on the end card, the next post in the list | Back to the list with this post selected; the position is saved at once | Back |
-| Loading | — | — | — | Cancel the request and go back | Same as double-tap |
-| Error | — | — | Retry (when retrying can help) | Back | Back |
+| Reader | Next page; after the last page, the end card | Previous page; from the end card, the last page | Next page (setting "Tap in reader: next page"); on the end card, the next post in the list (on the last loaded post of a list that still has "Load older posts…", that page is loaded first and its first new post opens) | Back to the list with this post selected; the position is saved at once | Back |
+| Loading | — | — | — | Cancel the request and go back (a cancelled Refresh or Load older returns to the list that was loaded) | Same as double-tap |
+| Error | — | — | Retry (when retrying can help) the same step: a failed Refresh keeps the selected post | Back (after a failed Refresh or Load older, to the list that was loaded) | Back |
 
 - Swipe direction can be inverted in the phone settings. The device checklist records which physical swipe is "down".
 - Taps and double-taps may arrive in the system, text or list event envelope; all three are read. A click with no event type inside an envelope is a tap.
@@ -55,10 +55,10 @@ Tap then hold opens the system menu, which lists these items above the system's 
 | ID | Item | Effect |
 | --- | --- | --- |
 | 1 | Home | Back to Home from anywhere (saves the reading position) |
-| 2 | Save for later | Saves the open post, or the selected post in a list. The footer shows "Saved for later", "Already saved" or "Saved list is full" for one frame. |
-| 3 | Next post | In the reader: open the next post of the list |
+| 2 | Save for later | Saves the open post, or the selected post in a list. The footer shows "Saved for later", "Already saved", "Saved list is full" (100 posts) or "Storage is full" (the stored library reached its size limit) for one frame. |
+| 3 | Next post | In the reader: open the next post of the list, loading the list's next archive page first when the loaded posts end here |
 | 4 | Restart post | In the reader: go to page 1 |
-| 5 | Refresh | In a list: reload it (Latest skips its 5-minute cache). In a failed reader: retry. Elsewhere: redraw the whole frame. |
+| 5 | Refresh | In a loaded list: reload it (Latest skips its 5-minute cache). In a list that is loading or failed: run the pending step again (load, Load older or Refresh). In a failed reader: retry. Elsewhere: redraw the whole frame. |
 
 An item that does not apply shows "Not available here" in the footer for one frame.
 
@@ -70,6 +70,7 @@ An item that does not apply shows "Not available here" in the footer for one fra
 | --- | --- | --- | --- |
 | Home | `Reader for Substack` | 4 items per screen with a blank line between them: `Continue: <title>` (only while a post is unfinished), then the Home items set on the phone: `Latest`, `Publications (N)`, `Saved (N)`, `History` | `Tap open · 2×tap exit` |
 | First run (no publications and nothing saved) | `Reader for Substack` | `No publications yet.` / blank / `On your phone, open Reader for Substack` / `in the Even app and add a publication.` | `2×tap exit` |
+| Loading your library (first frame only, when the WebView's copy was empty and Even app storage has not answered within 1.5 s) | `Reader for Substack` | `Loading your library…` | `2×tap exit` |
 | No relay in this build | `Reader for Substack` | `This build has no reader service.` / `See the phone for details.` | `2×tap exit` |
 | Publications | `Publications` | 4 names per screen, as on Home | `3/12 · Tap open · 2×tap back` |
 | Posts list | Publication name, `Latest`, `Saved` or `History` | 3 posts per screen, 2 lines each: `> Title…` and an indented meta line such as `Pub · 2d · 12 min · Paid · 34%` (the publication is left out inside its own list; `Paid` only for paywalled posts; the last field is the progress or `Read`). The last row may be `> Load older posts…`. | `4/37 · Tap read · 2×tap back` (`Tap load` on the Load row; `· 2 failed` when some Latest publications failed) |
@@ -79,7 +80,7 @@ An item that does not apply shows "Not available here" in the footer for one fra
 | Loading | Context title | `Loading…` | `2×tap cancel` |
 | Error | Context title | See below | `Tap retry · 2×tap back` (or `2×tap back` when retrying cannot help) |
 
-Empty lists show `No posts yet.`, `Nothing saved yet.` / `Save posts on your phone.`, `Nothing read yet.`, `No publications yet.` / `Add one on your phone.`, or `No publications in Latest.` / `Turn one on in the phone app.` A tap on the end card when the list has no next post shows `No more posts.` for one frame.
+Empty lists show `No posts yet.`, `Nothing saved yet.` / `Save posts on your phone.`, `Nothing read yet.`, `No publications yet.` / `Add one on your phone.`, or `No publications in Latest.` / `Turn one on in the phone app.` A tap on the end card when the list has no next post and no older posts to load shows `No more posts.` for one frame. While the next archive page loads from the end card, the reader shows the Loading frame (double-tap returns to the list); if that page fails, its error shows for one frame and a tap on the end card tries again.
 
 Error bodies (details go to the phone):
 
@@ -104,5 +105,8 @@ The converter keeps paragraphs, headings (upper-cased when short, a setting), qu
 
 - The reading position (character offset, fraction, page) is recorded after every page that the glasses actually displayed, saved after 800 ms, and saved immediately on back, Home, opening another post, background, `pagehide` and exit. Showing the end card marks the post as read.
 - Launching the app from the glasses menu with an unfinished post goes straight to that post (Loading first), with Home underneath it.
-- When the app returns to the foreground after more than 30 seconds, or the glasses reconnect, the current frame is sent again in full.
+- When the app returns to the foreground after more than 30 seconds, the current frame is sent again in full. When the glasses report Connected after a disconnect, or after a display write failed, the current frame is sent again in full too (decided from the device events, not from the status shown on the phone).
+- The first frame is created after Even app storage was read (at most 1.5 s), so a relaunch shows Home or the resumed post rather than the first-run screen when the WebView lost its own copy.
+- A refused container update is tried once more after 150 ms. If the glasses still refuse a frame, or do not confirm it, the next gesture only sends the current frame again in full instead of acting, so a page is never skipped and a row the wearer never saw is never opened. The root double-tap is the exception: it always opens the exit dialog.
+- Every bridge call waits in one queue and is bounded: 5 s for a frame or the exit dialog, 4 s for a storage call. A call that does not answer is abandoned so later page turns, the exit dialog and saves still run; if an abandoned write lands later, the newest frame is sent again in full. While one frame waits for its turn, a newer frame replaces it (only the newest is written; the replaced one is reported as superseded, not as a failure), so the root double-tap's exit dialog waits for at most one frame.
 - Connection status on the phone: `Connecting to G2…`, `G2 connected.`, `G2 disconnected. Reconnect in the Even app.`, `Reader closed.`

@@ -16,8 +16,11 @@ export const RELAY_MAX_ARCHIVE_OFFSET = 5000
 
 /** `<sub>.substack.com`, lowercase, a single DNS label before substack.com. */
 export const SUBSTACK_SUBDOMAIN_HOST_RE = /^[a-z0-9-]{1,63}\.substack\.com$/
-/** A public DNS host name (lowercase, at least one dot, alphabetic TLD, no port). */
-export const PUBLIC_HOST_RE = /^(?=.{4,253}$)(?:[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?\.)+[a-z]{2,63}$/
+/**
+ * A public DNS host name (lowercase, at least one dot, no port). The TLD is alphabetic or an IDN TLD
+ * as URL punycodes it (xn--p1ai, xn--fiqs8s).
+ */
+export const PUBLIC_HOST_RE = /^(?=.{4,253}$)(?:[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?\.)+(?:[a-z]{2,63}|xn--[a-z0-9](?:[a-z0-9-]{0,57}[a-z0-9])?)$/
 const SUBDOMAIN_RE = /^[a-z0-9-]{1,63}$/
 
 export interface PubMeta {

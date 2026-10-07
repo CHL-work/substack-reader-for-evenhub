@@ -20,7 +20,7 @@ import {
   type RelayUpstreamInfo,
   type UpstreamContentType,
 } from './types'
-import { HANDLE_RE, SLUG_RE, normalizeHost } from './urls'
+import { HANDLE_RE, MAX_POST_ID, SLUG_RE, normalizeHost } from './urls'
 
 export const REQUEST_TIMEOUT_MS = 15_000
 export const RSS2JSON_ENDPOINT = 'https://api.rss2json.com/v1/api.json'
@@ -441,7 +441,7 @@ export function createApi(
       let params: Record<string, string>
       let requested: string | null = null
       if ('id' in ref) {
-        if (!Number.isSafeInteger(ref.id) || ref.id < 1) throw new ApiError('INVALID_PARAM', messageFor('INVALID_PARAM'))
+        if (!Number.isSafeInteger(ref.id) || ref.id < 1 || ref.id > MAX_POST_ID) throw new ApiError('INVALID_PARAM', messageFor('INVALID_PARAM'))
         params = { id: String(ref.id) }
       } else {
         requested = requireHost(ref.host)
@@ -459,7 +459,8 @@ export function createApi(
 
     async getProfile(handle, signal) {
       const relay = requireRelay()
-      const value = typeof handle === 'string' ? handle.trim().replace(/^@/, '') : ''
+      // Substack's profile lookup is case-sensitive and handles are lowercase (the relay agrees).
+      const value = typeof handle === 'string' ? handle.trim().replace(/^@/, '').toLowerCase() : ''
       if (!HANDLE_RE.test(value)) throw new ApiError('INVALID_HANDLE', messageFor('INVALID_HANDLE'))
       const { data } = await getJson(relayUrl(relay, 'profile', { handle: value }), signal)
       return profileFrom(data, value)

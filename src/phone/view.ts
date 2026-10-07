@@ -75,6 +75,8 @@ export interface PhoneModel {
   storage: { backend: string; sizes: { prefs: number; progress: number } }
   lastErrorCode: string
   confirm: 'clear-reading' | 'reset-settings' | null
+  /** The stored library is still being read from bridge storage (lists and edits are held back). */
+  libraryLoading: boolean
 }
 
 export const NO_BRIDGE_MESSAGE = 'Open this from the Even app to use the glasses.'
@@ -194,10 +196,16 @@ function renderMessages(model: PhoneModel): string {
 // ---------------------------------------------------------------------------
 // Panels
 
+const LIBRARY_LOADING_CARD = '<section class="card" data-testid="library-loading"><p class="loading" role="status">Loading your library&hellip;</p>'
+  + '<p class="small">Your publications, saved posts and settings are being read from the Even app.</p></section>'
+
+/** Panels that show or edit the stored library. */
+const LIBRARY_PANELS: readonly PhonePanel[] = ['publications', 'browse', 'saved', 'settings']
+
 function renderHome(model: PhoneModel): string {
   const { state } = model
   const backDisabled = model.glasses.depth <= 1
-  const firstRun = !state.publications.length && !state.saved.length
+  const firstRun = !model.libraryLoading && !state.publications.length && !state.saved.length
   return `<section class="card mirror-card"><h2>Now on glasses</h2>`
     + `<div class="lens" id="mirror" data-testid="mirror">${renderMirrorFrame(model)}</div>`
     + '<details id="remote" class="remote"><summary data-testid="remote-toggle">Remote control</summary>'
@@ -212,10 +220,12 @@ function renderHome(model: PhoneModel): string {
       ? '<section class="card"><h2>Get started</h2><p>Add a Substack publication by link, custom domain, @handle or name. It then appears on the glasses.</p>'
         + '<button type="button" class="full" data-panel="publications">Add a publication</button></section>'
       : '')
-    + '<div class="source-grid">'
-    + `<button type="button" class="source-card" data-panel="publications" data-testid="count-publications"><strong>Publications</strong><span>${state.publications.length} followed</span></button>`
-    + `<button type="button" class="source-card" data-panel="saved" data-testid="count-saved"><strong>Saved</strong><span>${state.saved.length} for later</span></button>`
-    + '</div>'
+    + (model.libraryLoading
+      ? LIBRARY_LOADING_CARD
+      : '<div class="source-grid">'
+        + `<button type="button" class="source-card" data-panel="publications" data-testid="count-publications"><strong>Publications</strong><span>${state.publications.length} followed</span></button>`
+        + `<button type="button" class="source-card" data-panel="saved" data-testid="count-saved"><strong>Saved</strong><span>${state.saved.length} for later</span></button>`
+        + '</div>')
     + '<section class="card"><h2>On the glasses</h2><ul class="gestures">'
     + '<li><strong>Swipe down</strong> next item or page</li>'
     + '<li><strong>Swipe up</strong> previous item or page</li>'
@@ -481,6 +491,7 @@ function renderAbout(model: PhoneModel): string {
 }
 
 function renderPanel(model: PhoneModel): string {
+  if (model.libraryLoading && LIBRARY_PANELS.includes(model.panel)) return LIBRARY_LOADING_CARD
   switch (model.panel) {
     case 'home': return renderHome(model)
     case 'publications': return renderPublications(model)

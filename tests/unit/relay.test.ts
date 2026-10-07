@@ -1,6 +1,6 @@
 import { test } from 'node:test'
 import assert from 'node:assert/strict'
-import relayDefault, { CACHE_ORIGIN, USER_AGENT, createRelay, type CacheLike, type Env, type Relay, type RelayOptions } from '../../worker/relay'
+import relayDefault, { CACHE_PATH, USER_AGENT, createRelay, type CacheLike, type Env, type Relay, type RelayOptions } from '../../worker/relay'
 import { version } from '../../package.json'
 import type {
   ArchivePage,
@@ -28,12 +28,20 @@ import topSearchFixture from '../fixtures/relay/top-search.json'
 /* ------------------------------------------------------------------ helpers */
 
 const RELAY_ORIGIN = 'https://relay.example.com'
+/** S4: synthetic cache keys live under the relay's own origin. */
+const CACHE_NS = `${RELAY_ORIGIN}${CACHE_PATH}`
 const FINGERPRINT: Record<string, string> = { 'x-served-by': 'Substack', 'x-cluster': 'substack' }
 const TARGET = 'target.substack-custom-domains.com'
 const CNAME_TO_TARGET = [{ type: 5, data: `${TARGET}.` }]
 const JSON_TYPE = 'application/json; charset=utf-8'
+const FEED_TYPE = 'text/plain; charset=utf-8'
+const SANDBOX_CSP = "default-src 'none'; sandbox; frame-ancestors 'none'"
+/** A Workers `request.cf` object: the request came through Cloudflare's edge (S7). */
+const CF = { colo: 'TST', country: 'NL' }
 
 type Handler = (init: RequestInit | undefined) => Response | Promise<Response>
+/** RequestInit plus `cf`, which (as on Workers) is attached to the Request as `request.cf`. */
+type CallInit = RequestInit & { cf?: Record<string, unknown> }
 
 function newRelay(options: RelayOptions = {}): Relay {
   return createRelay({ cache: null, ...options })
@@ -109,6 +117,8 @@ function assertCommonHeaders(res: Response): void {
   assert.equal(res.headers.get('referrer-policy'), 'no-referrer')
   assert.equal(res.headers.get('access-control-allow-credentials'), null)
   assert.equal(res.headers.get('set-cookie'), null)
+  // S1: everything but the two HTML pages (which carry their own CSP) is sandboxed.
+  if (!res.headers.get('content-type')?.startsWith('text/html')) assert.equal(res.headers.get('content-security-policy'), SANDBOX_CSP)
 }
 
 function assertUpstreamInit(init: RequestInit | undefined, accept: string): void {
@@ -121,13 +131,20 @@ function assertUpstreamInit(init: RequestInit | undefined, accept: string): void
   assert.deepEqual(init.headers, { 'User-Agent': USER_AGENT, Accept: accept })
 }
 
-async function call(relay: Relay, path: string, init: RequestInit = {}, env?: Env): Promise<{ res: Response; text: string }> {
-  const res = await relay.fetch(new Request(`${RELAY_ORIGIN}${path}`, init), env)
+function relayRequest(url: string, init: CallInit = {}): Request {
+  const { cf, ...rest } = init
+  const request = new Request(url, rest)
+  if (cf) Object.defineProperty(request, 'cf', { value: cf, enumerable: true })
+  return request
+}
+
+async function call(relay: Relay, path: string, init: CallInit = {}, env?: Env): Promise<{ res: Response; text: string }> {
+  const res = await relay.fetch(relayRequest(`${RELAY_ORIGIN}${path}`, init), env)
   assertCommonHeaders(res)
   return { res, text: await res.text() }
 }
 
-async function expectOk<T>(relay: Relay, path: string, init: RequestInit = {}, env?: Env): Promise<{ res: Response; data: T; meta: RelayMeta }> {
+async function expectOk<T>(relay: Relay, path: string, init: CallInit = {}, env?: Env): Promise<{ res: Response; data: T; meta: RelayMeta }> {
   const { res, text } = await call(relay, path, init, env)
   assert.equal(res.status, 200, text)
   assert.equal(res.headers.get('content-type'), JSON_TYPE)
@@ -136,7 +153,7 @@ async function expectOk<T>(relay: Relay, path: string, init: RequestInit = {}, e
   return { res, data: body.data, meta: body.meta }
 }
 
-async function expectError(relay: Relay, path: string, status: number, code: string, init: RequestInit = {}, env?: Env): Promise<{ res: Response; error: RelayError; text: string }> {
+async function expectError(relay: Relay, path: string, status: number, code: string, init: CallInit = {}, env?: Env): Promise<{ res: Response; error: RelayError; text: string }> {
   const { res, text } = await call(relay, path, init, env)
   assert.equal(res.status, status, `${path}: ${text}`)
   assert.equal(res.headers.get('content-type'), JSON_TYPE)
@@ -293,6 +310,10 @@ test('every route validates its parameters before any upstream request', async (
     ['/v1/post?id=-5', 'INVALID_PARAM'],
     ['/v1/post?id=1e5', 'INVALID_PARAM'],
     ['/v1/post?id=9007199254740993', 'INVALID_PARAM'],
+    // C3: Substack's by-id endpoint answers 400 above the signed 32-bit range.
+    ['/v1/post?id=2147483648', 'INVALID_PARAM'],
+    ['/v1/post?id=99999999999', 'INVALID_PARAM'],
+    ['/v1/post?id=02147483647', 'INVALID_PARAM'],
     ['/v1/post?id=9001&host=exampleletters.substack.com&slug=a-post', 'INVALID_PARAM'],
     ['/v1/profile', 'INVALID_HANDLE'],
     ['/v1/profile?handle=..', 'INVALID_HANDLE'],
@@ -312,6 +333,23 @@ test('every route validates its parameters before any upstream request', async (
   await withUpstream({}, async () => {
     for (const [path, code] of cases) await expectError(relay, path, 400, code)
     assert.equal(fetchCalls.length, 0)
+  })
+})
+
+test('IDN hosts: punycode TLDs are publication hosts, malformed ones are refused (C6)', async () => {
+  const relay = newRelay()
+  const idn = 'xn--e1afmkfd.xn--p1ai'
+  await withUpstream({
+    [dohUrl(idn, 'CNAME')]: () => dns(CNAME_TO_TARGET),
+    [archiveUrl(idn)]: () => substackJson([]),
+  }, async () => {
+    const { data, meta } = await expectOk<ArchivePage>(relay, `/v1/archive?host=${idn}`)
+    assert.equal(meta.host, idn)
+    assert.deepEqual(data, { publication: null, posts: [], nextOffset: null })
+    for (const bad of ['foo.xn--', 'foo.xn---', 'foo.xn--p1ai-', 'foo.xn--p1_ai']) {
+      await expectError(relay, `/v1/archive?host=${bad}`, 400, 'INVALID_HOST')
+    }
+    assert.deepEqual(fetchCalls.map(entry => entry.url), [dohUrl(idn, 'CNAME'), archiveUrl(idn)])
   })
 })
 
@@ -471,8 +509,10 @@ test('custom domains: Substack mapping proof passes when S.substack.com redirect
   })
 })
 
-test('custom domains: a failed proof is HOST_NOT_SUBSTACK; lookup outages are 503 and not cached', async () => {
-  const relay = newRelay()
+test('custom domains: a failed proof is HOST_NOT_SUBSTACK; lookup outages are 503, remembered 60 s in memory only', async () => {
+  const clock = createFakeClock(1_000_000)
+  const cache = memoryCache()
+  const relay = newRelay({ cache, now: clock.now })
   const claimFor = (host: string, subdomain: string) => [{
     id: 2,
     publication_id: 77,
@@ -498,9 +538,111 @@ test('custom domains: a failed proof is HOST_NOT_SUBSTACK; lookup outages are 50
     await expectError(relay, '/v1/archive?host=mirror.example.net', 403, 'HOST_NOT_SUBSTACK')
     await expectError(relay, '/v1/archive?host=plain.example.net', 403, 'HOST_NOT_SUBSTACK')
     assert.equal(fetchCalls.some(entry => entry.url === proofUrl('plainpub.substack.com')), false, 'an unfingerprinted claim is never followed up')
+    assert.deepEqual(JSON.parse(cache.entries.get(`${CACHE_NS}/host-verdict?host=mirror.example.net`)?.body ?? 'null'), { verdict: 'fail', expires: 1_000_000 + 3_600_000 })
     await expectError(relay, '/v1/archive?host=down.example.net', 503, 'UPSTREAM_UNAVAILABLE')
+    // S6: the inconclusive check is remembered for 60 s, so a retry makes no lookups or proof request.
+    clock.advance(59_000)
+    await expectError(relay, '/v1/archive?host=down.example.net', 503, 'UPSTREAM_UNAVAILABLE')
+    assert.equal(fetchCalls.filter(entry => entry.url === dohUrl('down.example.net', 'CNAME')).length, 1)
+    assert.equal(fetchCalls.filter(entry => entry.url === proofUrl('down.example.net')).length, 1)
+    clock.advance(2_000)
     await expectError(relay, '/v1/archive?host=down.example.net', 503, 'UPSTREAM_UNAVAILABLE')
     assert.equal(fetchCalls.filter(entry => entry.url === dohUrl('down.example.net', 'CNAME')).length, 2)
+    assert.equal([...cache.entries.keys()].some(key => key.includes('down.example.net')), false, 'unknown is never put in the Cache API')
+  })
+})
+
+test('custom domains: a host without addresses fails for 10 min without any request to it (S3)', async () => {
+  const clock = createFakeClock(2_000_000)
+  const cache = memoryCache()
+  const relay = newRelay({ cache, now: clock.now })
+  const typo = 'www.slowbornig.example.net'
+  const dangling = 'gone.example.net'
+  await withUpstream({
+    ...TARGET_DNS,
+    // NXDOMAIN (Status 3) is a definitive answer.
+    [dohUrl(typo, 'CNAME')]: () => dns([], 3),
+    [dohUrl(typo, 'A')]: () => dns([], 3),
+    [dohUrl(typo, 'AAAA')]: () => dns([], 3),
+    // A CNAME to a name without addresses.
+    [dohUrl(dangling, 'CNAME')]: () => dns([{ type: 5, data: 'lapsed.provider.example.net.' }]),
+    [dohUrl(dangling, 'A')]: () => dns([{ type: 5, data: 'lapsed.provider.example.net.' }]),
+    [dohUrl(dangling, 'AAAA')]: () => dns([{ type: 5, data: 'lapsed.provider.example.net.' }]),
+  }, async () => {
+    await expectError(relay, `/v1/archive?host=${typo}`, 403, 'HOST_NOT_SUBSTACK')
+    await expectError(relay, `/v1/feed?host=${typo}`, 403, 'HOST_NOT_SUBSTACK')
+    await expectError(relay, `/v1/archive?host=${dangling}`, 403, 'HOST_NOT_SUBSTACK')
+    assert.equal(fetchCalls.filter(entry => !entry.url.startsWith('https://cloudflare-dns.com/')).length, 0, 'no proof request')
+    assert.equal(fetchCalls.filter(entry => entry.url === dohUrl(typo, 'CNAME')).length, 1, 'the verdict is remembered')
+    assert.deepEqual(JSON.parse(cache.entries.get(`${CACHE_NS}/host-verdict?host=${typo}`)?.body ?? 'null'), { verdict: 'fail', expires: 2_000_000 + 600_000 })
+    clock.advance(601_000)
+    await expectError(relay, `/v1/archive?host=${typo}`, 403, 'HOST_NOT_SUBSTACK')
+    assert.equal(fetchCalls.filter(entry => entry.url === dohUrl(typo, 'CNAME')).length, 2, 'a domain set up since then is seen after 10 min')
+  })
+})
+
+test('custom domains: Substack refusing the mapping proof is UPSTREAM_BLOCKED, never a cached failure (S5)', async () => {
+  const clock = createFakeClock(3_000_000)
+  const cache = memoryCache()
+  const relay = newRelay({ cache, now: clock.now })
+  const host = 'proxied.example.net'
+  const claim = [{
+    id: 5,
+    publication_id: 66,
+    slug: 'claim',
+    publishedBylines: [{ id: 1, name: 'P', publicationUsers: [{ id: 2, publication_id: 66, publication: { id: 66, name: 'P', subdomain: 'proxiedpub', custom_domain: host, custom_domain_optional: false } }] }],
+  }]
+  let check: () => Response = () => html('blocked', 403)
+  let first: () => Response = () => substackJson(claim)
+  await withUpstream({
+    ...TARGET_DNS,
+    ...plainDns(host),
+    [proofUrl(host)]: () => first(),
+    [proofUrl('proxiedpub.substack.com')]: () => check(),
+  }, async () => {
+    const blocked = await expectError(relay, `/v1/archive?host=${host}`, 503, 'UPSTREAM_BLOCKED')
+    assert.deepEqual(blocked.error.upstream, { status: 403, contentType: 'text/html', challenge: false })
+    assert.equal([...cache.entries.keys()].some(key => key.includes(host)), false, 'the refusal is not stored')
+    // Remembered 60 s in memory: same answer, no new requests.
+    const calls = fetchCalls.length
+    await expectError(relay, `/v1/archive?host=${host}`, 503, 'UPSTREAM_BLOCKED')
+    assert.equal(fetchCalls.length, calls)
+
+    clock.advance(61_000)
+    check = () => html('challenge', 403, { 'cf-mitigated': 'challenge' })
+    const challenged = await expectError(relay, `/v1/archive?host=${host}`, 503, 'UPSTREAM_BLOCKED')
+    assert.deepEqual(challenged.error.upstream, { status: 403, contentType: 'text/html', challenge: true })
+
+    clock.advance(61_000)
+    first = () => html('denied', 401)
+    const denied = await expectError(relay, `/v1/archive?host=${host}`, 503, 'UPSTREAM_BLOCKED')
+    assert.deepEqual(denied.error.upstream, { status: 401, contentType: 'text/html', challenge: false })
+
+    clock.advance(61_000)
+    first = () => html('busy', 503)
+    await expectError(relay, `/v1/archive?host=${host}`, 503, 'UPSTREAM_UNAVAILABLE')
+    assert.equal([...cache.entries.keys()].some(key => key.includes(host)), false)
+  })
+})
+
+test('custom domains: mapping proofs, the only requests to caller-chosen hosts, have a strict budget (S6)', async () => {
+  const clock = createFakeClock(0)
+  const relay = newRelay({ now: clock.now, strictRateLimitPerMinute: 2 })
+  const ip = { headers: { 'CF-Connecting-IP': '203.0.113.77' }, cf: CF }
+  const hosts = ['one.example.net', 'two.example.net', 'three.example.net']
+  const table: Record<string, Handler> = { ...TARGET_DNS, [dohUrl('cname.example.net', 'CNAME')]: () => dns(CNAME_TO_TARGET), [archiveUrl('cname.example.net')]: () => substackJson([]) }
+  for (const host of hosts) Object.assign(table, plainDns(host), { [proofUrl(host)]: () => html('<html>not substack</html>', 200) })
+  await withUpstream(table, async () => {
+    await expectError(relay, `/v1/archive?host=${hosts[0]}`, 403, 'HOST_NOT_SUBSTACK', ip)
+    await expectError(relay, `/v1/feed?host=${hosts[1]}`, 403, 'HOST_NOT_SUBSTACK', ip)
+    const limited = await expectError(relay, `/v1/post?host=${hosts[2]}&slug=a-post`, 429, 'RATE_LIMITED', ip)
+    assert.equal(limited.error.retryAfterSeconds, 30)
+    assert.equal(fetchCalls.some(entry => entry.url === proofUrl(hosts[2])), false, 'no request reached the third host')
+    // Remembered verdicts and DNS passes cost nothing from the strict budget; other clients have their own.
+    await expectError(relay, `/v1/archive?host=${hosts[0]}`, 403, 'HOST_NOT_SUBSTACK', ip)
+    await expectOk<ArchivePage>(relay, '/v1/archive?host=cname.example.net', ip)
+    await expectError(relay, `/v1/archive?host=${hosts[2]}`, 403, 'HOST_NOT_SUBSTACK', { headers: { 'CF-Connecting-IP': '203.0.113.78' }, cf: CF })
+    assert.equal(fetchCalls.filter(entry => entry.url === proofUrl(hosts[2])).length, 1)
   })
 })
 
@@ -801,23 +943,51 @@ test('search: top/search groups become deduped PubMeta, comments are ignored (C3
   })
 })
 
-test('feed: RSS XML is passed through with the XML content type; other types are refused', async () => {
+test('feed: RSS XML is passed through as sandboxed text/plain; other types and documents are refused (S1)', async () => {
   const relay = newRelay()
   const xml = '<?xml version="1.0" encoding="UTF-8"?><rss version="2.0"><channel><title>Example Letters</title></channel></rss>'
   let reply: () => Response = () => new Response(xml, { headers: { 'content-type': 'application/xml; charset=utf-8', ...FINGERPRINT } })
   await withUpstream({ 'https://exampleletters.substack.com/feed': () => reply() }, async () => {
     const { res, text } = await call(relay, '/v1/feed?host=exampleletters.substack.com')
     assert.equal(res.status, 200)
-    assert.equal(res.headers.get('content-type'), 'application/xml; charset=utf-8')
+    assert.equal(res.headers.get('content-type'), FEED_TYPE, 'never rendered as XML on the relay origin')
+    assert.equal(res.headers.get('content-security-policy'), SANDBOX_CSP)
     assert.equal(res.headers.get('cache-control'), 'public, max-age=120')
     assert.equal(text, xml)
     assertUpstreamInit(fetchCalls[0].init, 'application/rss+xml, application/xml;q=0.9')
     reply = () => new Response(xml, { headers: { 'content-type': 'text/xml', ...FINGERPRINT } })
     assert.equal((await call(relay, '/v1/feed?host=exampleletters.substack.com')).res.status, 200)
+    const commented = '\n<?xml version="1.0"?>\n<!-- generated -->\n<!-- twice -->\n<rss\n version="2.0"><channel/></rss>'
+    reply = () => new Response(commented, { headers: { 'content-type': 'application/rss+xml', ...FINGERPRINT } })
+    assert.equal((await call(relay, '/v1/feed?host=exampleletters.substack.com')).text, commented, 'declaration, comments and whitespace may precede <rss>')
     reply = () => html(xml, 200, FINGERPRINT)
     await expectError(relay, '/v1/feed?host=exampleletters.substack.com', 502, 'UPSTREAM_INVALID')
-    reply = () => new Response('{"not":"xml"}', { headers: { 'content-type': 'application/xml', ...FINGERPRINT } })
-    await expectError(relay, '/v1/feed?host=exampleletters.substack.com', 502, 'UPSTREAM_INVALID')
+    const refused = [
+      '{"not":"xml"}',
+      '<html xmlns="http://www.w3.org/1999/xhtml"><script>alert(1)</script></html>',
+      '<?xml version="1.0"?><svg xmlns="http://www.w3.org/2000/svg"><script>alert(1)</script></svg>',
+      '<?xml version="1.0"?><?xml-stylesheet type="text/xsl" href="https://evil.example.net/x.xsl"?><rss version="2.0"><channel/></rss>',
+      '<?xml version="1.0"?><!DOCTYPE rss [<!ENTITY x "y">]><rss version="2.0"><channel/></rss>',
+      '<!-- unterminated <rss version="2.0"><channel/></rss>',
+      '<rssfeed><channel/></rssfeed>',
+    ]
+    for (const body of refused) {
+      reply = () => new Response(body, { headers: { 'content-type': 'application/xml', ...FINGERPRINT } })
+      const { text: errorText } = await expectError(relay, '/v1/feed?host=exampleletters.substack.com', 502, 'UPSTREAM_INVALID')
+      assert.doesNotMatch(errorText, /script|evil/)
+    }
+  })
+  // Replayed from the edge cache: still text/plain under the sandbox CSP.
+  const cache = memoryCache()
+  const cached = newRelay({ cache })
+  await withUpstream({ 'https://exampleletters.substack.com/feed': () => new Response(xml, { headers: { 'content-type': 'application/xml', ...FINGERPRINT } }) }, async () => {
+    await call(cached, '/v1/feed?host=exampleletters.substack.com')
+    assert.equal(cache.entries.get(`${CACHE_NS}/v1/feed?host=exampleletters.substack.com`)?.headers.get('content-type'), FEED_TYPE)
+    const replayed = await call(cached, '/v1/feed?host=exampleletters.substack.com')
+    assert.equal(replayed.res.status, 200)
+    assert.equal(replayed.res.headers.get('content-type'), FEED_TYPE)
+    assert.equal(replayed.text, xml)
+    assert.equal(fetchCalls.length, 1)
   })
 })
 
@@ -859,23 +1029,58 @@ test('health probe=1 reports status-only probes of the three upstream kinds', as
   })
 })
 
+test('health probe=1 runs at most one probe round per minute and has a strict budget (S2)', async () => {
+  const clock = createFakeClock(5_000)
+  const relay = newRelay({ now: clock.now })
+  let status = 200
+  await withUpstream({
+    'https://on.substack.com/api/v1/archive?sort=new&offset=0&limit=1': () => substackJson([], status),
+    'https://www.slowboring.com/api/v1/archive?sort=new&offset=0&limit=1': () => substackJson([], status),
+    'https://substack.com/api/v1/top/search?query=substack': () => substackJson({ items: [] }, status),
+  }, async () => {
+    const first = await expectOk<HealthResponse>(relay, '/v1/health?probe=1')
+    assert.equal(first.meta.cached, false)
+    assert.deepEqual(first.data.probes?.map(probe => probe.status), [200, 200, 200])
+    status = 503
+    clock.advance(59_000)
+    const reused = await expectOk<HealthResponse>(relay, '/v1/health?probe=1')
+    assert.equal(reused.meta.cached, true, 'the round from 59 s ago is reused')
+    assert.deepEqual(reused.data.probes, first.data.probes)
+    assert.equal(fetchCalls.length, 3)
+    clock.advance(1_000)
+    const fresh = await expectOk<HealthResponse>(relay, '/v1/health?probe=1')
+    assert.equal(fresh.meta.cached, false)
+    assert.deepEqual(fresh.data.probes?.map(probe => probe.status), [503, 503, 503])
+    assert.equal(fetchCalls.length, 6)
+
+    // probe=1 has its own strict bucket (2 per minute here); plain health is unaffected.
+    const strict = newRelay({ now: createFakeClock(0).now, strictRateLimitPerMinute: 2 })
+    await expectOk<HealthResponse>(strict, '/v1/health?probe=1')
+    await expectOk<HealthResponse>(strict, '/v1/health?probe=1')
+    const limited = await expectError(strict, '/v1/health?probe=1', 429, 'RATE_LIMITED')
+    assert.equal(limited.error.retryAfterSeconds, 30)
+    await expectOk<HealthResponse>(strict, '/v1/health')
+    assert.equal(fetchCalls.length, 9, 'one more probe round in total')
+  })
+})
+
 test('the local limiter allows 60 requests per minute per client and route (fake clock)', async () => {
   const clock = createFakeClock(0)
   const relay = newRelay({ now: clock.now })
-  const ip = { 'CF-Connecting-IP': '203.0.113.50' }
+  const ip: CallInit = { headers: { 'CF-Connecting-IP': '203.0.113.50' }, cf: CF }
   await withUpstream({ [archiveUrl('exampleletters.substack.com')]: () => substackJson([]) }, async () => {
-    for (let index = 0; index < 60; index += 1) await expectOk<HealthResponse>(relay, '/v1/health', { headers: ip })
-    const limited = await expectError(relay, '/v1/health', 429, 'RATE_LIMITED', { headers: ip })
+    for (let index = 0; index < 60; index += 1) await expectOk<HealthResponse>(relay, '/v1/health', ip)
+    const limited = await expectError(relay, '/v1/health', 429, 'RATE_LIMITED', ip)
     assert.equal(limited.error.retryAfterSeconds, 1)
     assert.equal(limited.res.headers.get('retry-after'), '1')
-    await expectOk<HealthResponse>(relay, '/v1/health', { headers: { 'CF-Connecting-IP': '203.0.113.51' } })
-    await expectOk<ArchivePage>(relay, '/v1/archive?host=exampleletters.substack.com', { headers: ip })
+    await expectOk<HealthResponse>(relay, '/v1/health', { headers: { 'CF-Connecting-IP': '203.0.113.51' }, cf: CF })
+    await expectOk<ArchivePage>(relay, '/v1/archive?host=exampleletters.substack.com', ip)
     clock.advance(1_000)
-    await expectOk<HealthResponse>(relay, '/v1/health', { headers: ip })
-    await expectError(relay, '/v1/health', 429, 'RATE_LIMITED', { headers: ip })
+    await expectOk<HealthResponse>(relay, '/v1/health', ip)
+    await expectError(relay, '/v1/health', 429, 'RATE_LIMITED', ip)
     clock.advance(60_000)
-    for (let index = 0; index < 60; index += 1) await expectOk<HealthResponse>(relay, '/v1/health', { headers: ip })
-    await expectError(relay, '/v1/health', 429, 'RATE_LIMITED', { headers: ip })
+    for (let index = 0; index < 60; index += 1) await expectOk<HealthResponse>(relay, '/v1/health', ip)
+    await expectError(relay, '/v1/health', 429, 'RATE_LIMITED', ip)
   })
 })
 
@@ -890,13 +1095,66 @@ test('with the RL binding the relay asks it with ip:route keys and honours a ref
     },
   }
   const relay = newRelay()
-  const headers = { 'CF-Connecting-IP': '198.51.100.20' }
+  const init: CallInit = { headers: { 'CF-Connecting-IP': '198.51.100.20' }, cf: CF }
   await withUpstream({}, async () => {
-    await expectOk<HealthResponse>(relay, '/v1/health', { headers }, env)
-    const { error, res } = await expectError(relay, '/v1/health', 429, 'RATE_LIMITED', { headers }, env)
+    await expectOk<HealthResponse>(relay, '/v1/health', init, env)
+    const { error, res } = await expectError(relay, '/v1/health', 429, 'RATE_LIMITED', init, env)
     assert.equal(error.retryAfterSeconds, 60)
     assert.equal(res.headers.get('retry-after'), '60')
     assert.deepEqual(keys, ['198.51.100.20:health', '198.51.100.20:health'])
+  })
+})
+
+test('rate-limit keys: CF-Connecting-IP only on Cloudflare, IPv6 by its /64, otherwise one shared key (S7)', async () => {
+  const keys: string[] = []
+  const strictKeys: string[] = []
+  const env: Env = {
+    RL: {
+      async limit({ key }) {
+        keys.push(key)
+        return { success: true }
+      },
+    },
+    RL_STRICT: {
+      async limit({ key }) {
+        strictKeys.push(key)
+        return { success: false }
+      },
+    },
+  }
+  const relay = newRelay()
+  const cases: Array<[CallInit, string]> = [
+    [{ headers: { 'CF-Connecting-IP': '203.0.113.9' }, cf: CF }, '203.0.113.9'],
+    [{ headers: { 'CF-Connecting-IP': '2001:0DB8:0001:0002:ffff::1' }, cf: CF }, '2001:db8:1:2::/64'],
+    [{ headers: { 'CF-Connecting-IP': '2001:db8:1:2::a' }, cf: CF }, '2001:db8:1:2::/64'],
+    [{ headers: { 'CF-Connecting-IP': '2001:db8:1:3:4:5:6:7' }, cf: CF }, '2001:db8:1:3::/64'],
+    [{ headers: { 'CF-Connecting-IP': '::1' }, cf: CF }, '0:0:0:0::/64'],
+    [{ headers: { 'CF-Connecting-IP': '1::2::3' }, cf: CF }, 'shared'],
+    [{ headers: { 'CF-Connecting-IP': '1:2:3:4:5:6:7' }, cf: CF }, 'shared'],
+    [{ cf: CF }, 'shared'],
+    // Not on Cloudflare: the header is the client's own choice.
+    [{ headers: { 'CF-Connecting-IP': '203.0.113.9' } }, 'shared'],
+    [{ headers: { 'CF-Connecting-IP': '198.51.100.1' } }, 'shared'],
+  ]
+  await withUpstream({}, async () => {
+    for (const [init] of cases) await expectOk<HealthResponse>(relay, '/v1/health', init, env)
+    assert.deepEqual(keys, cases.map(([, client]) => `${client}:health`))
+    assert.deepEqual(strictKeys, [], 'plain health never asks the strict binding')
+    // probe=1 also asks RL_STRICT, under its own route key; a refusal sends nothing upstream.
+    const probe = await expectError(relay, '/v1/health?probe=1', 429, 'RATE_LIMITED', cases[1][0], env)
+    assert.equal(probe.error.retryAfterSeconds, 60)
+    assert.deepEqual(strictKeys, ['2001:db8:1:2::/64:health-probe'])
+    assert.equal(fetchCalls.length, 0)
+  })
+
+  // The local buckets follow the same keys.
+  const local = newRelay({ rateLimitPerMinute: 1, now: createFakeClock(0).now })
+  await withUpstream({}, async () => {
+    await expectOk<HealthResponse>(local, '/v1/health', { headers: { 'CF-Connecting-IP': '203.0.113.1' } })
+    await expectError(local, '/v1/health', 429, 'RATE_LIMITED', { headers: { 'CF-Connecting-IP': '203.0.113.2' } })
+    await expectOk<HealthResponse>(local, '/v1/health', { headers: { 'CF-Connecting-IP': '2001:db8:1:2::a' }, cf: CF })
+    await expectError(local, '/v1/health', 429, 'RATE_LIMITED', { headers: { 'CF-Connecting-IP': '2001:db8:1:2:ffff::1' }, cf: CF })
+    await expectOk<HealthResponse>(local, '/v1/health', { headers: { 'CF-Connecting-IP': '2001:db8:1:3::a' }, cf: CF })
   })
 })
 
@@ -936,12 +1194,12 @@ test('edge cache: hits skip upstream and set meta.cached; 404s are kept 60 s; fa
     const first = await expectOk<ArchivePage>(relay, '/v1/archive?host=exampleletters.substack.com')
     assert.equal(first.meta.cached, false)
     assert.equal(fetchCalls.length, 3)
-    const requestedKey = `${CACHE_ORIGIN}/v1/archive?host=exampleletters.substack.com&offset=0&limit=12&sort=new`
-    const finalKey = `${CACHE_ORIGIN}/v1/archive?host=news.example.com&offset=0&limit=12&sort=new`
+    const requestedKey = `${CACHE_NS}/v1/archive?host=exampleletters.substack.com&offset=0&limit=12&sort=new`
+    const finalKey = `${CACHE_NS}/v1/archive?host=news.example.com&offset=0&limit=12&sort=new`
     assert.deepEqual([...cache.entries.keys()].filter(key => key.includes('/v1/archive')).sort(), [finalKey, requestedKey].sort())
     assert.equal(cache.entries.get(requestedKey)?.headers.get('cache-control'), 'public, max-age=300')
     assert.equal(cache.entries.get(requestedKey)?.headers.get('set-cookie'), null)
-    const verdict = cache.entries.get(`${CACHE_ORIGIN}/host-verdict?host=news.example.com`)
+    const verdict = cache.entries.get(`${CACHE_NS}/host-verdict?host=news.example.com`)
     assert.deepEqual(verdict && JSON.parse(verdict.body), { verdict: 'pass', expires: 1_000 + 24 * 3_600_000 })
 
     const second = await expectOk<ArchivePage>(relay, '/v1/archive?host=exampleletters.substack.com')
@@ -964,7 +1222,7 @@ test('edge cache: hits skip upstream and set meta.cached; 404s are kept 60 s; fa
     await expectError(relay, '/v1/post?host=exampleletters.substack.com&slug=missing-post', 404, 'POST_NOT_FOUND')
     await expectError(relay, '/v1/post?host=exampleletters.substack.com&slug=missing-post', 404, 'POST_NOT_FOUND')
     assert.equal(fetchCalls.filter(entry => entry.url === post('missing-post')).length, 1)
-    const notFound = cache.entries.get(`${CACHE_ORIGIN}/v1/post?host=exampleletters.substack.com&slug=missing-post`)
+    const notFound = cache.entries.get(`${CACHE_NS}/v1/post?host=exampleletters.substack.com&slug=missing-post`)
     assert.equal(notFound?.status, 404)
     assert.equal(notFound?.headers.get('cache-control'), 'public, max-age=60')
 
@@ -972,6 +1230,99 @@ test('edge cache: hits skip upstream and set meta.cached; 404s are kept 60 s; fa
     await expectError(relay, '/v1/post?host=exampleletters.substack.com&slug=blocked-post', 503, 'UPSTREAM_BLOCKED')
     assert.equal(fetchCalls.filter(entry => entry.url === post('blocked-post')).length, 2)
     assert.equal([...cache.entries.keys()].some(key => key.includes('blocked-post')), false)
+  })
+})
+
+test('edge cache: keys live under the relay origin; a stored verdict claiming too long a life is ignored (S4)', async () => {
+  const cache = memoryCache()
+  const clock = createFakeClock(1_000)
+  const relay = newRelay({ cache, now: clock.now })
+  const host = 'www.example.org'
+  const archiveKey = '/v1/archive?host=exampleletters.substack.com&offset=0&limit=12&sort=new'
+  const forged = (body: string) => new Response(body, { headers: { 'content-type': 'application/json' } })
+  // Written by someone else sharing the cache: a pass that outlives anything the relay stores...
+  await cache.put(`${CACHE_NS}/host-verdict?host=${host}`, forged(JSON.stringify({ verdict: 'pass', expires: 1e15 })))
+  // ...and entries under another origin's namespace or the old fixed origin.
+  await cache.put(`https://relay.cache/p1${archiveKey}`, forged('{"ok":true,"meta":{"host":"forged.example.net","cached":false,"fetchedAt":"x"},"data":{}}'))
+  await cache.put(`https://other.example.net${CACHE_PATH}${archiveKey}`, forged('{"ok":true,"meta":{"host":"forged.example.net","cached":false,"fetchedAt":"x"},"data":{}}'))
+  await withUpstream({
+    ...TARGET_DNS,
+    [dohUrl(host, 'CNAME')]: () => dns([{ type: 5, data: 'elsewhere.example.net.' }]),
+    [dohUrl(host, 'A')]: () => dns([{ type: 1, data: '192.0.2.10' }]),
+    [dohUrl(host, 'AAAA')]: () => dns([]),
+    [proofUrl(host)]: () => html('<html>not substack</html>', 200),
+    [archiveUrl('exampleletters.substack.com')]: () => substackJson([]),
+  }, async () => {
+    await expectError(relay, `/v1/archive?host=${host}`, 403, 'HOST_NOT_SUBSTACK')
+    assert.deepEqual(JSON.parse(cache.entries.get(`${CACHE_NS}/host-verdict?host=${host}`)?.body ?? 'null'), { verdict: 'fail', expires: 1_000 + 3_600_000 })
+    const own = await expectOk<ArchivePage>(relay, '/v1/archive?host=exampleletters.substack.com')
+    assert.deepEqual(own.meta, { host: 'exampleletters.substack.com', cached: false, fetchedAt: new Date(1_000).toISOString() })
+    assert.equal(cache.entries.has(`${CACHE_NS}${archiveKey}`), true)
+    // The same relay reached under another origin keeps a separate namespace.
+    const other = await relay.fetch(new Request('https://relay-two.example.com/v1/archive?host=exampleletters.substack.com'))
+    assert.equal(other.status, 200)
+    assert.equal((JSON.parse(await other.text()) as RelayEnvelope<ArchivePage>).ok, true)
+    assert.equal(cache.entries.has(`https://relay-two.example.com${CACHE_PATH}${archiveKey}`), true)
+    assert.equal(fetchCalls.filter(entry => entry.url === archiveUrl('exampleletters.substack.com')).length, 2)
+  })
+})
+
+test('profile: handles are lowercased before the case-sensitive Substack lookup and the cache key (C1)', async () => {
+  const cache = memoryCache()
+  const relay = newRelay({ cache })
+  await withUpstream({ 'https://substack.com/api/v1/user/adaexample/public_profile': () => substackJson(profileFixture) }, async () => {
+    const { data } = await expectOk<Profile>(relay, '/v1/profile?handle=%40AdaExample')
+    assert.equal(data.handle, 'adaexample')
+    const again = await expectOk<Profile>(relay, '/v1/profile?handle=ADAEXAMPLE')
+    assert.equal(again.meta.cached, true, 'case variants share one cache entry')
+    assert.deepEqual(fetchCalls.map(entry => entry.url), ['https://substack.com/api/v1/user/adaexample/public_profile'])
+    assert.deepEqual([...cache.entries.keys()], [`${CACHE_NS}/v1/profile?handle=adaexample`])
+  })
+})
+
+test('post by id: the largest id Substack accepts is forwarded (C3)', async () => {
+  const relay = newRelay()
+  await withUpstream({ 'https://substack.com/api/v1/posts/by-id/2147483647': () => substackJson({ error: 'Post not found' }, 404) }, async () => {
+    await expectError(relay, '/v1/post?id=2147483647', 404, 'POST_NOT_FOUND')
+    assert.equal(fetchCalls.length, 1)
+  })
+})
+
+test('archive: without an id match, the byline publication served from the final host is used (C2)', async () => {
+  const relay = newRelay()
+  const host = 'onexample.substack.com'
+  const pub = (id: number | null, subdomain: string, name: string): Record<string, unknown> => ({
+    ...(id === null ? {} : { id }),
+    name,
+    subdomain,
+    custom_domain: null,
+    custom_domain_optional: false,
+  })
+  const post = (id: number, publication: Record<string, unknown>) => ({
+    id,
+    publication_id: 1,
+    slug: `post-${id}`,
+    title: `Post ${id}`,
+    audience: 'everyone',
+    publishedBylines: [{ id: id + 100, name: 'Writer', publicationUsers: [{ id: id + 200, publication }] }],
+  })
+  const guest = post(71, pub(4210070, 'guestpub', 'Guest Pub'))
+  const staff = post(72, pub(null, 'onexample', 'On Example'))
+  const owner = post(73, pub(1, 'onexample', 'On Example Owner'))
+  let page: unknown[] = []
+  await withUpstream({ [archiveUrl(host)]: () => substackJson(page) }, async () => {
+    page = [guest]
+    assert.equal((await expectOk<ArchivePage>(relay, `/v1/archive?host=${host}`)).data.publication, null, 'a guest byline names another publication')
+    page = [guest, staff]
+    assert.deepEqual((await expectOk<ArchivePage>(relay, `/v1/archive?host=${host}`)).data.publication,
+      { id: null, name: 'On Example', subdomain: 'onexample', customDomain: null, host })
+    page = [guest, staff, owner]
+    assert.deepEqual((await expectOk<ArchivePage>(relay, `/v1/archive?host=${host}`)).data.publication,
+      { id: 1, name: 'On Example Owner', subdomain: 'onexample', customDomain: null, host }, 'an id match wins')
+  })
+  await withUpstream({ [`https://${host}/api/v1/posts/post-72`]: () => substackJson(staff) }, async () => {
+    const { data } = await expectOk<PostResponse>(relay, `/v1/post?host=${host}&slug=post-72`)
+    assert.equal(data.publication?.name, 'On Example')
   })
 })
 

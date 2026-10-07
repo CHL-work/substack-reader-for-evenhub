@@ -163,6 +163,7 @@ function relayReply(url, request) {
       return [200, ok({ publication: pub, posts, nextOffset: posts.length ? offset + posts.length : null }, host)]
     }
     case '/v1/post': {
+      if (fixtures.notSubstackHosts.includes(q.get('host') ?? '')) return [403, failure('HOST_NOT_SUBSTACK', 'That site is not a Substack publication.')]
       const post = q.has('id')
         ? fixtures.posts.find(item => String(item.id) === q.get('id'))
         : fixtures.posts.find(item => item.host === q.get('host') && item.slug === q.get('slug'))
@@ -201,7 +202,7 @@ const CORS_JSON = {
 // ---------------------------------------------------------------------------
 // Bridge stub (runs in the page before the app)
 
-function installBridge({ seed }) {
+function installBridge({ seed, bridgeOnly }) {
   const BRIDGE = 'ci-bridge:'
   window.__g2Pages = []
   window.__g2State = {}
@@ -257,9 +258,10 @@ function installBridge({ seed }) {
     value: { async writeText() { throw new DOMException('Clipboard denied by fixture', 'NotAllowedError') } },
   })
   // Seed once per tab, so a reload really tests persistence (bridge copy lives in sessionStorage).
+  // bridgeOnly: the WebView lost its localStorage copy; only bridge storage has the library.
   if (seed && !sessionStorage.getItem('ci-seeded')) {
     for (const [key, value] of Object.entries(seed)) {
-      localStorage.setItem(key, value)
+      if (!bridgeOnly) localStorage.setItem(key, value)
       sessionStorage.setItem(BRIDGE + key, value)
     }
   }
@@ -299,7 +301,7 @@ async function openPhone(options = {}) {
   const origin = options.unconfigured ? unconfigured.origin : configured.origin
   const context = await browser.newContext({ viewport: { width: 393, height: 852 }, isMobile: true, hasTouch: true, serviceWorkers: 'block' })
   const fixture = { context, page: null, origin, unexpected: [], pageErrors: [], relayRequests: [], override: options.override ?? null }
-  await context.addInitScript(installBridge, { seed: options.seed ?? null })
+  await context.addInitScript(installBridge, { seed: options.seed ?? null, bridgeOnly: options.bridgeOnly === true })
   await context.route('**/*', async route => {
     const request = route.request()
     let url
@@ -519,10 +521,11 @@ try {
   await scenario('2 add by URL and apex custom domain (www retry); survives reload and lands in bridge storage', {}, async ({ page, relayRequests }) => {
     await addInput(page, `https://${ALPHA}/\ngammaletters-ci.com`)
     assert.deepEqual(await rowValues(page, '[data-pub-row]', 'data-pub-row'), [ALPHA, 'www.gammaletters-ci.com'])
+    // A full archive page, so the relay can name the publication from post bylines.
     assert.deepEqual(relayRequests, [
-      `/v1/archive?host=${ALPHA}&offset=0&limit=1&sort=new`,
-      '/v1/archive?host=gammaletters-ci.com&offset=0&limit=1&sort=new',
-      '/v1/archive?host=www.gammaletters-ci.com&offset=0&limit=1&sort=new',
+      `/v1/archive?host=${ALPHA}&offset=0&limit=12&sort=new`,
+      '/v1/archive?host=gammaletters-ci.com&offset=0&limit=12&sort=new',
+      '/v1/archive?host=www.gammaletters-ci.com&offset=0&limit=12&sort=new',
     ])
     await expect(page.locator('[data-testid="add-result"][data-kind="message"]')).toHaveCount(2)
     await expectBody(page, 'Publications (2)')
@@ -578,6 +581,30 @@ try {
     await expect(page.locator('[data-kind="post"][data-post-id="5001"] [data-action="follow"]')).toHaveCount(0)
     await expectBody(page, 'Saved (1)')
     await expect.poll(async () => (await storedDoc(page, PREFS_KEY)).bridge?.saved?.map(ref => ref.postId)).toEqual([5002])
+  })
+
+  await scenario('4c a post link on an apex custom domain is retried on www', {}, async ({ page, relayRequests }) => {
+    await addInput(page, 'https://gammaletters-ci.com/p/gamma-opening-letter')
+    const card = page.locator('[data-testid="add-result"][data-kind="post"][data-post-id="7001"]')
+    await expect(card).toContainText('Gamma opening letter')
+    assert.deepEqual(relayRequests, [
+      '/v1/post?host=gammaletters-ci.com&slug=gamma-opening-letter',
+      '/v1/post?host=www.gammaletters-ci.com&slug=gamma-opening-letter',
+    ])
+    await card.locator('[data-action="follow"]').click()
+    assert.deepEqual(await rowValues(page, '[data-pub-row]', 'data-pub-row'), ['www.gammaletters-ci.com'])
+  })
+
+  await scenario('4d share text: the title next to a link is shown as skipped, never searched; the link is followed', {}, async ({ page, relayRequests }) => {
+    await addInput(page, `A great essay on synthetic notes\nhttps://${ALPHA}/`)
+    const cards = page.locator('[data-testid="add-result"]')
+    await expect(cards).toHaveCount(2)
+    await expect(cards.first()).toHaveAttribute('data-kind', 'message')
+    await expect(cards.first()).toContainText('A great essay on synthetic notes')
+    await expect(cards.first()).toContainText('Text next to a link is read as share text.')
+    await expect(page.locator('[data-testid="add-result"][data-kind="invalid"]')).toHaveCount(0)
+    assert.deepEqual(relayRequests, [`/v1/archive?host=${ALPHA}&offset=0&limit=12&sort=new`])
+    assert.deepEqual(await rowValues(page, '[data-pub-row]', 'data-pub-row'), [ALPHA])
   })
 
   await scenario('5 full glasses navigation: reader 2/N, back keeps the selection, root double-tap exits with mode 1', { seed: SEED_ALPHA }, async ({ page }) => {
@@ -638,7 +665,7 @@ try {
     await expectBody(page, `> Continue: ${ALPHA_TITLES[0]}`)
   })
 
-  await scenario('7 paywalled post shows the preview, then the paid end card', { seed: SEED_ALPHA }, async ({ page }) => {
+  await scenario('7 paywalled post shows the preview, then the paid end card; its tap loads the next archive page', { seed: SEED_ALPHA }, async ({ page, relayRequests }) => {
     await openAlphaPost(page, 2)
     await expectBody(page, `[Paid post${DOT}free preview only]`)
     const seen = []
@@ -656,9 +683,14 @@ try {
     assert.ok((await g2Field(page, 'body')).startsWith('The free preview ends here.'))
     // The note may wrap across a page boundary; compare with whitespace collapsed.
     assert.ok(seen.join(' ').replace(/\s+/g, ' ').includes('[Preview ends here. The rest of this post is for paid subscribers.]'))
-    // Tap on the end card: the next post in the list (none after the last row's post).
+    // Tap on the end card of the last loaded post: the list still has a "Load older posts" row,
+    // so the next archive page is loaded and its first post opens in place of this one.
     await g2(page, 'select')
-    await expectBody(page, 'No more posts.')
+    await expectField(page, 'title', `Alpha Notes${DOT}Older synthetic note`)
+    await expectFooter(page, readerFooter(1))
+    assert.ok(relayRequests.includes(`/v1/archive?host=${ALPHA}&offset=3&limit=12&sort=new`), JSON.stringify(relayRequests))
+    await g2(page, 'back')
+    await expectBody(page, '> Older synthetic note')
   })
 
   const blocked = { blockPosts: true }
@@ -811,6 +843,22 @@ try {
     await expect(page.locator('[data-testid="event-log"]')).toContainText('text:SCROLL_BOTTOM')
   })
 
+  await scenario('12c browser copy lost: the first glasses frame and the phone show the bridge library', { seed: SEED_ALPHA, bridgeOnly: true }, async ({ page, relayRequests }) => {
+    const [created] = await page.evaluate(() => window.__g2Pages)
+    const text = Object.fromEntries(created.textObject.map(box => [box.containerName, box.content]))
+    assert.ok(text.body.includes('Publications (1)'), `The first frame is Home from bridge storage, not the setup frame: ${JSON.stringify(text.body)}`)
+    await expectBody(page, '> Latest')
+    await g2(page, 'next')
+    await expectBody(page, '> Publications (1)')
+    await expect(page.locator('[data-testid="library-loading"]')).toHaveCount(0)
+    await openTab(page, 'publications')
+    assert.deepEqual(await rowValues(page, '[data-pub-row]', 'data-pub-row'), [ALPHA])
+    // The browser mirror is refreshed from the bridge; the bridge copy is not rewritten.
+    await expect.poll(async () => (await storedDoc(page, PREFS_KEY)).local?.publications?.map(pub => pub.host)).toEqual([ALPHA])
+    assert.equal((await storedDoc(page, PREFS_KEY)).bridge?.savedAt, 1000)
+    assert.deepEqual(relayRequests, [])
+  })
+
   await scenario('13 relay not configured: phone alert, glasses message, no network requests', { unconfigured: true }, async ({ page, relayRequests }) => {
     await expect(page.locator('[data-testid="relay-missing"]')).toBeVisible()
     const [created] = await page.evaluate(() => window.__g2Pages)
@@ -818,7 +866,7 @@ try {
     assert.equal(text.body, 'This build has no reader service.\nSee the phone for details.')
     assert.equal(await g2Field(page, 'body'), 'This build has no reader service.\nSee the phone for details.')
     await expectField(page, 'footer', `2${TIMES}tap exit`)
-    // A bare domain and a handle (with a link in the paste, plain-text lines would be dropped as share text).
+    // A bare domain and a handle (no line has a link, so nothing is read as share text).
     await addInput(page, `${ALPHA}\n@ci_reader`)
     await expect(page.locator('[data-testid="add-result"][data-kind="error"]')).toHaveCount(2)
     await expect(page.locator('[data-testid="add-result"][data-kind="error"]').first()).toContainText('NOT_CONFIGURED')

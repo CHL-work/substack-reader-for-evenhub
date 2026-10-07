@@ -25,10 +25,10 @@ The app talks to one relay, at the origin shown in the phone's Diagnostics panel
 The relay:
 
 - **does not log requests** (no logging code; Cloudflare observability is disabled in `wrangler.toml`) and stores nothing permanently;
-- uses your IP address only as an in-memory key to limit request rates (at most 60 requests per minute per route); with Cloudflare's rate-limit binding, Cloudflare counts that key for one minute;
+- uses your IP address (for IPv6, only its first 64 bits) only as an in-memory key to limit request rates (at most 60 requests per minute per route, and 10 per minute for checking a new custom domain or probing Substack); with Cloudflare's rate-limit bindings, Cloudflare counts that key for one minute. On hosts other than Cloudflare the relay does not use your address at all, and everyone shares the same limits;
 - fetches the public Substack data with its own honest User-Agent (`SubstackReaderForEvenHub/<version>`) and no cookies, so Substack sees the relay, not you;
 - removes fields the app does not need before answering;
-- may keep the trimmed answers in the hosting provider's short-lived edge cache, keyed by what was requested and never by who asked: lists up to 5 minutes, posts up to 15 minutes (a "not found" answer for 1 minute), feeds up to 10 minutes, profiles and search results up to 1 hour. The result of checking that a custom domain belongs to Substack is cached for up to 24 hours (a failed check for 1 hour);
+- may keep the trimmed answers in the hosting provider's short-lived edge cache, keyed by what was requested and never by who asked: lists up to 5 minutes, posts up to 15 minutes (a "not found" answer for 1 minute), feeds up to 10 minutes, profiles and search results up to 1 hour. The result of checking that a custom domain belongs to Substack is cached for up to 24 hours (a failed check for 1 hour, a domain that does not exist for 10 minutes, and a check that could not finish for 1 minute in memory only);
 - echoes your request's `Origin` header back only in its health response, which the app uses for diagnostics.
 
 ## Third parties

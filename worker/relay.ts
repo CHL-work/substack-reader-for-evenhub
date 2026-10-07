@@ -9,7 +9,8 @@
  * allowlisted (a single-label *.substack.com host, substack.com for three fixed
  * templates only, or a verified custom domain) on the first request and on every
  * redirect; every upstream response must carry Substack's fingerprint header; honest
- * User-Agent, no cookies, no request logging, nothing stored except a short edge cache.
+ * User-Agent, no cookies, no request logging, nothing stored except a short edge cache;
+ * nothing the relay returns can run on its origin (sandbox CSP, the feed as text/plain).
  */
 import { version } from '../package.json'
 import {
@@ -46,6 +47,8 @@ export interface RateLimitBinding {
 
 export interface Env {
   RL?: RateLimitBinding
+  /** Strict budget for costly work: custom-domain mapping proofs and health probes (wrangler.toml RL_STRICT). */
+  RL_STRICT?: RateLimitBinding
   /** Optional deploy revision (e.g. a git sha) reported by /v1/health. */
   REVISION?: string
 }
@@ -71,6 +74,8 @@ export interface RelayOptions {
   timeoutMs?: number
   /** Local token bucket size per client key and route, default 60 per minute. */
   rateLimitPerMinute?: number
+  /** Local bucket for mapping proofs and health probes per client key, default 10 per minute. */
+  strictRateLimitPerMinute?: number
 }
 
 export interface Relay {
@@ -84,8 +89,13 @@ export const USER_AGENT = `SubstackReaderForEvenHub/${version}`
 export const SERVICE = 'substack-reader-relay' as const
 export const CUSTOM_DOMAIN_TARGET = 'target.substack-custom-domains.com.'
 export const DOH_ENDPOINT = 'https://cloudflare-dns.com/dns-query'
-/** Synthetic cache key origin; bump the protocol segment when trimmed shapes change. */
-export const CACHE_ORIGIN = `https://relay.cache/p${RELAY_PROTOCOL}`
+/**
+ * Synthetic cache key path under the relay's own request origin (S4: one deployment never reads
+ * another's entries); bump the protocol segment when trimmed shapes change.
+ */
+export const CACHE_PATH = `/__relay-cache/p${RELAY_PROTOCOL}`
+/** S1: every non-HTML response is inert if a browser ever renders it; fetch() callers ignore it. */
+export const SANDBOX_CSP = "default-src 'none'; sandbox; frame-ancestors 'none'"
 
 const MIB = 1024 * 1024
 const ARCHIVE_CAP = MIB
@@ -99,12 +109,21 @@ const MAX_REDIRECTS = 3
 const MAX_RETRY_AFTER = 86_400
 const MINUTE_MS = 60_000
 const RATE_LIMIT_PER_MINUTE = 60
+const STRICT_RATE_LIMIT_PER_MINUTE = 10
 const BINDING_RETRY_AFTER = 60
 const MAX_BUCKETS = 10_000
 const MAX_VERDICTS = 2_000
 const VERDICT_PASS_MS = 24 * 3_600_000
 const VERDICT_FAIL_MS = 3_600_000
+/** S3: a host with no addresses fails without a proof fetch; short, so a new domain recovers quickly. */
+const VERDICT_NO_ADDRESS_MS = 600_000
+/** S6: an inconclusive check is remembered in memory only, briefly. */
+const VERDICT_UNKNOWN_MS = 60_000
 const TARGET_IPS_MS = 3_600_000
+/** S2: at most one round of health probes per isolate per minute. */
+const PROBE_MEMO_MS = 60_000
+/** Rate-limit key for every client when the client address cannot be trusted (S7). */
+const SHARED_CLIENT = 'shared'
 const MAX_AUTHORS = 5
 const MAX_SEARCH_RESULTS = 20
 const MAX_SUBSCRIPTIONS = 500
@@ -113,7 +132,8 @@ const ACCEPT_JSON = 'application/json'
 const ACCEPT_FEED = 'application/rss+xml, application/xml;q=0.9'
 const ACCEPT_DOH = 'application/dns-json'
 const JSON_TYPE = 'application/json; charset=utf-8'
-const XML_TYPE = 'application/xml; charset=utf-8'
+/** S1: feed XML goes out as text, so a browser never renders upstream markup on the relay origin. */
+const FEED_TYPE = 'text/plain; charset=utf-8'
 const HTML_TYPE = 'text/html; charset=utf-8'
 const PAGE_CSP = "default-src 'none'; style-src 'unsafe-inline'; base-uri 'none'; frame-ancestors 'none'"
 const CACHED_FALSE = '"cached":false'
@@ -128,7 +148,16 @@ const LABEL_RE = /^[a-z0-9-]{1,63}$/
 const SLUG_RE = /^[a-z0-9][a-z0-9_-]{0,199}$/i
 /** First character is never '.', so a handle can never be a '.' or '..' path segment. */
 const HANDLE_RE = /^[A-Za-z0-9_][A-Za-z0-9_.-]{0,63}$/
-const ID_RE = /^[1-9]\d{0,15}$/
+const ID_RE = /^[1-9]\d{0,9}$/
+/** C3: Substack's by-id endpoint takes a signed 32-bit id and answers 400 above it. */
+const MAX_POST_ID = 2_147_483_647
+/**
+ * S1 defense in depth: the document element is <rss>, preceded only by an XML declaration,
+ * comments and whitespace (so no xml-stylesheet instruction and no DOCTYPE). Comments cannot
+ * contain '-->', so the scan is linear.
+ */
+const RSS_ROOT_RE = /^\s*(?:<\?xml\s[^?]*\?>\s*)?(?:<!--(?:(?!-->)[\s\S])*-->\s*)*<rss[\s>]/
+const HEXTET_RE = /^[0-9a-f]{1,4}$/
 const CONTROL_RE = /[\x00-\x1f\x7f-\x9f]/
 const FEED_TYPE_RE = /^(application\/(rss\+)?xml|text\/xml)$/
 const JSON_SUFFIX_RE = /^application\/[a-z0-9!#$&^_.+-]+\+json$/
@@ -151,12 +180,14 @@ const HEALTH_PROBES: ReadonlyArray<readonly [HealthProbe['target'], string]> = [
   ['substackCom', 'https://substack.com/api/v1/top/search?query=substack'],
 ]
 
-const CORS_HEADERS: Readonly<Record<string, string>> = {
+/** On every response; the HTML pages replace the CSP with PAGE_CSP. */
+const COMMON_HEADERS: Readonly<Record<string, string>> = {
   'Access-Control-Allow-Origin': '*',
   'Access-Control-Allow-Methods': 'GET, OPTIONS',
   'Access-Control-Max-Age': '86400',
   'X-Content-Type-Options': 'nosniff',
   'Referrer-Policy': 'no-referrer',
+  'Content-Security-Policy': SANDBOX_CSP,
 }
 
 const ERRORS: Readonly<Record<RelayErrorCode, readonly [number, string]>> = {
@@ -201,7 +232,7 @@ class RelayFailure extends Error {
 }
 
 function responseHeaders(contentType: string, cacheControl: string, extra: Record<string, string> = {}): Headers {
-  return new Headers({ ...CORS_HEADERS, 'Content-Type': contentType, 'Cache-Control': cacheControl, ...extra })
+  return new Headers({ ...COMMON_HEADERS, 'Content-Type': contentType, 'Cache-Control': cacheControl, ...extra })
 }
 
 function errorJson(failure: RelayFailure): string {
@@ -355,21 +386,28 @@ function postDetail(value: unknown, host: string | null): PostDetail | null {
   return { ...summary, bodyHtml: typeof body === 'string' ? body : null, truncated: summary.isPaywalled }
 }
 
-/** publishedBylines[].publicationUsers[].publication whose id === post.publication_id. */
-function bylinePublication(value: unknown): PubMeta | null {
-  const post = record(value)
-  const publicationId = positiveInt(post?.publication_id)
-  if (!post || publicationId === null) return null
-  for (const byline of list(post.publishedBylines)) {
-    for (const membership of list(record(byline)?.publicationUsers)) {
-      const pub = record(record(membership)?.publication)
-      if (pub && positiveInt(pub.id) === publicationId) {
+/**
+ * publishedBylines[].publicationUsers[].publication of any post in `posts` whose id === that
+ * post's publication_id; otherwise (C2: staff and guest bylines often name no such publication)
+ * the first one whose host is `host`, the host that served the posts.
+ */
+function bylinePublication(posts: unknown[], host: string | null): PubMeta | null {
+  let byHost: PubMeta | null = null
+  for (const value of posts) {
+    const post = record(value)
+    const publicationId = positiveInt(post?.publication_id)
+    for (const byline of list(post?.publishedBylines)) {
+      for (const membership of list(record(byline)?.publicationUsers)) {
+        const pub = record(record(membership)?.publication)
+        const idMatch = publicationId !== null && positiveInt(pub?.id) === publicationId
+        if (!pub || (!idMatch && (byHost !== null || host === null))) continue
         const meta = publicationMeta(pub)
-        if (meta) return meta
+        if (meta && idMatch) return meta
+        if (meta && meta.host === host) byHost = meta
       }
     }
   }
-  return null
+  return byHost
 }
 
 /** Dedupes by id and by host, keeping the first occurrence. */
@@ -403,7 +441,8 @@ interface Plan {
   /** > 0: cache upstream 404s at the edge for this many seconds. */
   notFoundEdgeTtl: number
   notFound(info: RelayUpstreamInfo): RelayErrorCode
-  cacheKey(host: string): string
+  /** Path and query of the synthetic cache key (prefixed with the request's cache namespace). */
+  cachePath(host: string): string
   shape(json: unknown, finalHost: string): { data: unknown; host: string }
 }
 
@@ -445,16 +484,12 @@ function archivePlan(params: URLSearchParams): Plan {
     ttl: TTL.archive,
     notFoundEdgeTtl: 0,
     notFound: () => 'PUBLICATION_NOT_FOUND',
-    cacheKey: h => `${CACHE_ORIGIN}/v1/archive?host=${h}&offset=${offset}&limit=${limit}&sort=${sort}`,
+    cachePath: h => `/v1/archive?host=${h}&offset=${offset}&limit=${limit}&sort=${sort}`,
     shape(json, finalHost) {
       if (!Array.isArray(json)) invalidShape()
       const items: unknown[] = json
       const posts = items.flatMap(item => postSummary(item, finalHost) ?? [])
-      let publication: PubMeta | null = null
-      for (const item of items) {
-        publication = bylinePublication(item)
-        if (publication) break
-      }
+      const publication = bylinePublication(items, finalHost)
       // C1: only an empty upstream page ends the list. Count upstream items, not kept ones.
       const end = offset + items.length
       const page: ArchivePage = { publication, posts, nextOffset: items.length > 0 && end <= RELAY_MAX_ARCHIVE_OFFSET ? end : null }
@@ -468,7 +503,7 @@ function postPlan(params: URLSearchParams): Plan {
   const rawHost = params.get('host') ?? ''
   const rawSlug = params.get('slug') ?? ''
   if (rawId) {
-    if (rawHost || rawSlug || !ID_RE.test(rawId) || !Number.isSafeInteger(Number(rawId))) throw new RelayFailure('INVALID_PARAM')
+    if (rawHost || rawSlug || !ID_RE.test(rawId) || Number(rawId) > MAX_POST_ID) throw new RelayFailure('INVALID_PARAM')
     const id = Number(rawId)
     return {
       route: 'post',
@@ -481,10 +516,10 @@ function postPlan(params: URLSearchParams): Plan {
       ttl: TTL.post,
       notFoundEdgeTtl: NOT_FOUND_EDGE_TTL,
       notFound: () => 'POST_NOT_FOUND',
-      cacheKey: () => `${CACHE_ORIGIN}/v1/post?id=${id}`,
+      cachePath: () => `/v1/post?id=${id}`,
       shape(json) {
         const root = record(json) ?? invalidShape()
-        const publication = publicationMeta(root.publication) ?? bylinePublication(root.post)
+        const publication = publicationMeta(root.publication) ?? bylinePublication([root.post], null)
         const post = postDetail(root.post, publication?.host ?? null) ?? invalidShape()
         const data: PostResponse = { post, publication }
         return { data, host: publication?.host ?? SUBSTACK_COM }
@@ -507,17 +542,18 @@ function postPlan(params: URLSearchParams): Plan {
     notFoundEdgeTtl: NOT_FOUND_EDGE_TTL,
     // Substack answers a missing post with 404 JSON; an unknown publication with an empty 404.
     notFound: info => info.contentType === 'application/json' ? 'POST_NOT_FOUND' : 'PUBLICATION_NOT_FOUND',
-    cacheKey: h => `${CACHE_ORIGIN}/v1/post?host=${h}&slug=${encodeURIComponent(slug)}`,
+    cachePath: h => `/v1/post?host=${h}&slug=${encodeURIComponent(slug)}`,
     shape(json, finalHost) {
       const post = postDetail(json, finalHost) ?? invalidShape()
-      const data: PostResponse = { post, publication: bylinePublication(json) }
+      const data: PostResponse = { post, publication: bylinePublication([json], finalHost) }
       return { data, host: finalHost }
     },
   }
 }
 
 function profilePlan(params: URLSearchParams): Plan {
-  const handle = (params.get('handle') ?? '').replace(/^@/, '')
+  // C1: Substack's public_profile lookup is case-sensitive and handles are lowercase.
+  const handle = (params.get('handle') ?? '').replace(/^@/, '').toLowerCase()
   if (!HANDLE_RE.test(handle)) throw new RelayFailure('INVALID_HANDLE')
   return {
     route: 'profile',
@@ -530,7 +566,7 @@ function profilePlan(params: URLSearchParams): Plan {
     ttl: TTL.profile,
     notFoundEdgeTtl: 0,
     notFound: () => 'PROFILE_NOT_FOUND',
-    cacheKey: () => `${CACHE_ORIGIN}/v1/profile?handle=${encodeURIComponent(handle)}`,
+    cachePath: () => `/v1/profile?handle=${encodeURIComponent(handle)}`,
     shape(json) {
       const root = record(json) ?? invalidShape()
       const upstreamHandle = text(root.handle)?.trim() ?? ''
@@ -569,7 +605,7 @@ function searchPlan(params: URLSearchParams): Plan {
     ttl: TTL.search,
     notFoundEdgeTtl: 0,
     notFound: () => 'NOT_FOUND',
-    cacheKey: () => `${CACHE_ORIGIN}/v1/search?q=${encodeURIComponent(query)}`,
+    cachePath: () => `/v1/search?q=${encodeURIComponent(query)}`,
     shape(json) {
       const root = record(json) ?? invalidShape()
       if (!Array.isArray(root.items)) invalidShape()
@@ -603,7 +639,7 @@ function feedPlan(params: URLSearchParams): Plan {
     ttl: TTL.feed,
     notFoundEdgeTtl: 0,
     notFound: () => 'PUBLICATION_NOT_FOUND',
-    cacheKey: h => `${CACHE_ORIGIN}/v1/feed?host=${h}`,
+    cachePath: h => `/v1/feed?host=${h}`,
     shape: () => invalidShape(),
   }
 }
@@ -674,9 +710,79 @@ function fingerprinted(response: Response): boolean {
 
 type Verdict = 'pass' | 'fail' | 'unknown'
 
+/** A host check result; `blocked`: Substack refused the check itself (S5, reported as UPSTREAM_BLOCKED). */
+interface Outcome {
+  verdict: Verdict
+  blocked?: RelayUpstreamInfo
+}
+
+/** A verdict remembered in isolate memory ('unknown' only briefly). */
+interface MemoVerdict extends Outcome {
+  expires: number
+}
+
+/** A verdict in the Cache API ('unknown' is never stored there). */
 interface StoredVerdict {
   verdict: 'pass' | 'fail'
   expires: number
+}
+
+/** The result of the checks and how long to remember it. */
+interface Checked extends Outcome {
+  ttlMs: number
+}
+
+/** Per-request context for the routes. */
+interface Call {
+  request: Request
+  env: Env
+  ctx?: Ctx
+  /** S4: `<relay origin><CACHE_PATH>`, the prefix of every synthetic cache key for this request. */
+  cacheNs: string
+}
+
+const UNKNOWN: Outcome = { verdict: 'unknown' }
+
+/**
+ * S5: an answer that proves nothing about the host. 429 and 5xx are outages; 401, 403 and
+ * challenges mean Substack refused the relay, which must never be cached as "not Substack".
+ */
+function inconclusive(response: Response): Outcome | null {
+  const info = describe(response)
+  if (info.challenge || response.status === 401 || response.status === 403) return { verdict: 'unknown', blocked: info }
+  return response.status === 429 || response.status >= 500 ? UNKNOWN : null
+}
+
+function unverified(outcome: Outcome): RelayFailure {
+  return outcome.blocked ? new RelayFailure('UPSTREAM_BLOCKED', { upstream: outcome.blocked }) : new RelayFailure('UPSTREAM_UNAVAILABLE')
+}
+
+/** The /64 of an IPv6 address as `a:b:c:d::/64`, or null when it does not parse. */
+function ipv6Prefix(address: string): string | null {
+  const halves = address.split('::')
+  if (halves.length > 2) return null
+  const groups = (value: string): string[] => value ? value.split(':') : []
+  const width = (parts: string[]): number => parts.reduce((sum, part) => sum + (part.includes('.') ? 2 : 1), 0)
+  const head = groups(halves[0])
+  const tail = halves.length === 2 ? groups(halves[1]) : []
+  const missing = 8 - width(head) - width(tail)
+  if (halves.length === 2 ? missing < 1 : missing !== 0) return null
+  const prefix = [...head, ...Array.from({ length: missing }, () => '0'), ...tail].slice(0, 4)
+  if (!prefix.every(part => HEXTET_RE.test(part))) return null
+  return `${prefix.map(part => part.replace(/^0+(?=.)/, '')).join(':')}::/64`
+}
+
+/**
+ * S7: the rate-limit client key. CF-Connecting-IP is trusted only on Cloudflare (the request has
+ * `cf`), whose edge sets it; on other hosts a client could pick any value, so every client shares
+ * one key. An IPv6 client is keyed by its /64, which one subscriber normally holds whole.
+ */
+function clientKey(request: Request): string {
+  const cf: unknown = (request as { cf?: unknown }).cf
+  if (cf === null || typeof cf !== 'object') return SHARED_CLIENT
+  const raw = (request.headers.get('CF-Connecting-IP') ?? '').trim().toLowerCase()
+  if (!raw) return SHARED_CLIENT
+  return raw.includes(':') ? ipv6Prefix(raw) ?? SHARED_CLIENT : raw.slice(0, 64)
 }
 
 interface DnsRecord {
@@ -758,11 +864,14 @@ export function createRelay(options: RelayOptions = {}): Relay {
   const send = options.fetch ?? ((input: string, init: RequestInit) => globalThis.fetch(input, init))
   const timeoutMs = options.timeoutMs ?? DEFAULT_TIMEOUT_MS
   const perMinute = Math.max(1, Math.floor(options.rateLimitPerMinute ?? RATE_LIMIT_PER_MINUTE))
+  const strictPerMinute = Math.max(1, Math.floor(options.strictRateLimitPerMinute ?? STRICT_RATE_LIMIT_PER_MINUTE))
   const buckets = new Map<string, { units: number; at: number }>()
-  const verdicts = new Map<string, StoredVerdict>()
-  const pendingVerdicts = new Map<string, Promise<Verdict>>()
+  const verdicts = new Map<string, MemoVerdict>()
+  const pendingVerdicts = new Map<string, Promise<Outcome>>()
   let targetIps: { ips: string[]; expires: number } | null = null
   let cachePromise: Promise<CacheLike | null> | null = null
+  let probeMemo: { at: number; probes: HealthProbe[] } | null = null
+  let pendingProbes: Promise<HealthProbe[]> | null = null
 
   function cacheStore(): Promise<CacheLike | null> {
     if (options.cache !== undefined) return Promise.resolve(options.cache)
@@ -823,7 +932,7 @@ export function createRelay(options: RelayOptions = {}): Relay {
 
   /* ---------- rate limiting (no logging; the IP lives only in this Map) */
 
-  function takeToken(key: string): number {
+  function takeToken(key: string, perMinute: number): number {
     // Integer units: one request costs MINUTE_MS units, refill is perMinute units per ms.
     const capacity = perMinute * MINUTE_MS
     const time = now()
@@ -842,10 +951,13 @@ export function createRelay(options: RelayOptions = {}): Relay {
     return Math.max(1, Math.ceil((MINUTE_MS - units) / perMinute / 1000))
   }
 
-  async function rateLimit(route: string, request: Request, env: Env): Promise<void> {
-    const client = (request.headers.get('CF-Connecting-IP') ?? '').trim().slice(0, 64) || 'unknown'
-    const key = `${client}:${route}`
-    const binding = env.RL
+  /**
+   * One token per request from the client's bucket for `route`. `strict` routes (mapping proofs,
+   * health probes) use the RL_STRICT binding or a 10 per minute local bucket instead.
+   */
+  async function rateLimit(route: string, call: Call, strict = false): Promise<void> {
+    const key = `${clientKey(call.request)}:${route}`
+    const binding = strict ? call.env.RL_STRICT : call.env.RL
     if (binding && typeof binding.limit === 'function') {
       let outcome: unknown = null
       try {
@@ -858,7 +970,7 @@ export function createRelay(options: RelayOptions = {}): Relay {
         return
       }
     }
-    const wait = takeToken(key)
+    const wait = takeToken(key, strict ? strictPerMinute : perMinute)
     if (wait > 0) throw new RelayFailure('RATE_LIMITED', { retryAfterSeconds: wait })
   }
 
@@ -896,114 +1008,119 @@ export function createRelay(options: RelayOptions = {}): Relay {
     return targetIps.ips
   }
 
-  /** C4(b): apex CNAME flattening, i.e. the host's A/AAAA records intersect the target's. */
-  async function flatteningCheck(host: string): Promise<Verdict> {
-    const [a, aaaa, target] = await Promise.all([dohQuery(host, 'A'), dohQuery(host, 'AAAA'), targetAddresses()])
-    const records = [...(a ?? []), ...(aaaa ?? [])]
-    if (pointsAtTarget(records)) return 'pass' // A CNAME chain that ends at the target.
-    const hostIps = new Set(addresses(records))
-    if (target && target.some(ip => hostIps.has(ip))) return 'pass'
-    return a === null || aaaa === null || target === null ? 'unknown' : 'fail'
-  }
-
-  /** C4(c): the host serves Substack JSON naming publication S, and S.substack.com redirects to the host. */
-  async function mappingProof(host: string): Promise<Verdict> {
+  /**
+   * C4(c): the host serves Substack JSON naming publication S, and S.substack.com redirects to the
+   * host. S5: a refusal (401, 403, challenge) or an outage is 'unknown', never a cached 'fail'.
+   */
+  async function mappingProof(host: string): Promise<Outcome> {
+    const fail: Outcome = { verdict: 'fail' }
     const clock = deadline()
     try {
       let first: Response
       try {
         first = await get(`https://${host}/api/v1/archive?sort=new&offset=0&limit=1`, ACCEPT_JSON, clock.signal)
       } catch {
-        return 'unknown'
+        return UNKNOWN
       }
-      if (first.status === 429 || first.status >= 500) {
+      const refused = inconclusive(first)
+      if (refused || first.status !== 200 || !fingerprinted(first) || contentTypeOf(first) !== 'application/json') {
         await discard(first)
-        return 'unknown'
-      }
-      if (first.status !== 200 || !fingerprinted(first) || contentTypeOf(first) !== 'application/json') {
-        await discard(first)
-        return 'fail'
+        return refused ?? fail
       }
       let items: unknown
       try {
         items = JSON.parse(await boundedText(first.body, ARCHIVE_CAP))
       } catch {
-        return clock.expired() ? 'unknown' : 'fail'
+        return clock.expired() ? UNKNOWN : fail
       }
       const subdomain = claimedSubdomain(items, host)
-      if (!subdomain) return 'fail'
+      if (!subdomain) return fail
       const checkUrl = `https://${subdomain}.substack.com/api/v1/archive?sort=new&offset=0&limit=1`
       let check: Response
       try {
         check = await get(checkUrl, ACCEPT_JSON, clock.signal)
       } catch {
-        return 'unknown'
+        return UNKNOWN
       }
       await discard(check)
-      if (check.status === 429 || check.status >= 500) return 'unknown'
+      const checkRefused = inconclusive(check)
+      if (checkRefused) return checkRefused
       const location = check.headers.get('Location')
-      if (!REDIRECT_STATUSES.has(check.status) || !fingerprinted(check) || !location) return 'fail'
+      if (!REDIRECT_STATUSES.has(check.status) || !fingerprinted(check) || !location) return fail
       try {
         const target = new URL(location, checkUrl)
-        return target.protocol === 'https:' && target.hostname.toLowerCase() === host ? 'pass' : 'fail'
+        return target.protocol === 'https:' && target.hostname.toLowerCase() === host ? { verdict: 'pass' } : fail
       } catch {
-        return 'fail'
+        return fail
       }
     } finally {
       clock.clear()
     }
   }
 
-  async function runChecks(host: string): Promise<Verdict> {
-    let unknown = false
+  /**
+   * C4 checks, cheapest first: (a) CNAME to the target; (b) a CNAME chain in the A answer that
+   * ends at the target, or apex flattening (the host's A/AAAA records intersect the target's);
+   * (c) the mapping proof. S3: definitive but empty A and AAAA answers mean nothing can serve the
+   * host, so it fails without any request to it. S6: the proof, the only request to a
+   * caller-chosen host, first takes a token from the caller's strict budget (`admit` throws
+   * RATE_LIMITED, and nothing is remembered).
+   */
+  async function runChecks(host: string, admit: () => Promise<void>): Promise<Checked> {
     const cname = await dohQuery(host, 'CNAME')
-    if (cname === null) unknown = true
-    else if (pointsAtTarget(cname)) return 'pass'
-    const flattened = await flatteningCheck(host)
-    if (flattened === 'pass') return 'pass'
-    if (flattened === 'unknown') unknown = true
+    if (cname !== null && pointsAtTarget(cname)) return { verdict: 'pass', ttlMs: VERDICT_PASS_MS }
+    const [a, aaaa, target] = await Promise.all([dohQuery(host, 'A'), dohQuery(host, 'AAAA'), targetAddresses()])
+    const records = [...(a ?? []), ...(aaaa ?? [])]
+    const hostIps = new Set(addresses(records))
+    if (pointsAtTarget(records) || (target !== null && target.some(ip => hostIps.has(ip)))) return { verdict: 'pass', ttlMs: VERDICT_PASS_MS }
+    if (a !== null && aaaa !== null && hostIps.size === 0) return { verdict: 'fail', ttlMs: VERDICT_NO_ADDRESS_MS }
+    await admit()
     const proof = await mappingProof(host)
-    if (proof === 'pass') return 'pass'
-    if (proof === 'unknown') unknown = true
-    return unknown ? 'unknown' : 'fail'
+    if (proof.verdict === 'pass') return { verdict: 'pass', ttlMs: VERDICT_PASS_MS }
+    if (proof.verdict === 'unknown' || cname === null || a === null || aaaa === null || target === null) {
+      return { ...proof, verdict: 'unknown', ttlMs: VERDICT_UNKNOWN_MS }
+    }
+    return { verdict: 'fail', ttlMs: VERDICT_FAIL_MS }
   }
 
-  function verdictKey(host: string): string {
-    return `${CACHE_ORIGIN}/host-verdict?host=${host}`
+  function verdictKey(host: string, cacheNs: string): string {
+    return `${cacheNs}/host-verdict?host=${host}`
   }
 
-  function remember(host: string, stored: StoredVerdict): void {
+  function remember(host: string, memo: MemoVerdict): void {
     verdicts.delete(host)
     if (verdicts.size >= MAX_VERDICTS) {
       const oldest = verdicts.keys().next()
       if (!oldest.done) verdicts.delete(oldest.value)
     }
-    verdicts.set(host, stored)
+    verdicts.set(host, memo)
   }
 
-  async function storedVerdict(host: string): Promise<StoredVerdict | null> {
+  /** S4: an entry that claims to live longer than the relay ever stores one is not the relay's. */
+  async function storedVerdict(host: string, cacheNs: string): Promise<StoredVerdict | null> {
     const cache = await cacheStore()
     if (!cache) return null
     try {
-      const hit = await cache.match(verdictKey(host))
+      const hit = await cache.match(verdictKey(host, cacheNs))
       if (!hit) return null
       const value = record(JSON.parse(await hit.text()))
       const verdict = value?.verdict
       const expires = value?.expires
-      if ((verdict === 'pass' || verdict === 'fail') && typeof expires === 'number' && expires > now()) return { verdict, expires }
+      if ((verdict === 'pass' || verdict === 'fail') && typeof expires === 'number' && expires > now()
+        && expires <= now() + (verdict === 'pass' ? VERDICT_PASS_MS : VERDICT_FAIL_MS)) return { verdict, expires }
     } catch {
       // A broken cache entry is treated as a miss.
     }
     return null
   }
 
-  async function saveVerdict(host: string, stored: StoredVerdict): Promise<void> {
+  async function saveVerdict(host: string, stored: StoredVerdict, cacheNs: string): Promise<void> {
     remember(host, stored)
     const cache = await cacheStore()
     if (!cache) return
     const maxAge = Math.max(1, Math.round((stored.expires - now()) / 1000))
     try {
-      await cache.put(verdictKey(host), new Response(JSON.stringify(stored), {
+      await cache.put(verdictKey(host, cacheNs), new Response(JSON.stringify(stored), {
         headers: { 'Content-Type': JSON_TYPE, 'Cache-Control': `public, max-age=${maxAge}` },
       }))
     } catch {
@@ -1011,23 +1128,31 @@ export function createRelay(options: RelayOptions = {}): Relay {
     }
   }
 
-  /** Cached per host: pass 24 h, fail 1 h; 'unknown' (lookup failures) is never cached. */
-  async function verifyCustomDomain(host: string): Promise<Verdict> {
+  /**
+   * Remembered per host: pass 24 h, fail 1 h (10 min for a host without addresses) in memory and
+   * the Cache API; 'unknown' (lookup outage, Substack refusing the proof) 60 s in memory only.
+   */
+  async function verifyCustomDomain(host: string, call: Call): Promise<Outcome> {
     const memo = verdicts.get(host)
-    if (memo && memo.expires > now()) return memo.verdict
+    if (memo && memo.expires > now()) return memo
     const pending = pendingVerdicts.get(host)
     if (pending) return pending
-    const work = (async (): Promise<Verdict> => {
-      const stored = await storedVerdict(host)
+    const work = (async (): Promise<Outcome> => {
+      const stored = await storedVerdict(host, call.cacheNs)
       if (stored) {
         remember(host, stored)
-        return stored.verdict
+        return stored
       }
-      const verdict = await runChecks(host)
-      if (verdict !== 'unknown') {
-        await saveVerdict(host, { verdict, expires: now() + (verdict === 'pass' ? VERDICT_PASS_MS : VERDICT_FAIL_MS) })
+      const checked = await runChecks(host, () => rateLimit('verify', call, true))
+      const expires = now() + checked.ttlMs
+      if (checked.verdict === 'unknown') {
+        const unknown: MemoVerdict = checked.blocked ? { verdict: 'unknown', blocked: checked.blocked, expires } : { verdict: 'unknown', expires }
+        remember(host, unknown)
+        return unknown
       }
-      return verdict
+      const saved: StoredVerdict = { verdict: checked.verdict, expires }
+      await saveVerdict(host, saved, call.cacheNs)
+      return saved
     })()
     pendingVerdicts.set(host, work)
     try {
@@ -1038,17 +1163,17 @@ export function createRelay(options: RelayOptions = {}): Relay {
   }
 
   /** Security rule 2: the allowlist, applied to the first host and to every redirect target. */
-  async function hostVerdict(host: string, allowSubstackCom: boolean): Promise<Verdict> {
-    if (allowSubstackCom) return host === SUBSTACK_COM ? 'pass' : 'fail'
-    if (!isPublicationHost(host)) return 'fail'
-    if (SUBSTACK_SUBDOMAIN_HOST_RE.test(host)) return 'pass'
-    if (host.endsWith('.substack.com')) return 'fail'
-    return verifyCustomDomain(host)
+  async function hostVerdict(host: string, allowSubstackCom: boolean, call: Call): Promise<Outcome> {
+    if (allowSubstackCom) return { verdict: host === SUBSTACK_COM ? 'pass' : 'fail' }
+    if (!isPublicationHost(host)) return { verdict: 'fail' }
+    if (SUBSTACK_SUBDOMAIN_HOST_RE.test(host)) return { verdict: 'pass' }
+    if (host.endsWith('.substack.com')) return { verdict: 'fail' }
+    return verifyCustomDomain(host, call)
   }
 
   /* ---------- upstream fetch with redirect validation */
 
-  async function nextHop(current: URL, location: string | null, plan: Plan, info: RelayUpstreamInfo): Promise<URL> {
+  async function nextHop(current: URL, location: string | null, plan: Plan, info: RelayUpstreamInfo, call: Call): Promise<URL> {
     if (!location) throw new RelayFailure('REDIRECT_NOT_ALLOWED', { upstream: info })
     let target: URL
     try {
@@ -1064,9 +1189,9 @@ export function createRelay(options: RelayOptions = {}): Relay {
     if (target.protocol !== 'https:' || target.username || target.password || target.port || target.pathname !== current.pathname) {
       throw new RelayFailure('REDIRECT_NOT_ALLOWED', { upstream: info })
     }
-    const verdict = await hostVerdict(host, plan.allowSubstackCom)
-    if (verdict === 'unknown') throw new RelayFailure('UPSTREAM_UNAVAILABLE')
-    if (verdict === 'fail') throw new RelayFailure('REDIRECT_NOT_ALLOWED', { upstream: info })
+    const outcome = await hostVerdict(host, plan.allowSubstackCom, call)
+    if (outcome.verdict === 'unknown') throw unverified(outcome)
+    if (outcome.verdict === 'fail') throw new RelayFailure('REDIRECT_NOT_ALLOWED', { upstream: info })
     // Only the host may change; path and query stay the relay's own.
     return new URL(`https://${host}${current.pathname}${current.search}`)
   }
@@ -1085,7 +1210,7 @@ export function createRelay(options: RelayOptions = {}): Relay {
     }
   }
 
-  async function fetchUpstream(plan: Plan): Promise<UpstreamBody> {
+  async function fetchUpstream(plan: Plan, call: Call): Promise<UpstreamBody> {
     const clock = deadline()
     let url = new URL(plan.href)
     let redirects = 0
@@ -1110,7 +1235,7 @@ export function createRelay(options: RelayOptions = {}): Relay {
         if (REDIRECT_STATUSES.has(response.status)) {
           await discard(response)
           if (redirects >= MAX_REDIRECTS) throw new RelayFailure('TOO_MANY_REDIRECTS', { upstream: info })
-          url = await nextHop(url, response.headers.get('Location'), plan, info)
+          url = await nextHop(url, response.headers.get('Location'), plan, info, call)
           redirects += 1
           continue
         }
@@ -1159,7 +1284,7 @@ export function createRelay(options: RelayOptions = {}): Relay {
       const body = await hit.text()
       if (hit.status === 200) {
         const client = `public, max-age=${plan.ttl.client}`
-        if (plan.kind === 'xml') return new Response(body, { status: 200, headers: responseHeaders(XML_TYPE, client) })
+        if (plan.kind === 'xml') return new Response(body, { status: 200, headers: responseHeaders(FEED_TYPE, client) })
         return new Response(body.replace(CACHED_FALSE, CACHED_TRUE), { status: 200, headers: responseHeaders(JSON_TYPE, client) })
       }
       if (hit.status === 404) return new Response(body, { status: 404, headers: responseHeaders(JSON_TYPE, 'no-store') })
@@ -1171,33 +1296,34 @@ export function createRelay(options: RelayOptions = {}): Relay {
 
   /* ---------- routes */
 
-  async function serve(plan: Plan, request: Request, env: Env, ctx?: Ctx): Promise<Response> {
-    await rateLimit(plan.route, request, env)
+  async function serve(plan: Plan, call: Call): Promise<Response> {
+    await rateLimit(plan.route, call)
     const cache = await cacheStore()
-    const key = plan.cacheKey(plan.host)
+    const key = call.cacheNs + plan.cachePath(plan.host)
     if (cache) {
       const replayed = await replay(cache, key, plan)
       if (replayed) return replayed
     }
-    const verdict = await hostVerdict(plan.host, plan.allowSubstackCom)
-    if (verdict === 'unknown') throw new RelayFailure('UPSTREAM_UNAVAILABLE')
-    if (verdict === 'fail') throw new RelayFailure('HOST_NOT_SUBSTACK')
+    const outcome = await hostVerdict(plan.host, plan.allowSubstackCom, call)
+    if (outcome.verdict === 'unknown') throw unverified(outcome)
+    if (outcome.verdict === 'fail') throw new RelayFailure('HOST_NOT_SUBSTACK')
     let upstream: UpstreamBody
     try {
-      upstream = await fetchUpstream(plan)
+      upstream = await fetchUpstream(plan, call)
     } catch (error) {
       if (cache && plan.notFoundEdgeTtl > 0 && error instanceof RelayFailure && error.status === 404) {
-        await store(cache, [key], errorJson(error), 404, JSON_TYPE, plan.notFoundEdgeTtl, ctx)
+        await store(cache, [key], errorJson(error), 404, JSON_TYPE, plan.notFoundEdgeTtl, call.ctx)
       }
       throw error
     }
     // Also cache under the post-redirect host, which the client adopts from meta.host.
-    const keys = upstream.finalHost === plan.host ? [key] : [key, plan.cacheKey(upstream.finalHost)]
+    const keys = upstream.finalHost === plan.host ? [key] : [key, call.cacheNs + plan.cachePath(upstream.finalHost)]
     const clientCache = `public, max-age=${plan.ttl.client}`
     if (plan.kind === 'xml') {
-      if (!/^\s*</.test(upstream.text)) throw new RelayFailure('UPSTREAM_INVALID', { upstream: upstream.info })
-      if (cache) await store(cache, keys, upstream.text, 200, XML_TYPE, plan.ttl.edge, ctx)
-      return new Response(upstream.text, { status: 200, headers: responseHeaders(XML_TYPE, clientCache) })
+      // S1: only an RSS document passes, and it leaves as text/plain under the sandbox CSP.
+      if (!RSS_ROOT_RE.test(upstream.text)) throw new RelayFailure('UPSTREAM_INVALID', { upstream: upstream.info })
+      if (cache) await store(cache, keys, upstream.text, 200, FEED_TYPE, plan.ttl.edge, call.ctx)
+      return new Response(upstream.text, { status: 200, headers: responseHeaders(FEED_TYPE, clientCache) })
     }
     let json: unknown
     try {
@@ -1207,7 +1333,7 @@ export function createRelay(options: RelayOptions = {}): Relay {
     }
     const shaped = plan.shape(json, upstream.finalHost)
     const body = okJson(shaped.data, shaped.host, iso())
-    if (cache) await store(cache, keys, body, 200, JSON_TYPE, plan.ttl.edge, ctx)
+    if (cache) await store(cache, keys, body, 200, JSON_TYPE, plan.ttl.edge, call.ctx)
     return new Response(body, { status: 200, headers: responseHeaders(JSON_TYPE, clientCache) })
   }
 
@@ -1226,13 +1352,33 @@ export function createRelay(options: RelayOptions = {}): Relay {
     }
   }
 
-  async function health(request: Request, url: URL, env: Env): Promise<Response> {
-    await rateLimit('health', request, env)
-    const data: HealthResponse = { service: SERVICE, protocol: RELAY_PROTOCOL, revision: revisionOf(env), origin: originOf(request) }
-    if (url.searchParams.get('probe') === '1') {
-      data.probes = await Promise.all(HEALTH_PROBES.map(([target, href]) => probe(target, href)))
+  /** S2: one probe round per isolate per PROBE_MEMO_MS, shared by concurrent callers; `fresh` when this call ran it. */
+  async function probeRound(): Promise<{ probes: HealthProbe[]; fresh: boolean }> {
+    if (probeMemo && now() - probeMemo.at < PROBE_MEMO_MS) return { probes: probeMemo.probes, fresh: false }
+    if (pendingProbes) return { probes: await pendingProbes, fresh: false }
+    const work = Promise.all(HEALTH_PROBES.map(([target, href]) => probe(target, href)))
+    pendingProbes = work
+    try {
+      const probes = await work
+      probeMemo = { at: now(), probes }
+      return { probes, fresh: true }
+    } finally {
+      pendingProbes = null
     }
-    return new Response(okJson(data, url.hostname, iso()), { status: 200, headers: responseHeaders(JSON_TYPE, 'no-store') })
+  }
+
+  async function health(url: URL, call: Call): Promise<Response> {
+    await rateLimit('health', call)
+    const data: HealthResponse = { service: SERVICE, protocol: RELAY_PROTOCOL, revision: revisionOf(call.env), origin: originOf(call.request) }
+    let cached = false
+    if (url.searchParams.get('probe') === '1') {
+      await rateLimit('health-probe', call, true)
+      const round = await probeRound()
+      data.probes = round.probes
+      cached = !round.fresh
+    }
+    const body = okJson(data, url.hostname, iso())
+    return new Response(cached ? body.replace(CACHED_FALSE, CACHED_TRUE) : body, { status: 200, headers: responseHeaders(JSON_TYPE, 'no-store') })
   }
 
   async function handle(request: Request, env?: Env, ctx?: Ctx): Promise<Response> {
@@ -1242,16 +1388,16 @@ export function createRelay(options: RelayOptions = {}): Relay {
       if (method !== 'GET') throw new RelayFailure('METHOD_NOT_ALLOWED')
       const url = new URL(request.url)
       const params = url.searchParams
-      const bindings = envOf(env)
+      const call: Call = { request, env: envOf(env), ctx, cacheNs: `${url.origin}${CACHE_PATH}` }
       switch (url.pathname) {
         case '/': return htmlResponse(landingPage(url.hostname, version))
         case '/privacy': return htmlResponse(privacyPage(url.hostname))
-        case '/v1/health': return await health(request, url, bindings)
-        case '/v1/archive': return await serve(archivePlan(params), request, bindings, ctx)
-        case '/v1/post': return await serve(postPlan(params), request, bindings, ctx)
-        case '/v1/profile': return await serve(profilePlan(params), request, bindings, ctx)
-        case '/v1/search': return await serve(searchPlan(params), request, bindings, ctx)
-        case '/v1/feed': return await serve(feedPlan(params), request, bindings, ctx)
+        case '/v1/health': return await health(url, call)
+        case '/v1/archive': return await serve(archivePlan(params), call)
+        case '/v1/post': return await serve(postPlan(params), call)
+        case '/v1/profile': return await serve(profilePlan(params), call)
+        case '/v1/search': return await serve(searchPlan(params), call)
+        case '/v1/feed': return await serve(feedPlan(params), call)
         default: throw new RelayFailure('NOT_FOUND')
       }
     } catch (error) {

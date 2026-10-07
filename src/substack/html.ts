@@ -16,7 +16,7 @@
  */
 
 /** Bump whenever the output text can change for the same input and options. */
-export const CONVERTER_VERSION = 1
+export const CONVERTER_VERSION = 2
 
 export interface ReaderFootnote {
   /** Label as printed by Substack ("1", "2", ...). */
@@ -34,7 +34,7 @@ export interface ReaderTextResult {
   footnotes: ReaderFootnote[]
   /** Whitespace-separated tokens containing a letter or digit, counted on the body before any paywall note. */
   wordCount: number
-  /** True when the post is gated (audience other than 'everyone') or a paywall marker cut the HTML. */
+  /** True when the post is gated (audience other than 'everyone'), a paywall marker cut the HTML, or the RSS "Read more" tail ended it. */
   paywalled: boolean
 }
 
@@ -75,14 +75,26 @@ const CHAR_MAP: Record<string, string> = {
   // bullets, arrows, marks
   '\u2023': '\u2022', '\u25E6': '\u2022', '\u25AA': '\u2022', '\u25AB': '\u2022', '\u2219': '\u00B7',
   '\u22C5': '\u00B7', '\u25B8': '\u203A', '\u25B9': '\u203A', '\u25BA': '\u203A', '\u25BB': '\u203A',
-  '\u27F6': '\u2192', '\u27F5': '\u2190', '\u2794': '\u2192', '\u279C': '\u2192', '\u27A1': '\u2192',
-  '\u2B05': '\u2190', '\u2713': '\u221A', '\u2714': '\u221A', '\u2611': '\u221A', '\u2717': '\u00D7',
-  '\u2718': '\u00D7', '\u2715': '\u00D7', '\u2716': '\u00D7', '\u274C': '\u00D7', '\u22EE': '\u2026',
-  '\u22EF': '\u2026', '\u2024': '.',
+  '\u27F6': '\u2192', '\u27F5': '\u2190', '\u2794': '\u2192', '\u279C': '\u2192', '\u279E': '\u2192',
+  '\u27A1': '\u2192', '\u27A4': '\u2192', '\u2B05': '\u2190', '\u2713': '\u221A', '\u2714': '\u221A',
+  '\u2717': '\u00D7', '\u2718': '\u00D7', '\u2715': '\u00D7', '\u2716': '\u00D7', '\u274C': '\u00D7',
+  '\u22EE': '\u2026', '\u22EF': '\u2026', '\u2024': '.',
+  '\u2666': '\u25C6', // the only card suit missing from the cn font
+  // ballot boxes (to-do lists), all three missing from the fonts
+  '\u2610': '[ ]', '\u2611': '[\u221A]', '\u2612': '[x]',
   // math and letters
   '\u00B5': '\u03BC', '\u2217': '*', '\u223C': '~', '\u2215': '/', '\u2236': ':',
 }
 const CHAR_MAP_RE = new RegExp(`[${Object.keys(CHAR_MAP).join('')}]`, 'g')
+
+/** Currency signs missing from the fonts (none has an NFKD form) -> ISO 4217 code. */
+const CURRENCY_CODES: Record<string, string> = {
+  '\u20B9': 'INR', '\u20BD': 'RUB', '\u20BA': 'TRY', '\u20B4': 'UAH', '\u20A6': 'NGN', '\u20B1': 'PHP',
+  '\u20AB': 'VND', '\u20B8': 'KZT', '\u20AA': 'ILS', '\u20BC': 'AZN', '\u20BE': 'GEL', '\u20A1': 'CRC',
+  '\u20B2': 'PYG', '\u20B5': 'GHS', '\u20AD': 'LAK', '\u20AE': 'MNT',
+}
+/** The sign plus an adjacent digit on either side, so the code is set off by a space: 500 INR, INR 500. */
+const CURRENCY_RE = new RegExp(`(\\d?)([${Object.keys(CURRENCY_CODES).join('')}])(\\d?)`, 'g')
 
 /** C0/C1 controls other than TAB, LF, FF, CR and NEL (pagination would drop them anyway). */
 const CONTROL_RE = /[\u0000-\u0008\u000B\u000E-\u001F\u007F-\u0084\u0086-\u009F]/g
@@ -116,7 +128,7 @@ const PICTOGRAPH_RE = /\p{Extended_Pictographic}/u
 
 /**
  * Normalize one text run for the G2 fonts. Order: NFC, controls, invisibles, spaces, mapping table,
- * colour emoji, optional emoji strip, then (only with `isCovered`) the coverage fallback:
+ * currency codes, colour emoji, optional emoji strip, then (only with `isCovered`) the coverage fallback:
  * NFKD without combining marks when that is covered, else uncovered marks and pictographs vanish,
  * else a run of uncovered characters becomes `[?]`. Whitespace is not collapsed here.
  */
@@ -124,6 +136,8 @@ export function normalizeChars(input: string, isCovered?: (cp: number) => boolea
   let s = input.normalize('NFC')
   s = s.replace(CONTROL_RE, '').replace(INVISIBLE_RE, '').replace(SPACES_RE, ' ')
     .replace(CHAR_MAP_RE, ch => CHAR_MAP[ch] ?? ch)
+    .replace(CURRENCY_RE, (_m: string, before: string, sign: string, after: string) =>
+      [before, CURRENCY_CODES[sign] ?? sign, after].filter(Boolean).join(' '))
     .replace(EMOJI_WORDS_RE, e => EMOJI_WORDS[e] ?? e)
   if (stripEmoji) s = s.replace(EMOJI_STRIP_RE, '')
   if (!isCovered) return s
@@ -173,7 +187,9 @@ const TEX_SYMBOLS: Record<string, string> = {
 
 export function latexToText(expr: string): string {
   let s = expr
-  s = s.replace(/\\begin\{[^}]*\}|\\end\{[^}]*\}/g, '').replace(/\\\\/g, '; ').replace(/(?<!\\)&/g, ' ')
+  // Alignment '&' becomes a space; an escaped '\&' is kept for the next line. No lookbehind: WKWebView
+  // before iOS 16.4 cannot parse it, and one such literal stops the whole bundle from loading.
+  s = s.replace(/\\begin\{[^}]*\}|\\end\{[^}]*\}/g, '').replace(/\\\\/g, '; ').replace(/\\?&/g, m => (m === '&' ? ' ' : m))
   s = s.replace(/\\\{/g, '\u0001').replace(/\\\}/g, '\u0002').replace(/\\([%$&_#])/g, '$1')
   s = s.replace(/\\(?:text|mathrm|mathbf|mathit|mathsf|mathtt|mathcal|operatorname|textbf|textit|mbox|boldsymbol)\s*\{([^{}]*)\}/g, '$1')
   for (let i = 0; i < 4; i += 1) {
@@ -409,11 +425,7 @@ function renderBlock(el: Element, ctx: Ctx, out: Block[], st: State): void {
     if (t && max > 0 && t.length <= max) t = st.norm(t.toUpperCase()) // re-check glyphs: 'n with apostrophe' upper-cases to U+02BC N
     return push(out, st, ctx, t)
   }
-  if (tag === 'p') {
-    // RSS <content:encoded> of a paid post ends with <p><a href="{post url}">Read more</a></p>
-    if (el.querySelector('a') && /^read more$/i.test((el.textContent || '').trim())) { st.cut = true; return }
-    return renderChildren(el, ctx, out, st) // usually pure inline; tolerates junk
-  }
+  if (tag === 'p') return renderChildren(el, ctx, out, st) // usually pure inline; tolerates junk
   if (tag === 'blockquote' || cls.contains('pullquote')) {
     return renderChildren(el, { ...ctx, quote: ctx.quote + 1 }, out, st)
   }
@@ -528,6 +540,22 @@ function finish(s: string): string {
 const PAID_PREVIEW_NOTE = '[Preview ends here. The rest of this post is for paid subscribers.]'
 const PAID_ONLY_NOTE = '[This post is for paid subscribers.]'
 
+/**
+ * RSS <content:encoded> of a paid post ends with <p><a href="{post url}">Read more</a></p>
+ * (whitespace-padded). Removes that paragraph when it is the last top-level node and reports it.
+ * A "Read more" link anywhere else is content (link roundups, list items, callouts).
+ */
+function removeReadMoreTail(root: Element): boolean {
+  let node = root.lastChild
+  while (node && (node.nodeType === 8 || (node.nodeType === 3 && !(node.textContent || '').trim()))) node = node.previousSibling
+  if (!node || node.nodeType !== 1) return false
+  const el = node as Element
+  if (el.localName !== 'p' || el.children.length !== 1 || el.firstElementChild?.localName !== 'a') return false
+  if (!/^read more$/i.test((el.textContent || '').trim())) return false
+  el.remove()
+  return true
+}
+
 export function htmlToReaderText(html: string | null | undefined, opts: HtmlToReaderTextOptions = {}): ReaderTextResult {
   const strip = opts.stripEmoji === true
   const norm = (s: string): string => normalizeChars(s, opts.isCovered, strip)
@@ -548,6 +576,9 @@ export function htmlToReaderText(html: string | null | undefined, opts: HtmlToRe
     if (label) st.notes.set(label, finish(serialize(sub.map(b => ({ ...b, tight: true })))))
     fn.remove()
   }
+  // Only a body that may be gated (a known free post keeps a trailing "Read more" link as text).
+  // Not st.cut: that would stop the walk before the first block.
+  const tailCut = opts.audience !== 'everyone' && removeReadMoreTail(root)
 
   const blocks: Block[] = []
   renderChildren(root, base, blocks, st)
@@ -555,7 +586,7 @@ export function htmlToReaderText(html: string | null | undefined, opts: HtmlToRe
 
   const wordCount = body.split(/\s+/).filter(w => /[\p{L}\p{N}]/u.test(w)).length
   const gated = typeof opts.audience === 'string' && opts.audience !== 'everyone' // C11
-  const paywalled = st.cut || gated || (!body && (opts.expectedWordCount ?? 0) > 0)
+  const paywalled = st.cut || tailCut || gated || (!body && (opts.expectedWordCount ?? 0) > 0)
   if (paywalled) body = body ? `${body}\n\n${PAID_PREVIEW_NOTE}` : PAID_ONLY_NOTE
 
   const footnotes: ReaderFootnote[] = st.usedNotes.map(label => ({ label, text: st.notes.get(label) ?? '' }))

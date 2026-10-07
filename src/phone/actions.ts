@@ -7,7 +7,7 @@
  * phone fetches never block paging through pages already on the glasses.
  */
 import { toViewError, type Controller } from '../app/controller'
-import { defaultSettings, type HomeItemId, type PostRef } from '../app/types'
+import { LIMITS, defaultSettings, type HomeItemId, type PostRef } from '../app/types'
 import type { GlassesAction, GlassesStatus } from '../events'
 import {
   addPublication, addSaved, clearReading, isSaved, normalizeSettings, refKey, rehostPublication,
@@ -15,7 +15,7 @@ import {
 } from '../storage'
 import { appendPosts, type RelayApi } from '../substack/api'
 import { ARCHIVE_PAGE_SIZE, type PostSummary, type PubMeta } from '../substack/types'
-import { parseMany, wwwAlternative, type ParsedInput } from '../substack/urls'
+import { INVALID_REASONS, parseMany, wwwAlternative, type ParsedInput } from '../substack/urls'
 import {
   NO_BRIDGE_MESSAGE, PHONE_PANELS, renderEventLog, renderGlassesLive, renderMirrorFrame, renderPhone, renderStatusInner,
   type AddCard, type BrowseState, type GlassesLink, type PhoneError, type PhoneModel, type PhonePanel,
@@ -48,6 +48,12 @@ export interface PhoneApp {
   saved(ok: boolean): void
   /** Exposed on #app[data-phase] for diagnostics and CI ('boot', 'phone', 'glasses', 'nobridge'). */
   setPhase(phase: string): void
+  /**
+   * The stored library is still being read from bridge storage: lists show
+   * "Loading your library" and edits are refused, so an empty list never
+   * invites an edit that would race the bridge copy.
+   */
+  setLibraryLoading(loading: boolean): void
 }
 
 interface RunContext {
@@ -58,6 +64,15 @@ interface RunContext {
 type RunAction = (ctx: RunContext) => Promise<void>
 
 const MAX_EVENTS = 30
+/** Characters of a skipped share-text line used as its card label. */
+const SKIPPED_LABEL_CHARS = 60
+/** Buttons that change publications, saved posts, settings or progress (refused while the library loads). */
+const LIBRARY_ACTIONS = new Set([
+  'follow', 'follow-selected', 'save-post', 'toggle-save', 'pub-up', 'pub-down', 'pub-remove', 'pub-latest',
+  'saved-up', 'saved-down', 'saved-remove', 'set', 'home-item', 'home-up', 'home-down', 'latest-max',
+  'clear-reading', 'reset-settings', 'clear-reading-confirm', 'reset-settings-confirm', 'browse',
+])
+const LIBRARY_LOADING = `Loading your library${String.fromCharCode(0x2026)}`
 const COPY_BLOCKED = 'Copying is not allowed here. Press and hold the link below to copy it.'
 const SUMMARY_FIELDS = [
   'id', 'publicationId', 'slug', 'title', 'subtitle', 'postDate', 'audience', 'isPaywalled',
@@ -86,15 +101,19 @@ function labelOf(parsed: ParsedInput): string {
     case 'postId': return `Post ${parsed.id}`
     case 'handle': return `@${parsed.handle}`
     case 'search': return `Search: ${parsed.query}`
-    case 'invalid': return 'Not added'
+    // Share text next to a link: the card is titled with the skipped line itself.
+    case 'invalid': return parsed.skipped === undefined ? 'Not added' : Array.from(parsed.skipped).slice(0, SKIPPED_LABEL_CHARS).join('')
   }
 }
 
-function followText(result: AddResult, name: string): { text: string; tone: 'ok' | 'info' } {
+/** `count` is the list length after the attempt: below the limit, 'full' means the storage space ran out. */
+function followText(result: AddResult, name: string, count: number): { text: string; tone: 'ok' | 'info' } {
   switch (result) {
     case 'added': return { text: `Following ${name}. It is on the glasses now.`, tone: 'ok' }
     case 'exists': return { text: `Already following ${name}.`, tone: 'info' }
-    case 'full': return { text: 'Your list is full (100 publications). Remove one first.', tone: 'info' }
+    case 'full': return count >= LIMITS.publications
+      ? { text: `Your list is full (${LIMITS.publications} publications). Remove one first.`, tone: 'info' }
+      : { text: 'Storage is full. Remove a publication or saved post first.', tone: 'info' }
     case 'invalid': return { text: 'That publication address could not be used.', tone: 'info' }
   }
 }
@@ -147,6 +166,7 @@ export function createPhoneApp(deps: PhoneDeps): PhoneApp {
   let lastGlassesError: object | null = null
   let confirm: PhoneModel['confirm'] = null
   let drawQueued = false
+  let libraryLoading = false
   const drafts = new Map<string, { value: string; start: number | null; end: number | null }>()
 
   // -------------------------------------------------------------------------
@@ -181,6 +201,7 @@ export function createPhoneApp(deps: PhoneDeps): PhoneApp {
       storage: { backend: store.backend(), sizes: store.sizes() },
       lastErrorCode,
       confirm,
+      libraryLoading,
     }
   }
 
@@ -346,22 +367,48 @@ export function createPhoneApp(deps: PhoneDeps): PhoneApp {
   // -------------------------------------------------------------------------
   // Publications: add flow
 
-  async function followHost(host: string, ctx: RunContext): Promise<{ text: string; tone: 'ok' | 'info' }> {
-    let result: Awaited<ReturnType<PhoneApi['getArchive']>>
+  /**
+   * C4: an apex custom domain often only serves Substack on www. On
+   * HOST_NOT_SUBSTACK, try the www host once; if that fails too, its error
+   * (more specific, e.g. post not found) is reported.
+   */
+  async function withWwwRetry<T>(host: string, ctx: RunContext, call: (host: string) => Promise<T>): Promise<T> {
     try {
-      result = await api.getArchive(host, { offset: 0, limit: 1 }, ctx.signal)
+      return await call(host)
     } catch (err) {
-      // C4: an apex custom domain often only serves Substack on www.
       const alternative = codeOf(err) === 'HOST_NOT_SUBSTACK' ? wwwAlternative(host) : null
       if (!alternative || !ctx.live()) throw err
-      result = await api.getArchive(alternative, { offset: 0, limit: 1 }, ctx.signal)
+      return call(alternative)
     }
+  }
+
+  /** The publication's name when the archive could not tell (no post byline names it). */
+  async function nameFromPost(postId: number, host: string, ctx: RunContext): Promise<string | null> {
+    try {
+      const detail = await api.getPost({ id: postId }, ctx.signal)
+      const pub = detail.publication
+      return pub && pub.host === host && pub.name ? pub.name : null
+    } catch {
+      return null // Cosmetic: the host is shown instead.
+    }
+  }
+
+  async function followHost(host: string, ctx: RunContext): Promise<{ text: string; tone: 'ok' | 'info' }> {
+    // A full page: the relay finds the publication through post bylines, and one post may have none.
+    const result = await withWwwRetry(host, ctx, target => api.getArchive(target, { offset: 0, limit: ARCHIVE_PAGE_SIZE }, ctx.signal))
     if (!ctx.live()) throw abortedError()
     const pub = result.page.publication
-    const name = pub?.name || result.host
-    const outcome = addPublication(state, { id: pub?.id ?? null, name, host: result.host, addedAt: deps.now(), inLatest: true })
+    const first = result.page.posts[0]
+    let name = pub?.name || ''
+    if (!name && first) {
+      name = await nameFromPost(first.id, result.host, ctx) ?? ''
+      if (!ctx.live()) throw abortedError()
+    }
+    if (!name) name = result.host
+    const id = pub?.id ?? first?.publicationId ?? null
+    const outcome = addPublication(state, { id, name, host: result.host, addedAt: deps.now(), inLatest: true })
     if (outcome === 'added') changed('prefs')
-    return followText(outcome, name)
+    return followText(outcome, name, state.publications.length)
   }
 
   async function processInput(parsed: ParsedInput, id: number, ctx: RunContext): Promise<AddCard> {
@@ -369,12 +416,16 @@ export function createPhoneApp(deps: PhoneDeps): PhoneApp {
     try {
       switch (parsed.kind) {
         case 'invalid':
+          // A skipped share-text line is information, not a failed add.
+          if (parsed.skipped !== undefined) return { id, kind: 'message', label, text: INVALID_REASONS.shareText, tone: 'info' }
           return { id, kind: 'invalid', label, text: parsed.reason }
         case 'publication':
           return { id, kind: 'message', label, ...await followHost(parsed.host, ctx) }
         case 'post':
         case 'postId': {
-          const result = await api.getPost(parsed.kind === 'post' ? { host: parsed.host, slug: parsed.slug } : { id: parsed.id }, ctx.signal)
+          const result = parsed.kind === 'post'
+            ? await withWwwRetry(parsed.host, ctx, host => api.getPost({ host, slug: parsed.slug }, ctx.signal))
+            : await api.getPost({ id: parsed.id }, ctx.signal)
           return { id, kind: 'post', label, post: summaryOf(result.post), publication: result.publication, host: result.host }
         }
         case 'handle':
@@ -442,7 +493,7 @@ export function createPhoneApp(deps: PhoneDeps): PhoneApp {
     if (!pub) return
     const outcome = followPub(pub)
     if (outcome === 'added') changed('prefs')
-    notice = followText(outcome, pub.name).text
+    notice = followText(outcome, pub.name, state.publications.length).text
     draw()
   }
 
@@ -459,7 +510,10 @@ export function createPhoneApp(deps: PhoneDeps): PhoneApp {
     }
     replaceCard({ ...card, picks: [] })
     if (added) changed('prefs')
-    notice = `Following ${added} new publication${added === 1 ? '' : 's'}.${full ? ' Your list is full (100 publications).' : ''}`
+    const fullText = !full ? ''
+      : state.publications.length >= LIMITS.publications ? ` Your list is full (${LIMITS.publications} publications).`
+        : ' Storage is full. Remove a publication or saved post first.'
+    notice = `Following ${added} new publication${added === 1 ? '' : 's'}.${fullText}`
     draw()
   }
 
@@ -507,8 +561,11 @@ export function createPhoneApp(deps: PhoneDeps): PhoneApp {
       notice = 'Removed from Saved.'
     } else {
       const outcome = addSaved(state, ref)
+      const full = state.saved.length >= LIMITS.saved
+        ? `Saved is full (${LIMITS.saved} posts). Remove one first.`
+        : 'Storage is full. Remove some saved posts first.'
       notice = outcome === 'added' ? 'Saved. Open Saved on the glasses to read it.'
-        : outcome === 'full' ? 'Saved is full (100 posts). Remove one first.'
+        : outcome === 'full' ? full
           : outcome === 'exists' ? 'Already saved.' : 'That post could not be saved.'
       if (outcome !== 'added') {
         draw()
@@ -592,6 +649,11 @@ export function createPhoneApp(deps: PhoneDeps): PhoneApp {
     }
     const host = data.host ?? ''
     const cardId = Number(data.card)
+    if (libraryLoading && data.action && LIBRARY_ACTIONS.has(data.action)) {
+      notice = LIBRARY_LOADING
+      draw()
+      return
+    }
     switch (data.action) {
       case 'remote': return remote(data.remote)
       case 'glasses-retry': void controller.retry().catch(() => undefined); return
@@ -745,6 +807,11 @@ export function createPhoneApp(deps: PhoneDeps): PhoneApp {
     if (!(form instanceof HTMLFormElement) || form.id !== 'add-form') return
     const input = form.querySelector<HTMLTextAreaElement>('#add-input')
     if (!input || busy) return
+    if (libraryLoading) {
+      notice = LIBRARY_LOADING
+      draw()
+      return
+    }
     const parsed = parseMany(input.value)
     if (!parsed.length) {
       notice = 'Paste a link, a domain, an @handle, or a name to search.'
@@ -793,6 +860,12 @@ export function createPhoneApp(deps: PhoneDeps): PhoneApp {
     },
     setPhase(phase) {
       root.dataset.phase = phase
+    },
+    setLibraryLoading(loading) {
+      if (libraryLoading === loading) return
+      libraryLoading = loading
+      if (!loading && notice === LIBRARY_LOADING) notice = ''
+      requestDraw()
     },
   }
 }

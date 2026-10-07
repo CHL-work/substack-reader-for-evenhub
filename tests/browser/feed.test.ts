@@ -11,6 +11,7 @@ import {
   slugFromLink,
   syntheticPostId,
 } from '../../src/substack/feed'
+import { htmlToReaderText } from '../../src/substack/html'
 import type { PostSummary } from '../../src/substack/types'
 
 const HOST = 'fieldnotes.substack.com'
@@ -85,6 +86,18 @@ test('parseFeed: free, paid (Read more tail) and podcast items', () => {
   const paid = result.bodies.get('paid-notes-on-compost') ?? ''
   assert(paid.startsWith('<p>The public opening of an invented paid post.</p>'), 'paid preview body kept as HTML')
   assert(hasReadMoreTail(paid, `${BASE}paid-notes-on-compost`), 'the paid body keeps its Read more tail for html.ts')
+})
+
+test('feed bodies convert with their audience: only a paid item loses its Read more tail (C1)', () => {
+  const result = parseFeed(feedXml, HOST)
+  const convert = (slug: string) => htmlToReaderText(result.bodies.get(slug), { audience: result.posts.find(post => post.slug === slug)?.audience })
+  const free = convert('weekly-links')
+  assertEqual(free.text, 'A short free post.\n\nRead more', 'a free item ending in a link to another post keeps it')
+  assertEqual(free.paywalled, false)
+  const paid = convert('paid-notes-on-compost')
+  assertEqual(paid.text, 'The public opening of an invented paid post.\n\n[Preview ends here. The rest of this post is for paid subscribers.]')
+  assertEqual(paid.paywalled, true)
+  assertEqual(paid.wordCount, 8)
 })
 
 test('parseFeed: synthetic ids are negative, stable and host-scoped', () => {

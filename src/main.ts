@@ -6,10 +6,11 @@
  */
 import './styles.css'
 import { createController } from './app/controller'
+import { TEXT, messageFrame } from './app/frames'
 import { APP_NAME, RELAY_BASE, VERSION, isRelayConfigured } from './config'
-import { connectGlasses, type GlassesController, type GlassesMenuItem, type GlassesStatus } from './glasses'
+import { connectGlasses, type GlassesController, type GlassesMenuItem, type GlassesStorage } from './glasses'
 import { createPhoneApp, type PhoneApp } from './phone/actions'
-import { browserKV, bridgeKV, createStore, mirroredKV } from './storage'
+import { browserKV, bridgeKV, createStore } from './storage'
 import { relayApi } from './substack/api'
 import { buildArticle } from './substack/article'
 import { parseFeed } from './substack/feed'
@@ -24,6 +25,16 @@ const MENU_ITEMS: GlassesMenuItem[] = [
 ]
 /** Show "Open this from the Even app" after this long without a bridge. */
 const BRIDGE_GRACE_MS = 4000
+/** controller.start() waits this long at most for the bridge library (glassesMenu resume needs it). */
+const START_WAIT_MS = 4000
+/** Retries after a failed bridge storage read; foreground and reconnect start a new round. */
+const ATTACH_RETRY_MS = [1000, 3000, 10_000] as const
+/** First glasses frame while the bridge library is still being read and the browser copy was empty. */
+const LOADING_LIBRARY_FRAME = messageFrame(APP_NAME, 'Loading your library\u2026', TEXT.exitFooter)
+
+function delay(ms: number): Promise<void> {
+  return new Promise(resolve => setTimeout(resolve, ms))
+}
 
 async function boot(root: HTMLElement): Promise<void> {
   let phone: PhoneApp | null = null
@@ -56,8 +67,78 @@ async function boot(root: HTMLElement): Promise<void> {
     relayOrigin: RELAY_BASE,
     now: () => Date.now(),
   })
+  // Nothing in the browser copy: the library may still be in bridge storage.
+  // Until it was read (or there is no bridge), the phone shows "Loading your
+  // library" instead of an empty list that invites edits.
+  let libraryLoading = store.loadedEmpty()
+  phone.setLibraryLoading(libraryLoading)
   phone.draw()
   phone.setPhase('phone')
+
+  function libraryReady() {
+    if (!libraryLoading) return
+    libraryLoading = false
+    phone?.setLibraryLoading(false)
+  }
+
+  // -------------------------------------------------------------------------
+  // Bridge storage (the source of truth), attached as soon as the bridge
+  // exists, independent of page creation. A failed read never overwrites it:
+  // retry with backoff, and again on every foreground and reconnect.
+
+  let bridgeStorage: GlassesStorage | null = null
+  let attachRunning = false
+  let attachApplied: Promise<void> = Promise.resolve()
+  let retries = 0
+  let retryTimer: ReturnType<typeof setTimeout> | undefined
+
+  /** Resolves once the bridge documents were merged into memory, or the attempt failed. */
+  function attach(): Promise<void> {
+    const storage = bridgeStorage
+    if (!storage || store.attached()) return Promise.resolve()
+    if (attachRunning) return attachApplied
+    if (retryTimer !== undefined) clearTimeout(retryTimer)
+    retryTimer = undefined
+    attachRunning = true
+    let markApplied = () => undefined as void
+    attachApplied = new Promise<void>(resolve => { markApplied = resolve })
+    store.attachBridge(bridgeKV(storage), changed => {
+      // Before the write-back: the glasses and phone show the library at once.
+      // While loading, the glasses may still show the "Loading your library" frame.
+      if (changed || libraryLoading) controller.configurationChanged()
+      libraryReady()
+      if (changed) phone?.draw()
+      markApplied()
+    }).then(() => {
+      retries = 0
+    }, () => {
+      // Nothing was written. Edits now go to the browser copy; a later attach merges them.
+      if (libraryLoading) controller.configurationChanged()
+      libraryReady()
+      scheduleRetry()
+    }).catch(() => undefined).finally(() => {
+      attachRunning = false
+      markApplied()
+    })
+    return attachApplied
+  }
+
+  function scheduleRetry() {
+    if (store.attached() || retryTimer !== undefined || retries >= ATTACH_RETRY_MS.length) return
+    const wait = ATTACH_RETRY_MS[retries]!
+    retries += 1
+    retryTimer = setTimeout(() => {
+      retryTimer = undefined
+      void attach()
+    }, wait)
+  }
+
+  /** Foreground or reconnect: try now, with a fresh round of retries. */
+  function retryAttach() {
+    if (!bridgeStorage || store.attached()) return
+    retries = 0
+    void attach()
+  }
 
   // Persist before the WebView may be killed; tell the controller (resume redraw after 30 s).
   document.addEventListener('visibilitychange', () => {
@@ -66,47 +147,54 @@ async function boot(root: HTMLElement): Promise<void> {
       controller.onLifecycle('background')
     } else {
       controller.onLifecycle('foreground')
+      retryAttach()
     }
   })
   window.addEventListener('pagehide', () => { void store.flush() })
 
-  let lastState: GlassesStatus['state'] = 'connecting'
   const grace = setTimeout(() => {
-    if (glasses) return
+    if (glasses || bridgeStorage) return
+    libraryReady()
     phone?.setNoBridge()
     phone?.setPhase('nobridge')
   }, BRIDGE_GRACE_MS)
 
   // Not awaited: in a plain browser the bridge never arrives, and the phone stays usable.
   connectGlasses({
-    initialPage: controller.current(),
+    // Called after onBridgeReady's bounded wait, so the first frame can show the bridge library.
+    initialPage: () => (libraryLoading ? LOADING_LIBRARY_FRAME : controller.current()),
+    onBridgeReady: storage => {
+      bridgeStorage = storage
+      return attach()
+    },
     menuItems: MENU_ITEMS,
     invertSwipe: () => store.state.settings.invertSwipe,
     onAction: action => controller.onAction(action),
-    onStatus: status => {
-      const reconnected = lastState === 'disconnected' && status.state === 'ready'
-      lastState = status.state
-      phone?.setGlassesStatus(status)
-      if (reconnected) void controller.redraw()
+    onStatus: status => phone?.setGlassesStatus(status),
+    onReconnect: () => {
+      void controller.redraw()
+      retryAttach()
     },
-    onLifecycle: signal => controller.onLifecycle(signal),
+    onLifecycle: signal => {
+      controller.onLifecycle(signal)
+      if (signal === 'foreground') retryAttach()
+    },
     onLaunchSource: source => controller.onLaunchSource(source),
     onRawEvent: summary => phone?.logEvent(summary),
     onExit: async () => { await store.flush() },
   }).then(async connected => {
     clearTimeout(grace)
     glasses = connected
-    try {
-      // Bridge storage is the source of truth; localStorage stays a mirror.
-      if (await store.attachBridge(mirroredKV(bridgeKV(connected), browserKV()))) controller.configurationChanged()
-    } catch { /* Keep the browser copy; saving reports its own failures. */ }
+    // A glassesMenu launch resumes lastOpen, which may only be in bridge storage.
+    await Promise.race([attachApplied, delay(START_WAIT_MS)])
     await controller.start()
     phone?.setPhase('glasses')
     phone?.draw()
   }, () => {
     clearTimeout(grace)
     phone?.setPhase('nobridge')
-    // connectGlasses already reported the error through onStatus; the phone stays usable.
+    // connectGlasses already reported the error through onStatus; the phone
+    // stays usable, and bridge storage (if the bridge exists) still attaches.
   })
 }
 

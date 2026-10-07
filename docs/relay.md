@@ -11,22 +11,22 @@ Every route is `GET`. `OPTIONS` answers `204`; any other method answers `405 MET
 | Route | Parameters | Upstream request | Edge / client cache (s) | `data` |
 | --- | --- | --- | --- | --- |
 | `/` and `/privacy` | none | none | client 3600 | HTML landing and privacy pages (CSP `default-src 'none'; style-src 'unsafe-inline'; base-uri 'none'; frame-ancestors 'none'`) |
-| `/v1/health` | `probe=1` (optional) | with `probe=1`, three fixed probes (below) | none (`no-store`) | `{service: 'substack-reader-relay', protocol: 1, revision, origin, probes?}` |
+| `/v1/health` | `probe=1` (optional) | with `probe=1`, three fixed probes (below), at most one round per minute | none (`no-store`) | `{service: 'substack-reader-relay', protocol: 1, revision, origin, probes?}` |
 | `/v1/archive` | `host`; `offset` 0 to 5000 (default 0); `limit` (default 12, clamped to 1..20); `sort` `new` or `top` (default `new`) | `https://<host>/api/v1/archive?sort=<s>&search=&offset=<o>&limit=<l>` | 300 / 60 | `ArchivePage {publication, posts, nextOffset}` |
 | `/v1/post` | `host` and `slug` | `https://<host>/api/v1/posts/<slug>` | 900 / 300 (404s cached 60 at the edge) | `{post: PostDetail, publication: PubMeta or null}` |
-| `/v1/post` | `id` (a positive safe integer) alone | `https://substack.com/api/v1/posts/by-id/<id>` | 900 / 300 (404s cached 60 at the edge) | `{post, publication}`; `meta.host` is the publication's host |
-| `/v1/profile` | `handle` (one leading `@` is removed) | `https://substack.com/api/v1/user/<handle>/public_profile` | 3600 / 600 | `Profile {handle, name, primaryPublication, subscriptions}` (public subscriptions only, at most 500) |
+| `/v1/post` | `id` (an integer from 1 to 2147483647, the range Substack's by-id endpoint accepts) alone | `https://substack.com/api/v1/posts/by-id/<id>` | 900 / 300 (404s cached 60 at the edge) | `{post, publication}`; `meta.host` is the publication's host |
+| `/v1/profile` | `handle` (one leading `@` is removed, then it is lowercased: Substack's lookup is case-sensitive and handles are lowercase) | `https://substack.com/api/v1/user/<handle>/public_profile` | 3600 / 600 | `Profile {handle, name, primaryPublication, subscriptions}` (public subscriptions only, at most 500) |
 | `/v1/search` | `q`, 2 to 100 characters | `https://substack.com/api/v1/top/search?query=<q>` | 3600 / 600 | `{results: PubMeta[]}`, at most 20, deduplicated by id and host |
-| `/v1/feed` | `host` | `https://<host>/feed` | 600 / 120 | Raw RSS XML (`application/xml; charset=utf-8`) on success; a JSON error envelope on failure |
+| `/v1/feed` | `host` | `https://<host>/feed` | 600 / 120 | Raw RSS XML served as `text/plain; charset=utf-8` on success; a JSON error envelope on failure |
 
 Details:
 
 - **Archive paging.** Substack often returns fewer posts than `limit`. `nextOffset` is `offset` plus the number of items Substack returned, and becomes `null` only after an empty page (or past offset 5000). Clients must keep paging until `nextOffset` is `null`, never stop because a page is short.
-- **Archive publication.** `publication` comes from `publishedBylines[].publicationUsers[].publication` whose `id` equals the post's `publication_id`.
+- **Archive publication.** `publication` comes from `publishedBylines[].publicationUsers[].publication` whose `id` equals the post's `publication_id`. When no item has such a byline (staff and guest bylines often name no publication, or another one), the first byline publication whose host is the final upstream host is used; otherwise it is `null`. The same rule gives `/v1/post?host=&slug=` its `publication`.
 - **Search.** Results come from `profileSearchResults` items (each result's `primaryPublication`) and from `post` items (their `publication`). Comment items are ignored.
 - **Publication host.** A `PubMeta.host` is the publication's `base_url`/`hostname` when Substack sends one; otherwise its custom domain when set and not marked optional; otherwise `<subdomain>.substack.com`.
 - **Trimming.** Posts keep `id`, `publication_id`, `slug`, `title` (trimmed), `subtitle`, `post_date`, `audience`, `type`, `wordcount`, `canonical_url`, up to 5 byline names and `podcast_duration`. Post details add `body_html` unchanged. A missing `audience` becomes `unknown`. Any audience other than `everyone` sets `isPaywalled` and `truncated`, because the body may be only a preview. Publication names are trimmed.
-- **Feed.** The XML is passed through unchanged after the content-type check; the phone parses it.
+- **Feed.** The XML is passed through unchanged after the content-type check and a check that the document element is `<rss>`, preceded only by an XML declaration, comments and whitespace (so no `xml-stylesheet` instruction and no DOCTYPE). It is served as `text/plain` under the sandbox CSP, so a browser that opens the URL never renders upstream markup on the relay's origin; the phone parses it with `DOMParser`.
 
 ## Envelope and headers
 
@@ -38,7 +38,8 @@ Every response carries:
 
 - `Access-Control-Allow-Origin: *`, `Access-Control-Allow-Methods: GET, OPTIONS`, `Access-Control-Max-Age: 86400` (never `Access-Control-Allow-Credentials`)
 - `X-Content-Type-Options: nosniff`, `Referrer-Policy: no-referrer`
-- `Content-Type` (JSON, XML or HTML)
+- `Content-Security-Policy: default-src 'none'; sandbox; frame-ancestors 'none'` (the two HTML pages carry their own CSP instead); `fetch()` callers are unaffected, and nothing the relay returns can run script on its origin
+- `Content-Type` (JSON, plain text for the feed, or HTML)
 - `Cache-Control: public, max-age=<client TTL>` on success, `no-store` on errors and on `/v1/health`
 - `Retry-After` on every error that has `retryAfterSeconds`
 
@@ -49,12 +50,12 @@ No upstream header (in particular no `Set-Cookie`) is copied.
 | Status | Code | Meaning |
 | --- | --- | --- |
 | 400 | `INVALID_HOST`, `INVALID_SLUG`, `INVALID_HANDLE`, `INVALID_QUERY`, `INVALID_PARAM` | Parameter rejected before any upstream request. Also `INVALID_PARAM` when `id` is combined with `host`/`slug`. |
-| 403 | `HOST_NOT_SUBSTACK` | The host failed verification, or an upstream response lacked Substack's fingerprint header. |
+| 403 | `HOST_NOT_SUBSTACK` | The host failed verification (including a domain that does not exist or has no addresses), or an upstream response lacked Substack's fingerprint header. |
 | 404 | `NOT_FOUND`, `PUBLICATION_NOT_FOUND`, `POST_NOT_FOUND`, `PROFILE_NOT_FOUND` | Unknown route, or Substack has no such publication, post or profile. A redirect from an unknown subdomain to `substack.com` also means `PUBLICATION_NOT_FOUND`. On `/v1/post`, a JSON 404 is `POST_NOT_FOUND` and an empty 404 is `PUBLICATION_NOT_FOUND`. |
 | 405 | `METHOD_NOT_ALLOWED` | Not GET or OPTIONS. |
-| 429 | `RATE_LIMITED` | Too many requests from this client; see `retryAfterSeconds`. |
+| 429 | `RATE_LIMITED` | Too many requests from this client (or too many new custom-domain mapping proofs or health probes); see `retryAfterSeconds`. |
 | 502 | `UPSTREAM_INVALID`, `UPSTREAM_TOO_LARGE`, `UPSTREAM_ERROR`, `TOO_MANY_REDIRECTS`, `REDIRECT_NOT_ALLOWED` | Wrong content type or unreadable JSON, over the size cap, another non-2xx status, more than 3 redirects, or a redirect the relay will not follow. |
-| 503 | `UPSTREAM_BLOCKED`, `UPSTREAM_RATE_LIMITED`, `UPSTREAM_UNAVAILABLE` | Substack answered 403 or a Cloudflare challenge; Substack answered 429 (with `retryAfterSeconds`, at most 86400); Substack answered 5xx or could not be reached. `UPSTREAM_UNAVAILABLE` also covers a custom domain that could not be checked because DNS lookups failed. |
+| 503 | `UPSTREAM_BLOCKED`, `UPSTREAM_RATE_LIMITED`, `UPSTREAM_UNAVAILABLE` | Substack answered 403 or a Cloudflare challenge; Substack answered 429 (with `retryAfterSeconds`, at most 86400); Substack answered 5xx or could not be reached. `UPSTREAM_BLOCKED` also covers a custom-domain mapping proof that Substack refused (401, 403 or a challenge, with `upstream`); `UPSTREAM_UNAVAILABLE` also covers a custom domain that could not be checked because DNS lookups or the proof failed on the network, 429 or 5xx. |
 | 504 | `UPSTREAM_TIMEOUT` | Substack did not answer within 10 s. |
 | 500 | `INTERNAL_ERROR` | Unexpected relay failure. |
 
@@ -74,20 +75,24 @@ These rules keep the relay from becoming an open proxy. Do not relax them.
      2. the host's A/AAAA records share an address with `target.substack-custom-domains.com` (apex domains with CNAME flattening), or its A answer contains a CNAME chain ending at that target;
      3. a mapping proof: `https://<host>/api/v1/archive?sort=new&offset=0&limit=1` answers Substack JSON (with the fingerprint header) that names a publication whose `custom_domain` is the host (or its `www.` variant) and whose subdomain is `S`, **and** `https://S.substack.com/api/v1/archive?...` redirects to exactly that host.
 
-     A pass is cached for 24 hours and a failure for 1 hour, in memory and in the Cache API. A lookup that fails on the network is not cached and is reported as `UPSTREAM_UNAVAILABLE`.
+     The checks run in that order. When the host's A and AAAA answers are definitive but contain no address (NXDOMAIN, or a CNAME to a name without addresses), nothing can serve it, so it fails without any request to the host. The mapping proof is the only request to a host the caller chose, so it first takes a token from the client's strict budget (rule 7).
+
+     A pass is cached for 24 hours and a failure for 1 hour (10 minutes for a host without addresses, so a newly configured domain is seen soon), in memory and in the Cache API. An inconclusive check is remembered for 60 seconds in memory only and never written to the Cache API: a DNS lookup or proof request that failed on the network or with 429/5xx is reported as `UPSTREAM_UNAVAILABLE`, and a proof request that Substack refused (401, 403 or a challenge) as `UPSTREAM_BLOCKED`, never as a cached `HOST_NOT_SUBSTACK`.
 3. **Fingerprint.** Every upstream response, redirects included, must carry `x-served-by: Substack` or `x-cluster: substack` (case-insensitive), or its body is discarded and the request fails with `HOST_NOT_SUBSTACK`.
 4. **Redirects** are handled manually, at most 3 hops. A relative `Location` is resolved against the request URL. The target must be `https:` with no credentials or port, keep the same path, and pass rule 2. Only the host changes; the relay keeps its own path and query.
 5. **Honest requests.** GET only, no body, no cookies. The only request headers are `User-Agent: SubstackReaderForEvenHub/<version>` (no URL in it: a URL in the User-Agent makes Substack search return nothing) and `Accept: application/json` (`application/rss+xml, application/xml;q=0.9` for feeds, `application/dns-json` for DNS). Never spoof a browser User-Agent or Referer, rotate IPs or replay Cloudflare cookies.
-6. **Size caps**, enforced while streaming: archive 1 MiB, post 4 MiB, profile 1 MiB, search 2 MiB, feed 4 MiB, DNS answers 64 KiB. Each upstream call has a 10 s timeout covering every redirect hop and the body. JSON routes require a JSON content type; the feed route requires `application/rss+xml`, `application/xml` or `text/xml` and a body that starts with `<`.
-7. **Rate limiting** per client IP and route, applied after parameter validation (so `400`s never count): the Cloudflare binding `RL` (60 per 60 s, counted per Cloudflare location) when present, otherwise a per-isolate token bucket of 60 per minute. If the binding throws, the local bucket is used. The IP is used only as an in-memory key.
+6. **Size caps**, enforced while streaming: archive 1 MiB, post 4 MiB, profile 1 MiB, search 2 MiB, feed 4 MiB, DNS answers 64 KiB. Each upstream call has a 10 s timeout covering every redirect hop and the body. JSON routes require a JSON content type; the feed route requires `application/rss+xml`, `application/xml` or `text/xml` and an `<rss>` document element (see Feed above).
+7. **Rate limiting** per client and route, applied after parameter validation (so `400`s never count): the Cloudflare binding `RL` (60 per 60 s, counted per Cloudflare location) when present, otherwise a per-isolate token bucket of 60 per minute. Costly work also takes a token from a strict budget under its own route key: each custom-domain mapping proof (`verify`) and each `/v1/health?probe=1` (`health-probe`), through the binding `RL_STRICT` (10 per 60 s) or a per-isolate bucket of 10 per minute. If a binding throws, the local bucket is used.
+   - **The client key** is the `CF-Connecting-IP` header only when the request carries Cloudflare's `request.cf` object, i.e. it came through Cloudflare's edge, which sets that header. An IPv6 address is reduced to its /64 (`2001:db8:1:2::/64`), because one subscriber usually holds a whole /64. On any other platform a client could choose the header's value, so the relay ignores it and all clients share one key (`shared`) per route.
+   - The IP is used only as an in-memory key.
 8. **No logs, no storage.** No `console` output, `observability.enabled = false` in `wrangler.toml`, nothing written anywhere except the edge cache.
-9. **Edge cache.** Keys are synthetic (`https://relay.cache/p1/v1/...`) and built after validation. Only successful responses and post 404s are cached; 403, 429 and 5xx never are. A response that followed a redirect is cached under both the requested and the final host. On `*.workers.dev` the Cache API is best-effort; it is reliable on a custom domain.
+9. **Edge cache.** Keys are synthetic, live under the relay's own request origin (`https://<relay host>/__relay-cache/p1/v1/...`, so relays at different origins never read each other's entries) and are built after validation. Only successful responses, post 404s and custom-domain pass/fail verdicts are cached; 403, 429, 5xx and inconclusive verdicts never are. A stored verdict whose expiry is later than the relay ever sets (24 h for a pass, 1 h for a failure) is ignored. A response that followed a redirect is cached under both the requested and the final host. On `*.workers.dev` the Cache API is best-effort; it is reliable on a custom domain.
 
 ## Health and probes
 
 `GET /v1/health` returns the service name, protocol, `revision` (the Worker variable `REVISION`, or `null`) and `origin`: the request's `Origin` header (at most 128 printable characters), or `null`. Calling it from the Diagnostics panel on a real phone reveals the Even WebView's origin, which Even does not document.
 
-`GET /v1/health?probe=1` also makes three requests and reports only status, content-type category, whether a Cloudflare challenge was shown, and the time taken:
+`GET /v1/health?probe=1` also makes three requests and reports only status, content-type category, whether a Cloudflare challenge was shown, and the time taken. Each isolate runs at most one round per minute: a later call within that minute gets the same results with `meta.cached: true`. Each call also takes a token from the strict budget (rule 7).
 
 | Probe | Request |
 | --- | --- |
@@ -108,11 +113,11 @@ The **Deploy relay** workflow runs this probe once after each deploy when `VITE_
 
 ### Cloudflare Workers with GitHub Actions (default)
 
-`wrangler.toml` deploys `worker/relay.ts` as `substack-reader-relay` with `workers_dev = true`, observability off, and the `RL` rate-limit binding.
+`wrangler.toml` deploys `worker/relay.ts` as `substack-reader-relay` with `workers_dev = true`, observability off, and the `RL` and `RL_STRICT` rate-limit bindings. Wrangler is an exact devDependency (`wrangler` 4.148.0, locked in `pnpm-lock.yaml`), so the deploy never resolves a fresh dependency tree while the API token is in its environment.
 
 1. Create a Cloudflare API token with **Workers Scripts: Edit** for your account. Make sure the account has a `workers.dev` subdomain; wrangler cannot create one in CI.
 2. Add the repository secrets `CLOUDFLARE_API_TOKEN` and `CLOUDFLARE_ACCOUNT_ID`.
-3. Run **Actions → Deploy relay**. It installs the locked dependencies, type-checks, runs the Node unit tests (which include the relay's), then runs `pnpm dlx wrangler@4.148.0 deploy --var "REVISION:<short sha>"`.
+3. Run **Actions → Deploy relay**. It installs the locked dependencies, type-checks, runs the Node unit tests (which include the relay's), then runs `pnpm exec wrangler deploy --var "REVISION:<short sha>"`.
 4. Set the repository variable `VITE_RELAY_ORIGIN` to the Worker URL (`https://substack-reader-relay.<subdomain>.workers.dev`) and re-run the workflow to get the probe summary, or open `/v1/health?probe=1` yourself.
 
 A custom domain for the Worker (configured in Cloudflare) gives a more stable origin and a working edge cache. Changing the origin later requires a new `.ehpk`.
@@ -121,22 +126,24 @@ A custom domain for the Worker (configured in Cloudflare) gives a more stable or
 
 ```powershell
 $env:PATH = "C:\Code\.tools\node;$env:PATH"; $env:COREPACK_ENABLE_DOWNLOAD_PROMPT = "0"
-pnpm dlx wrangler@4.148.0 login
-pnpm dlx wrangler@4.148.0 deploy --var REVISION:manual
+pnpm install --frozen-lockfile
+pnpm exec wrangler login
+pnpm exec wrangler deploy --var REVISION:manual
 ```
 
 ### OpenAI Sites
 
-`pnpm run build` also writes the relay as `dist/server/index.js`, which is the entry point the Sites platform expects. See [.openai/README-sites.md](../.openai/README-sites.md). Sites has no rate-limit binding, so the per-isolate token bucket applies.
+`pnpm run build` also writes the relay as `dist/server/index.js`, which is the entry point the Sites platform expects. See [.openai/README-sites.md](../.openai/README-sites.md). Sites has no rate-limit binding, so the per-isolate token buckets apply. If Sites requests carry no Cloudflare `request.cf` object, all clients share one bucket per route (rule 7).
 
 ### Other hosts
 
-The relay uses only `fetch`, `Request`, `Response`, `AbortController`, `TextDecoder` and an optional `caches`. Any platform that runs an ES module with a `fetch(request, env, ctx)` export (Deno Deploy, Vercel Edge and similar) can host `dist/server/index.js`, which may help if Substack blocks Cloudflare's egress. Behind a platform that does not set `CF-Connecting-IP`, all clients share one rate-limit bucket per route.
+The relay uses only `fetch`, `Request`, `Response`, `AbortController`, `TextDecoder` and an optional `caches`. Any platform that runs an ES module with a `fetch(request, env, ctx)` export (Deno Deploy, Vercel Edge and similar) can host `dist/server/index.js`, which may help if Substack blocks Cloudflare's egress. Off Cloudflare (no `request.cf`), the relay ignores `CF-Connecting-IP`, which any client could set there, so all clients share one rate-limit bucket per route in each isolate (60 per minute; 10 per minute for mapping proofs and probes).
 
 ## Client contract (src/substack/api.ts)
 
 - Every request is a CORS simple request: `GET`, `credentials: 'omit'`, `redirect: 'error'`, `referrerPolicy: 'no-referrer'`, no custom headers, so there is no preflight.
-- The client timeout is 15 s. The client validates input itself and rejects bad hosts, slugs, handles and queries before sending anything. When the build has no relay origin, it fails with `NOT_CONFIGURED` and sends nothing.
+- The client timeout is 15 s. The client validates input itself and rejects bad hosts, slugs, handles, post ids (above 2147483647) and queries before sending anything; handles are lowercased like the relay does. When the build has no relay origin, it fails with `NOT_CONFIGURED` and sends nothing.
+- `/v1/feed` answers `text/plain`; the client accepts any non-JSON success body as the feed XML and parses it as `application/xml`.
 - Client-only error codes: `NOT_CONFIGURED`, `NETWORK_ERROR` (including a response that is not a relay envelope), `TIMEOUT` and `ABORTED` (the caller cancelled).
 - The archive page size is 12. The client adopts `meta.host` after redirects.
 - When adding a bare custom domain such as `example.com` fails with `HOST_NOT_SUBSTACK`, the phone retries `www.example.com` once, because many publications redirect the apex to `www.` without Substack's headers.

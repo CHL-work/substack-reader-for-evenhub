@@ -14,15 +14,15 @@
 import type { GlassesAction, GlassesPage, LaunchSource, LifecycleSignal } from '../events'
 import { PAGINATION_VERSION, bodyBox, pageIndexForOffset, paginate, type TextPage } from '../pagination'
 import {
-  addSaved, markRead, normalizePostRef, positionOf, recordHistory, recordPosition, refKey,
+  addSaved, markRead, normalizePostRef, normalizePublication, positionOf, recordHistory, recordPosition, refKey,
   rehostPost, rehostPublication, setLastOpen, type Store,
 } from '../storage'
 import { ARCHIVE_PAGE_SIZE, type ArchivePage, type PostDetail, type PostSummary, type PubMeta } from '../substack/types'
 import {
-  EMPTY_TEXT, TEXT, canContinue, clampIndex, fitBody, frameFor, homeEntries, isFirstRun, isRetryable,
+  EMPTY_TEXT, TEXT, canContinue, clampIndex, errorBody, fitBody, frameFor, homeEntries, isFirstRun, isRetryable,
   latestPublications, postsRowCount, type HomeEntry, type PostsView, type ReaderView,
 } from './frames'
-import type { Article, GlassesView, LinesPerPage, Position, PostRef, PostSource, Settings, ViewError } from './types'
+import { LIMITS, type Article, type GlassesView, type LinesPerPage, type Position, type PostRef, type PostSource, type Publication, type Settings, type ViewError } from './types'
 
 /** The relay-client subset the glasses need (src/substack/api.ts satisfies it). */
 export interface ReaderApi {
@@ -37,7 +37,11 @@ export interface FeedResult {
 }
 
 export interface ControllerDeps {
-  /** Resolves after the glasses accepted the frame. */
+  /**
+   * Resolves after the glasses accepted the frame. Rejects with an Error named
+   * 'SupersededRenderError' when a newer frame replaced it before it was written
+   * (not shown, nothing to retry), and with any other Error when the write failed.
+   */
   render(page: GlassesPage): Promise<void>
   /** shutDownPageContainer(1) (root double-tap). */
   exit(): Promise<void>
@@ -83,15 +87,24 @@ export interface Controller {
 
 type HomeView = Extract<GlassesView, { kind: 'home' }>
 type PublicationsView = Extract<GlassesView, { kind: 'publications' }>
+interface PublicationsState extends PublicationsView {
+  /** Host of the selected publication: phone edits move the cursor with it, not with its index. */
+  selHost: string | null
+}
+type LoadMode = 'initial' | 'older' | 'refresh'
 interface PostsState extends PostsView {
-  /** The pending or failed load is "Load older posts" (the list stays usable on cancel/error). */
-  older?: boolean
+  /**
+   * The pending or failed load; cleared on success. 'older' and 'refresh' run on a list that
+   * was already loaded, so cancel or back after an error returns to it, and retry keeps the mode.
+   */
+  pendingMode?: LoadMode
 }
 interface ReaderState extends ReaderView {
   /** Lines per page the pages were computed for. */
   lines: LinesPerPage
 }
-type View = HomeView | PublicationsView | PostsState | ReaderState
+type View = HomeView | PublicationsState | PostsState | ReaderState
+type ArchiveSource = Extract<PostSource, { host: string }>
 
 interface PostEntry {
   post: PostDetail
@@ -116,6 +129,11 @@ export function toViewError(error: unknown): ViewError {
   const message = typeof value.message === 'string' && value.message ? value.message : 'Something went wrong.'
   const retry = value.retryAfterSeconds
   return typeof retry === 'number' && Number.isFinite(retry) && retry > 0 ? { code, message, retryAfterSeconds: retry } : { code, message }
+}
+
+/** A render the glasses wrapper dropped because a newer frame replaced it (matched by name, not class). */
+export function isSupersededRender(error: unknown): boolean {
+  return error !== null && typeof error === 'object' && (error as { name?: unknown }).name === 'SupersededRenderError'
 }
 
 /** `${articleVersion}.${PAGINATION_VERSION}.${lines}` (Position.version). */
@@ -250,9 +268,19 @@ export function createController(deps: ControllerDeps): Controller {
     return entries
   }
 
+  /** Publications are edited on the phone while the cursor is on one: follow its host (like Home). */
+  function syncPublications(view: PublicationsState): Publication[] {
+    const publications = state.publications
+    const index = view.selHost === null ? -1 : publications.findIndex(item => item.host === view.selHost)
+    view.sel = clampIndex(index >= 0 ? index : view.sel, publications.length)
+    view.selHost = publications[view.sel]?.host ?? null
+    return publications
+  }
+
   function computeFrame(): GlassesPage {
     const view = top()
     if (view.kind === 'home') syncHome(view)
+    else if (view.kind === 'publications') syncPublications(view)
     let page = frameFor(view, state, { now: deps.now(), relayConfigured: relayConfigured() })
     if (transient) {
       page = {
@@ -265,6 +293,13 @@ export function createController(deps: ControllerDeps): Controller {
     return page
   }
 
+  /**
+   * The latest frame failed to reach the glasses, so they show an older state than the model.
+   * The next action then redraws the model instead of moving past a page or row never shown.
+   */
+  let displayStale = false
+  let drawSeq = 0
+
   /** Render the top of the stack; a shown reader page records the position afterwards. */
   function draw(): Promise<void> {
     const page = computeFrame()
@@ -272,6 +307,8 @@ export function createController(deps: ControllerDeps): Controller {
     notifyPhone()
     const view = top()
     const shown = view.kind === 'reader' && view.state === 'ready' ? positionShown(view) : null
+    drawSeq += 1
+    const seq = drawSeq
     let rendered: Promise<void>
     try {
       rendered = Promise.resolve(deps.render(page))
@@ -279,8 +316,18 @@ export function createController(deps: ControllerDeps): Controller {
       rendered = Promise.reject(error)
     }
     return rendered.then(() => {
+      if (seq === drawSeq) displayStale = false
       if (shown) afterReaderRender(shown)
-    }, () => undefined /* The glasses wrapper reports write failures. */)
+    }, error => {
+      // The glasses wrapper reports write failures; a superseded frame was replaced by a newer one.
+      if (seq === drawSeq && !isSupersededRender(error)) displayStale = true
+    })
+  }
+
+  /** Resend the whole current frame. */
+  function forceRedraw(): Promise<void> {
+    try { deps.invalidate?.() } catch { /* Optional dependency. */ }
+    return draw()
   }
 
   function hint(footer: string): Promise<void> {
@@ -336,7 +383,39 @@ export function createController(deps: ControllerDeps): Controller {
       store.save('prefs')
       notifyPhone()
     }
+    for (const view of stack) if (view.kind === 'publications' && view.selHost === from) view.selHost = to
     latestCache = null
+  }
+
+  /**
+   * A publication added while the relay could not name it stores its host as the name;
+   * adopt the name a later archive page reports (a real name is never replaced).
+   */
+  function backfillName(host: string, resolved: string, name: string) {
+    const index = state.publications.findIndex(item => item.host === host || item.host === resolved)
+    const current = state.publications[index]
+    if (!current || (current.name !== current.host && current.name !== host && current.name !== resolved)) return
+    const updated = normalizePublication({ ...current, name })
+    if (!updated || updated.name === current.name) return
+    state.publications[index] = updated
+    store.save('prefs')
+    notifyPhone()
+  }
+
+  /** The archive answered for another host (e.g. the custom domain): follow it in the list and in storage. */
+  function adoptHost(view: PostsState, source: ArchiveSource, host: string) {
+    if (host === source.host) return
+    rehost(source.host, host)
+    view.source = { ...source, host }
+  }
+
+  /** Append an older archive page, skipping posts already listed; returns the new posts. */
+  function appendPage(view: PostsState, page: { items: PostRef[]; nextOffset: number | null }): PostRef[] {
+    const known = new Set(view.items.map(refKey))
+    const fresh = page.items.filter(item => !known.has(refKey(item)))
+    view.items = [...view.items, ...fresh]
+    view.nextOffset = page.nextOffset
+    return fresh
   }
 
   // -------------------------------------------------------------------------
@@ -346,7 +425,9 @@ export function createController(deps: ControllerDeps): Controller {
     try {
       const result = await deps.api.getArchive(host, { offset, limit: ARCHIVE_PAGE_SIZE }, signal)
       const resolved = result.host || host
-      const pubName = result.page.publication?.name || name || resolved
+      const archiveName = result.page.publication?.name
+      if (archiveName) backfillName(host, resolved, archiveName)
+      const pubName = archiveName || name || resolved
       const addedAt = deps.now()
       const items: PostRef[] = []
       for (const post of result.page.posts) {
@@ -404,6 +485,8 @@ export function createController(deps: ControllerDeps): Controller {
       if (signal.aborted) return Promise.reject(new Error('Cancelled.'))
       return fetchArchive(publication.host, 0, publication.name, signal)
     })
+    // Back or another open aborted the load: its fetches "failed" by cancellation, so cache nothing.
+    if (signal.aborted) throw Object.assign(new Error('The request was cancelled.'), { code: 'ABORTED' })
     const merged: PostRef[] = []
     let failed = 0
     let firstError: unknown = null
@@ -429,10 +512,10 @@ export function createController(deps: ControllerDeps): Controller {
     return { items: [...items], failed }
   }
 
-  async function loadPosts(view: PostsState, mode: 'initial' | 'older' | 'refresh'): Promise<void> {
+  async function loadPosts(view: PostsState, mode: LoadMode): Promise<void> {
     const { gen, signal } = begin()
     const keep = mode === 'refresh' ? selectedKey(view) : null
-    view.older = mode === 'older'
+    view.pendingMode = mode
     view.state = 'loading'
     view.error = null
     void draw()
@@ -449,16 +532,10 @@ export function createController(deps: ControllerDeps): Controller {
         const offset = mode === 'older' ? view.nextOffset ?? view.items.length : 0
         const result = await fetchArchive(source.host, offset, source.name ?? '', signal)
         if (gen !== generation) return
-        if (result.host !== source.host) {
-          rehost(source.host, result.host)
-          view.source = { ...source, host: result.host }
-        }
+        adoptHost(view, source, result.host)
         if (mode === 'older') {
-          const known = new Set(view.items.map(refKey))
-          const fresh = result.items.filter(item => !known.has(refKey(item)))
           const first = view.items.length
-          view.items = [...view.items, ...fresh]
-          view.nextOffset = result.nextOffset
+          const fresh = appendPage(view, result)
           view.sel = fresh.length ? first : clampIndex(view.sel, postsRowCount(view))
         } else {
           view.items = result.items
@@ -471,7 +548,7 @@ export function createController(deps: ControllerDeps): Controller {
         selectKey(view, keep)
       }
       view.state = 'ready'
-      view.older = false
+      view.pendingMode = undefined
     } catch (error) {
       if (gen !== generation) return
       view.state = 'error'
@@ -614,9 +691,49 @@ export function createController(deps: ControllerDeps): Controller {
         list.sel = index + 1
         return openReader(next, { replace: true })
       }
+      // The last loaded post of a list with a "Load older posts" row: the next post is on the next page.
+      const source = list.source
+      if (index >= 0 && list.state === 'ready' && list.nextOffset !== null && typeof source === 'object') {
+        return nextFromArchive(view, list, source, list.nextOffset)
+      }
     }
     transient = { body: TEXT.noMorePosts, footer: TEXT.backFooter }
     return draw()
+  }
+
+  /** Load the list's next archive page (like "Load older posts"), then open its first new post. */
+  async function nextFromArchive(view: ReaderState, list: PostsState, source: ArchiveSource, offset: number): Promise<void> {
+    const { gen, signal } = begin()
+    view.state = 'loading' // Loading frame; back cancels and returns to the list (leaveReader).
+    view.error = null
+    void draw()
+    try {
+      const result = await fetchArchive(source.host, offset, source.name ?? '', signal)
+      if (gen !== generation) return
+      adoptHost(list, source, result.host)
+      const first = list.items.length
+      const next = appendPage(list, result)[0]
+      if (next) {
+        list.sel = first
+        return openReader(next, { replace: true })
+      }
+      readerReady(view)
+      transient = { body: TEXT.noMorePosts, footer: TEXT.backFooter }
+    } catch (error) {
+      if (gen !== generation) return
+      readerReady(view)
+      // One frame on the reader; on the end card a tap runs nextPost again.
+      const failure = toViewError(error)
+      const retry = view.page >= view.pages.length && isRetryable(failure)
+      transient = { body: errorBody(failure), footer: retry ? TEXT.retryFooter : TEXT.backFooter }
+    }
+    return draw()
+  }
+
+  /** Back to the page shown before nextFromArchive (a density change while loading applies now). */
+  function readerReady(view: ReaderState) {
+    view.state = 'ready'
+    if (view.lines !== state.settings.linesPerPage) repaginate(view)
   }
 
   function repaginate(view: ReaderState) {
@@ -666,7 +783,7 @@ export function createController(deps: ControllerDeps): Controller {
       case 'continue':
         return state.lastOpen ? openReader(state.lastOpen) : draw()
       case 'publications':
-        push({ kind: 'publications', sel: 0 })
+        push({ kind: 'publications', sel: 0, selHost: null })
         return draw()
       case 'latest':
       case 'saved':
@@ -675,31 +792,32 @@ export function createController(deps: ControllerDeps): Controller {
     }
   }
 
-  async function onPublications(view: PublicationsView, action: GlassesAction): Promise<void> {
+  async function onPublications(view: PublicationsState, action: GlassesAction): Promise<void> {
     if (action === 'back' || action === 'hold') {
       pop()
       return draw()
     }
-    const publications = state.publications
+    const publications = syncPublications(view)
     if (action === 'next' || action === 'previous') {
       const sel = move(view.sel, action, publications.length)
       if (sel === view.sel) return
       view.sel = sel
+      view.selHost = publications[sel]?.host ?? null
       return draw()
     }
     if (action !== 'select') return
-    const publication = publications[clampIndex(view.sel, publications.length)]
+    const publication = publications[view.sel]
     if (publication) return openPosts({ host: publication.host, name: publication.name })
   }
 
   async function onPosts(view: PostsState, action: GlassesAction): Promise<void> {
     if (action === 'back' || action === 'hold') {
       cancel()
-      if (view.state !== 'ready' && view.older && view.items.length) {
-        // A failed or cancelled "Load older" returns to the loaded list.
+      if (view.state !== 'ready' && (view.pendingMode === 'older' || view.pendingMode === 'refresh')) {
+        // A failed or cancelled "Load older" or Refresh returns to the list that was loaded.
         view.state = 'ready'
         view.error = null
-        view.older = false
+        view.pendingMode = undefined
         return draw()
       }
       pop()
@@ -707,7 +825,7 @@ export function createController(deps: ControllerDeps): Controller {
     }
     if (view.state === 'loading') return
     if (view.state === 'error') {
-      if (action === 'select' && isRetryable(view.error)) return loadPosts(view, view.older ? 'older' : 'initial')
+      if (action === 'select' && isRetryable(view.error)) return loadPosts(view, view.pendingMode ?? 'initial')
       return
     }
     const rows = postsRowCount(view)
@@ -769,7 +887,9 @@ export function createController(deps: ControllerDeps): Controller {
           store.save('prefs')
           notifyPhone()
         }
-        return hint(result === 'added' ? 'Saved for later' : result === 'exists' ? 'Already saved' : result === 'full' ? 'Saved list is full' : TEXT.notAvailable)
+        // 'full' below the count limit means the prefs document has no room left (storage).
+        const full = state.saved.length >= LIMITS.saved ? 'Saved list is full' : 'Storage is full'
+        return hint(result === 'added' ? 'Saved for later' : result === 'exists' ? 'Already saved' : result === 'full' ? full : TEXT.notAvailable)
       }
       case 3:
         if (view.kind === 'reader' && view.state === 'ready') return nextPost(view)
@@ -790,11 +910,11 @@ export function createController(deps: ControllerDeps): Controller {
             selectKey(view, key)
             return draw()
           }
-          return loadPosts(view, view.state === 'error' && view.older ? 'older' : 'refresh')
+          // A loaded list reloads; otherwise the pending or failed step runs again.
+          return loadPosts(view, view.state === 'ready' ? 'refresh' : view.pendingMode ?? 'initial')
         }
         if (view.kind === 'reader' && view.state === 'error' && isRetryable(view.error)) return loadReader(view, false)
-        try { deps.invalidate?.() } catch { /* Optional dependency. */ }
-        return draw()
+        return forceRedraw()
       default:
         return hint(TEXT.notAvailable)
     }
@@ -814,6 +934,9 @@ export function createController(deps: ControllerDeps): Controller {
     },
     async onAction(action) {
       interacted = true
+      // The wearer acted on an older frame than the model: show the model first. The root double-tap
+      // still opens the exit dialog, so glasses that keep refusing frames cannot trap the wearer.
+      if (displayStale && !(action === 'back' && stack.length === 1)) return forceRedraw()
       if (action.startsWith('menu:')) return onMenu(Number(action.slice(5)))
       const view = top()
       switch (view.kind) {
@@ -831,10 +954,7 @@ export function createController(deps: ControllerDeps): Controller {
       }
       const since = hiddenAt
       hiddenAt = null
-      if (since !== null && deps.now() - since > FOREGROUND_REDRAW_MS) {
-        try { deps.invalidate?.() } catch { /* Optional dependency. */ }
-        void draw()
-      }
+      if (since !== null && deps.now() - since > FOREGROUND_REDRAW_MS) void forceRedraw()
     },
     configurationChanged() {
       for (const view of stack) {
@@ -846,7 +966,7 @@ export function createController(deps: ControllerDeps): Controller {
       }
       const view = top()
       if (view.kind === 'home') syncHome(view)
-      else if (view.kind === 'publications') view.sel = clampIndex(view.sel, state.publications.length)
+      else if (view.kind === 'publications') syncPublications(view)
       else if (view.kind === 'reader' && view.state === 'ready' && view.lines !== state.settings.linesPerPage) repaginate(view)
       void draw()
     },
@@ -865,13 +985,10 @@ export function createController(deps: ControllerDeps): Controller {
     },
     retry() {
       const view = top()
-      if (view.kind === 'posts' && view.state === 'error') return loadPosts(view, view.older ? 'older' : 'initial')
+      if (view.kind === 'posts' && view.state === 'error') return loadPosts(view, view.pendingMode ?? 'initial')
       if (view.kind === 'reader' && view.state === 'error' && isRetryable(view.error)) return loadReader(view, false)
       return Promise.resolve()
     },
-    redraw() {
-      try { deps.invalidate?.() } catch { /* Optional dependency. */ }
-      return draw()
-    },
+    redraw: forceRedraw,
   }
 }
