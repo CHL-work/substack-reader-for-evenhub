@@ -701,7 +701,8 @@ test('contextual menu: Save for later, Restart, Home, Not available here', async
   assert.ok(t.last().footer.startsWith(`1/${pages.length}${DOT}`))
   await t.controller.onAction('menu:1')
   assert.equal(t.controller.depth(), 1)
-  assert.equal(t.last().body, `${NB}Continue: Post 81\n\n> Latest\n\n${NB}Publications (1)\n\n${NB}Saved (1)`)
+  assert.equal(t.last().body, `${NB}Continue: Post 81\n\n${NB}Latest\n\n> Publications (1)\n\n${NB}Saved (1)`,
+    'the cursor stays on the Home entry it left from')
   const count = t.frames.length
   await t.controller.onAction('menu:1')
   assert.equal(t.frames.length, count, 'Home on Home is a no-op')
