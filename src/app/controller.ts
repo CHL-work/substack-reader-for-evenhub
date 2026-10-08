@@ -46,7 +46,7 @@ export interface ControllerDeps {
   /** shutDownPageContainer(1) (root double-tap). */
   exit(): Promise<void>
   api: ReaderApi
-  /** Optional fallback when the archive is blocked: e.g. host => api.getFeedXml then parseFeed. */
+  /** Optional fallback when an archive or post is blocked: e.g. host => api.getFeedXml then parseFeed. */
   getFeed?(host: string, signal?: AbortSignal): Promise<FeedResult>
   store: Store
   /** src/substack/article.ts buildArticle (with the production converter options). */
@@ -128,6 +128,12 @@ interface PostEntry {
   host: string
   article?: Article
   articleKey?: string
+}
+
+interface FeedEntry {
+  summary: PostSummary
+  html: string
+  pubName: string
 }
 
 export const LATEST_TTL_MS = 5 * 60_000
@@ -224,7 +230,7 @@ export function createController(deps: ControllerDeps): Controller {
   let hiddenAt: number | null = null
   let latestCache: { key: string; at: number; items: PostRef[]; failed: number } | null = null
   const postCache = new Map<string, PostEntry>()
-  const feedCache = new Map<string, { summary: PostSummary; html: string; pubName: string }>()
+  const feedCache = new Map<string, FeedEntry>()
 
   const top = (): View => stack[stack.length - 1]!
 
@@ -602,6 +608,14 @@ export function createController(deps: ControllerDeps): Controller {
   // -------------------------------------------------------------------------
   // Reader
 
+  function feedPost(host: string, feed: FeedEntry): PostEntry {
+    return {
+      post: { ...feed.summary, bodyHtml: feed.html, truncated: feed.summary.isPaywalled },
+      publication: { id: null, name: feed.pubName, subdomain: null, customDomain: null, host },
+      host,
+    }
+  }
+
   async function fetchPost(ref: PostRef, signal: AbortSignal): Promise<PostEntry> {
     const key = refKey(ref)
     const cached = postCache.get(key)
@@ -613,15 +627,27 @@ export function createController(deps: ControllerDeps): Controller {
     let entry: PostEntry
     const feed = ref.slug ? feedCache.get(`${ref.host}/${ref.slug}`) : undefined
     if (feed) {
-      entry = {
-        post: { ...feed.summary, bodyHtml: feed.html, truncated: feed.summary.isPaywalled },
-        publication: { id: null, name: feed.pubName, subdomain: null, customDomain: null, host: ref.host },
-        host: ref.host,
-      }
+      entry = feedPost(ref.host, feed)
     } else {
-      const result = await deps.api.getPost(ref.slug ? { host: ref.host, slug: ref.slug } : { id: ref.postId }, signal)
-      entry = { post: result.post, publication: result.publication, host: result.host || ref.host }
+      try {
+        const result = await deps.api.getPost(ref.slug ? { host: ref.host, slug: ref.slug } : { id: ref.postId }, signal)
+        entry = { post: result.post, publication: result.publication, host: result.host || ref.host }
+      } catch (error) {
+        // Saved, History and Continue can reopen a feed post after its in-memory body is gone.
+        if (signal.aborted || !ref.slug || !deps.getFeed || !FEED_FALLBACK_CODES.has(toViewError(error).code)) throw error
+        let result: FeedResult
+        try {
+          result = await deps.getFeed(ref.host, signal)
+        } catch {
+          throw error // Keep the post error when its recent feed is also unavailable.
+        }
+        const summary = result.posts.find(post => post.slug === ref.slug)
+        const html = result.bodies.get(ref.slug)
+        if (signal.aborted || !summary || html === undefined) throw error
+        entry = feedPost(ref.host, { summary, html, pubName: ref.pubName || ref.host })
+      }
     }
+    if (signal.aborted) throw Object.assign(new Error('The request was cancelled.'), { code: 'ABORTED' })
     postCache.set(key, entry)
     while (postCache.size > POST_CACHE_SIZE) postCache.delete(postCache.keys().next().value!)
     return entry

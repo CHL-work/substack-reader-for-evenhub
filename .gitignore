@@ -11,3 +11,9 @@ coverage/
 research/
 test-results/
 playwright-report/
+
+# Project-owned local workspace, tools, and caches
+.worktrees/
+.tools/
+.local/
+.pnpm-store/

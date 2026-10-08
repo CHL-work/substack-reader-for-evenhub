@@ -13,7 +13,8 @@ import {
   addPublication, addSaved, clearReading, isSaved, normalizeSettings, refKey, rehostPublication,
   removePublication, removeSaved, reorderItem, type AddResult, type Store,
 } from '../storage'
-import { appendPosts, type RelayApi } from '../substack/api'
+import { appendPosts, type ArchiveResult, type RelayApi } from '../substack/api'
+import { parseFeed, type FeedResult } from '../substack/feed'
 import { ARCHIVE_PAGE_SIZE, type PostSummary, type PubMeta } from '../substack/types'
 import { INVALID_REASONS, parseMany, wwwAlternative, type ParsedInput } from '../substack/urls'
 import {
@@ -21,7 +22,7 @@ import {
   type AddCard, type BrowseState, type GlassesLink, type PhoneError, type PhoneModel, type PhonePanel,
 } from './view'
 
-export type PhoneApi = Pick<RelayApi, 'getArchive' | 'getPost' | 'getProfile' | 'searchPublications' | 'getHealth'>
+export type PhoneApi = Pick<RelayApi, 'getArchive' | 'getPost' | 'getProfile' | 'searchPublications' | 'getHealth' | 'getFeedXml'>
 
 export interface PhoneDeps {
   root: HTMLElement
@@ -75,6 +76,7 @@ const LIBRARY_ACTIONS = new Set([
 ])
 const LIBRARY_LOADING = `Loading your library${String.fromCharCode(0x2026)}`
 const COPY_BLOCKED = 'Copying is not allowed here. Press and hold the link below to copy it.'
+const FEED_FALLBACK_CODES = new Set(['UPSTREAM_BLOCKED', 'UPSTREAM_RATE_LIMITED', 'UPSTREAM_UNAVAILABLE'])
 const SUMMARY_FIELDS = [
   'id', 'publicationId', 'slug', 'title', 'subtitle', 'postDate', 'audience', 'isPaywalled',
   'type', 'wordcount', 'canonicalUrl', 'authors', 'podcastDurationSec',
@@ -383,6 +385,47 @@ export function createPhoneApp(deps: PhoneDeps): PhoneApp {
     }
   }
 
+  /** One feed attempt after an upstream refusal; retain the API error if RSS cannot help. */
+  async function feedAfterError(host: string, ctx: RunContext, original: unknown): Promise<FeedResult> {
+    if (!ctx.live() || ctx.signal.aborted) throw abortedError()
+    if (!FEED_FALLBACK_CODES.has(codeOf(original))) throw original
+    try {
+      const xml = await api.getFeedXml(host, ctx.signal)
+      if (!ctx.live() || ctx.signal.aborted) throw abortedError()
+      return parseFeed(xml, host)
+    } catch {
+      if (!ctx.live() || ctx.signal.aborted) throw abortedError()
+      throw original
+    }
+  }
+
+  function feedPublication(host: string, feed: FeedResult): PubMeta {
+    return { id: null, name: feed.title || host, subdomain: null, customDomain: null, host }
+  }
+
+  /** RSS has only recent posts, so it can replace the first page but never an older page. */
+  async function archiveWithFeed(host: string, offset: number, ctx: RunContext): Promise<ArchiveResult> {
+    try {
+      return await api.getArchive(host, { offset, limit: ARCHIVE_PAGE_SIZE }, ctx.signal)
+    } catch (err) {
+      if (offset !== 0) throw err
+      const feed = await feedAfterError(host, ctx, err)
+      return { host, page: { publication: feedPublication(host, feed), posts: feed.posts, nextOffset: null } }
+    }
+  }
+
+  /** A pasted post URL can be resolved from recent RSS items; the phone retains only its summary. */
+  async function postWithFeed(host: string, slug: string, ctx: RunContext): Promise<{ post: PostSummary; publication: PubMeta | null; host: string }> {
+    try {
+      return await api.getPost({ host, slug }, ctx.signal)
+    } catch (err) {
+      const feed = await feedAfterError(host, ctx, err)
+      const post = feed.posts.find(item => item.slug === slug)
+      if (!post) throw err
+      return { post, publication: feedPublication(host, feed), host }
+    }
+  }
+
   /** The publication's name when the archive could not tell (no post byline names it). */
   async function nameFromPost(postId: number, host: string, ctx: RunContext): Promise<string | null> {
     try {
@@ -396,7 +439,7 @@ export function createPhoneApp(deps: PhoneDeps): PhoneApp {
 
   async function followHost(host: string, ctx: RunContext): Promise<{ text: string; tone: 'ok' | 'info' }> {
     // A full page: the relay finds the publication through post bylines, and one post may have none.
-    const result = await withWwwRetry(host, ctx, target => api.getArchive(target, { offset: 0, limit: ARCHIVE_PAGE_SIZE }, ctx.signal))
+    const result = await withWwwRetry(host, ctx, target => archiveWithFeed(target, 0, ctx))
     if (!ctx.live()) throw abortedError()
     const pub = result.page.publication
     const first = result.page.posts[0]
@@ -425,7 +468,7 @@ export function createPhoneApp(deps: PhoneDeps): PhoneApp {
         case 'post':
         case 'postId': {
           const result = parsed.kind === 'post'
-            ? await withWwwRetry(parsed.host, ctx, host => api.getPost({ host, slug: parsed.slug }, ctx.signal))
+            ? await withWwwRetry(parsed.host, ctx, host => postWithFeed(host, parsed.slug, ctx))
             : await api.getPost({ id: parsed.id }, ctx.signal)
           return { id, kind: 'post', label, post: summaryOf(result.post), publication: result.publication, host: result.host }
         }
@@ -584,7 +627,7 @@ export function createPhoneApp(deps: PhoneDeps): PhoneApp {
     const current = browse
     if (!current) return
     const offset = more ? current.nextOffset ?? current.posts.length : 0
-    const result = await api.getArchive(current.host, { offset, limit: ARCHIVE_PAGE_SIZE }, ctx.signal)
+    const result = await archiveWithFeed(current.host, offset, ctx)
     if (!ctx.live() || browse !== current) return
     if (result.host !== current.host) {
       if (rehostPublication(state, current.host, result.host)) changed('prefs')

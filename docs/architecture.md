@@ -49,12 +49,15 @@ G2 glasses  <--BLE-->  Even app  -->  WebView: index.html + JS bundle (the .ehpk
 
 1. The user taps a post in a glasses list. The controller pushes a reader view and renders `Loading…` before anything is awaited.
 2. `api.getPost({host, slug})` (or `{id}` for share links) calls `GET <relay>/v1/post`. The relay fetches Substack and returns the trimmed post with its `bodyHtml`.
+   If a host-and-slug request is blocked, rate-limited or unavailable upstream, the controller tries the publication's RSS feed once and uses the exact matching slug. This also works from Saved, History and Continue after a restart, without first opening the publication list. Failed feeds or missing items preserve the original post error. Numeric-id lookups have no feed fallback.
 3. `buildArticle()` converts the HTML with `htmlToReaderText()` and prepends the header block. Converted articles are cached in memory (10 posts).
 4. `paginate()` splits the text for the current lines-per-page setting.
 5. A saved position opens at the page that contains its character offset. The offset is kept when only the lines-per-page setting changed; if the text itself may differ (a new converter version, different text settings or a new pagination version), the stored fraction of the post is used instead. A finished post reopens at page 1.
 6. The page is rendered as `{title, body, footer}`. After the glasses accept the write, the position is recorded and saved (debounced 800 ms; flushed at once on back, on opening another post, when the app goes to the background, on `pagehide` and on exit).
 
 If the relay redirects to another host (a publication moved to a custom domain), the stored publication and post references are updated to `meta.host`.
+
+Phone publication adding and Browse use the same first-page RSS recovery for `UPSTREAM_BLOCKED`, `UPSTREAM_RATE_LIMITED` and `UPSTREAM_UNAVAILABLE`. A pasted post URL can also use its matching recent feed item. RSS supplies the channel name and summaries, with no older-page cursor. Phone state and saved references discard article bodies; the glasses retain them only in memory. Navigation cancellation prevents late feed results from changing the library or display. Relay rate limits, validation errors, missing posts, search and profile lookups do not trigger this recovery.
 
 ## Lists
 

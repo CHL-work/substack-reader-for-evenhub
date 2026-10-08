@@ -979,6 +979,133 @@ test('a blocked archive falls back to the feed and opens posts from the feed HTM
   assert.deepEqual(t.last(), { title: 'Beta', body: 'That site is not a Substack publication.', footer: `Tap retry${DOT}2${X}tap back` })
 })
 
+for (const [source, code] of [
+  ['saved', 'UPSTREAM_RATE_LIMITED'],
+  ['history', 'UPSTREAM_BLOCKED'],
+  ['continue', 'UPSTREAM_UNAVAILABLE'],
+] as const) {
+  test(`cold ${source} reading retries an unavailable post through its exact feed slug`, async () => {
+    const saved = ref(-5, { slug: 'feed-one', title: 'Feed one' })
+    const pages = pagesOf(5)
+    const feedCalls: Array<{ host: string; signal?: AbortSignal }> = []
+    const t = await setup({
+      publications: [pub(ALPHA, 'Alpha')],
+      saved: source === 'saved' ? [saved] : [],
+      lastOpen: source === 'continue' ? saved : null,
+      settings: { homeItems: source === 'history' ? ['history'] : ['saved'] },
+      positions: source === 'continue'
+        ? [{ postId: -5, offset: pages[2]!.start, fraction: 2 / pages.length, page: 2, pages: pages.length, version: positionVersion('1', 7), updatedAt: 1 }]
+        : [],
+      async getFeed(host, signal) {
+        feedCalls.push({ host, signal })
+        return {
+          posts: [summary(-6, { slug: 'feed-two' }), summary(-5, { slug: 'feed-one', title: 'Feed one', isPaywalled: true, audience: 'only_paid' })],
+          bodies: new Map([['feed-two', bodyText(6)], ['feed-one', bodyText(5)]]),
+        }
+      },
+    })
+    if (source === 'history') t.store.state.history = [saved]
+    await t.controller.start()
+    if (source !== 'continue') await t.controller.onAction('select')
+    const opening = t.controller.onAction('select')
+    const call = t.api.posts[0]!
+    assert.deepEqual(call.ref, { host: ALPHA, slug: 'feed-one' })
+    call.reply.reject({ code, message: 'The post API is unavailable.' })
+    await opening
+    assert.deepEqual(feedCalls, [{ host: ALPHA, signal: call.signal }])
+    assert.equal(t.api.archive.length, 0, 'cold reading does not depend on first browsing the archive')
+    assert.equal(t.last().body, pages[source === 'continue' ? 2 : 0]!.text)
+    assert.equal(t.controller.lastError(), null)
+    assert.equal(t.store.state.lastOpen?.postId, -5)
+    assert.equal(t.store.state.lastOpen?.isPaywalled, true, 'the feed preview remains marked paid')
+    await t.store.flush()
+    assert.ok(![...t.data.values()].join('').includes('Paragraph 1 of post 5'), 'fallback text remains in memory only')
+  })
+}
+
+test('a cold post keeps its original error when the feed fails or lacks the exact post body', async () => {
+  const original = { code: 'UPSTREAM_RATE_LIMITED', message: 'Substack is busy.', retryAfterSeconds: 120 }
+  for (const outcome of ['failed', 'different-slug', 'missing-body'] as const) {
+    let feedCalls = 0
+    const t = await setup({
+      saved: [ref(5)],
+      async getFeed() {
+        feedCalls += 1
+        if (outcome === 'failed') throw { code: 'NETWORK_ERROR', message: 'Feed unavailable.' }
+        return {
+          posts: [summary(5, { slug: outcome === 'different-slug' ? 'post-50' : 'post-5' })],
+          bodies: new Map(outcome === 'missing-body' ? [] : [['post-50', bodyText(50)]]),
+        }
+      },
+    })
+    const { done: opening } = await openSaved(t)
+    t.api.posts[0]!.reply.reject(original)
+    await opening
+    assert.equal(feedCalls, 1)
+    assert.deepEqual(t.controller.lastError(), original, outcome)
+    assert.equal(t.store.state.history.length, 0)
+  }
+})
+
+test('cold post fallback respects ineligible failures and references without a slug', async () => {
+  for (const [slug, code] of [['post-5', 'HOST_NOT_SUBSTACK'], ['post-5', 'RATE_LIMITED'], ['', 'UPSTREAM_RATE_LIMITED']] as const) {
+    let feedCalls = 0
+    const t = await setup({
+      saved: [ref(5, { slug })],
+      async getFeed() { feedCalls += 1; return { posts: [], bodies: new Map() } },
+    })
+    const { done: opening } = await openSaved(t)
+    const original = { code, message: 'Post unavailable.' }
+    t.api.posts[0]!.reply.reject(original)
+    await opening
+    assert.equal(feedCalls, 0)
+    assert.deepEqual(t.controller.lastError(), original)
+  }
+})
+
+test('cancelling a cold post before its API failure does not start a feed request', async () => {
+  let feedCalls = 0
+  const t = await setup({
+    saved: [ref(5)],
+    async getFeed() { feedCalls += 1; return { posts: [], bodies: new Map() } },
+  })
+  const { done: opening } = await openSaved(t)
+  await t.controller.onAction('back')
+  const frames = t.frames.length
+  t.api.posts[0]!.reply.reject({ code: 'UPSTREAM_RATE_LIMITED', message: 'busy' })
+  await opening
+  assert.equal(feedCalls, 0)
+  assert.equal(t.frames.length, frames)
+  assert.equal(t.last().title, 'Saved')
+})
+
+test('a cancelled cold feed response neither redraws nor populates the post cache', async () => {
+  const feed = deferred<FeedResult>()
+  let feedSignal: AbortSignal | undefined
+  const t = await setup({
+    saved: [ref(5)],
+    getFeed(_host, signal) { feedSignal = signal; return feed.promise },
+  })
+  const { done: opening } = await openSaved(t)
+  t.api.posts[0]!.reply.reject({ code: 'UPSTREAM_RATE_LIMITED', message: 'busy' })
+  await flushPromises()
+  assert.equal(feedSignal, t.api.posts[0]!.signal)
+  await t.controller.onAction('back')
+  assert.equal(feedSignal?.aborted, true)
+  const frames = t.frames.length
+  feed.resolve({ posts: [summary(5)], bodies: new Map([['post-5', bodyText(5)]]) })
+  await opening
+  assert.equal(t.frames.length, frames)
+  assert.equal(t.last().title, 'Saved')
+  assert.equal(t.store.state.history.length, 0)
+  assert.equal(t.store.state.lastOpen, null)
+  const reopened = t.controller.onAction('select')
+  assert.equal(t.api.posts.length, 2, 'a cancelled feed body must not satisfy a later open')
+  t.api.posts[1]!.reply.resolve(postReply(5))
+  await reopened
+  assert.equal(t.last().body, pagesOf(5)[0]!.text)
+})
+
 test('Save for later says Storage is full when the prefs document has no room, below the count limit', async () => {
   // Long references fill the 48k prefs document well before 100 saved posts.
   const long = (id: number) => ref(id, { slug: `p${id}-${'s'.repeat(190)}`, title: 'T'.repeat(200), pubName: 'P'.repeat(120) })

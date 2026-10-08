@@ -2,7 +2,7 @@
 
 Run this on real G2 glasses with the packaged build. Tick an item only after you have observed it, and write down what you saw (values, codes, firmware and Even app versions). CI cannot cover any of this: it uses a stub of the Even bridge.
 
-Build under test: `artifacts/substack-reader-0.1.0.ehpk` (version ______, relay origin ______, SHA-256 ______).
+Build under test: `artifacts/substack-reader-0.1.1.ehpk` (version ______, relay origin ______, SHA-256 ______).
 
 Upload it at hub.evenrealities.com (your project → Builds → upload the build, with a change log). Then **promote it from Private to Beta**; forgetting this step caused the "expired" message in the LIHKG reader. Install or update it as a tester in the Even app (Me → Beta tester).
 

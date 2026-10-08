@@ -19,7 +19,7 @@ The relay (`worker/relay.ts`) can run on OpenAI Sites (`*.chatgpt.site`, the hos
 2. **Create `.openai/hosting.json`** at the repository root with the JSON above. The id is not a secret, so you may commit it; never commit Sites credentials.
 3. **Build** (PowerShell, portable Node). The relay bundle does not depend on `VITE_RELAY_ORIGIN`.
    ```powershell
-   $env:PATH = "C:\Code\.tools\node;$env:PATH"; $env:COREPACK_ENABLE_DOWNLOAD_PROMPT = "0"
+   $env:PATH = "C:\Code\substack-reader-for-evenhub\.tools\node;$env:PATH"; $env:COREPACK_ENABLE_DOWNLOAD_PROMPT = "0"
    pnpm install
    pnpm run build
    ```

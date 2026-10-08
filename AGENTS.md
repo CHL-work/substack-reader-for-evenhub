@@ -7,7 +7,7 @@ Even Hub plugin (Vite + TypeScript, `@evenrealities/even_hub_sdk` 0.0.16) that s
 ## Hard rules
 
 1. **No local runtime tests.** Never run `scripts/ci-tests.mjs`, `scripts/browser-ci.mjs`, `scripts/ui-ci.mjs`, `node --test`, Playwright, a Vite dev or preview server, a browser against the app, or the Even simulator on the owner's machine. Allowed locally: `pnpm install`, `pnpm run check`, `pnpm run build`, `pnpm run pack`, `node --check <file>`, and `node scripts/ci-status.mjs` (it only queries GitHub). Tests run in GitHub Actions only.
-2. **Use the portable toolchain.** There is no system Node. Per command, PowerShell: `$env:PATH = "C:\Code\.tools\node;$env:PATH"; $env:COREPACK_ENABLE_DOWNLOAD_PROMPT = "0"`. Bash: `export PATH="/c/Code/.tools/node:$PATH" COREPACK_ENABLE_DOWNLOAD_PROMPT=0`. pnpm 10.32.1 comes from corepack. Install with the committed lockfile.
+2. **Use the portable toolchain.** There is no system Node. Per command, PowerShell: `$env:PATH = "C:\Code\substack-reader-for-evenhub\.tools\node;$env:PATH"; $env:COREPACK_ENABLE_DOWNLOAD_PROMPT = "0"`. Bash: `export PATH="/c/Code/substack-reader-for-evenhub/.tools/node:$PATH" COREPACK_ENABLE_DOWNLOAD_PROMPT=0`. pnpm 10.32.1 comes from corepack. Install with the committed lockfile.
 3. **CI is the test loop.** Work on a branch, push, run `node scripts/ci-status.mjs --wait`, read the annotations it prints (job logs need a GitHub login), fix, repeat. Fast-forward `main` only after CI is green.
 4. **Write tests you cannot run with care.** Trace every expectation by hand against the code, keep tests deterministic (fake clocks from `tests/unit/helpers.ts`), add a regression test for each bug fixed, and update existing expectations whenever behaviour changes.
 5. **The relay stays honest.** Never spoof a browser User-Agent or Referer, rotate IPs, replay Substack cookies, log requests, or add a public CORS proxy. The User-Agent is exactly `SubstackReaderForEvenHub/<version>` with no URL in it.
@@ -17,6 +17,7 @@ Even Hub plugin (Vite + TypeScript, `@evenrealities/even_hub_sdk` 0.0.16) that s
 9. **Versions and names.** Keep `version` equal in `package.json` and `app.json`, and the display name equal in `app.json` and `APP_NAME` (`src/config.ts`); `scripts/pack.mjs` enforces both. Never pass `-c`/`--check` to `evenhub pack`.
 10. **Docs follow the code.** Update `README.md` and `docs/*.md` in the same commit as any behaviour change. `docs/background/` is a point-in-time archive; do not edit it except to add new records.
 11. **Do not touch** `C:\Code\lihkg-reader-for-evenhub` (the owner's sibling project; read-only reference).
+12. **Keep local files with their repository.** `C:\Code` contains only the four canonical repositories; this project's linked worktrees belong in `.worktrees/`, portable tools in `.tools/`, and local research or scratch files in `.local/research/`. These directories are ignored. Use Git worktree commands to create or relocate worktrees, and keep `.env` in the repository root. See [README.md](README.md#local-workspace-layout).
 
 ## Commits
 

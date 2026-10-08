@@ -116,6 +116,12 @@ The **Deploy relay** workflow runs this probe once after each deploy when `VITE_
 
 ## Deployment options
 
+### Current deployment (2026-10-07)
+
+The account's relay is live at `https://substack-reader-relay.chihin-lau-work.workers.dev`. Both GitHub deployment secrets and `VITE_RELAY_ORIGIN` are configured. The [first deployment](https://github.com/CHL-work/substack-reader-for-evenhub/actions/runs/37723359582) used revision `0f8c717` and passed deployment checks, but all three API probes returned upstream HTTP 429. A direct archive request returned `UPSTREAM_RATE_LIMITED`; RSS requests for `on.substack.com` and `www.slowboring.com` returned 200 (the latter contained 20 items).
+
+This is partial upstream availability. Version 0.1.1 uses the existing RSS route for phone publication adding/Browse and for reopening recent posts on glasses, including after restart. Search, profile imports, numeric post IDs and posts no longer in RSS still depend on the API. The optional third-party rss2json service remains disabled. The account token has Workers Scripts Write only and expires January 6, 2027; replace the GitHub secret before the next deployment after expiry. Expiry does not stop the already deployed Worker.
+
 ### Cloudflare Workers with GitHub Actions (default)
 
 `wrangler.toml` deploys `worker/relay.ts` as `substack-reader-relay` with `workers_dev = true`, observability off, and the `RL` and `RL_STRICT` rate-limit bindings. Wrangler is an exact devDependency (`wrangler` 4.148.0, locked in `pnpm-lock.yaml`), so the deploy never resolves a fresh dependency tree while the API token is in its environment.
@@ -130,7 +136,7 @@ A custom domain for the Worker (configured in Cloudflare) gives a more stable or
 ### Cloudflare Workers from your computer
 
 ```powershell
-$env:PATH = "C:\Code\.tools\node;$env:PATH"; $env:COREPACK_ENABLE_DOWNLOAD_PROMPT = "0"
+$env:PATH = "C:\Code\substack-reader-for-evenhub\.tools\node;$env:PATH"; $env:COREPACK_ENABLE_DOWNLOAD_PROMPT = "0"
 pnpm install --frozen-lockfile
 pnpm exec wrangler login
 pnpm exec wrangler deploy --var REVISION:manual

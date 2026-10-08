@@ -1,44 +1,47 @@
 # Handoff: Reader for Substack (Even Hub plugin for Even G2)
 
-State as of **2026-10-07**, commit `228e20f` on `main` (the same commit as branch `feat/reader-v0.1`). CI is green on it.
+State as of **2026-10-07**: deployed relay and v0.1.0 baseline `0f8c717` on `origin/main` and `origin/feat/reader-v0.1`. [Manual CI on `main`](https://github.com/CHL-work/substack-reader-for-evenhub/actions/runs/37723032892) passed all suites and uploaded v0.1.0. The relay is deployed and v0.1.0 is uploaded to Even Hub as **Private, not Beta**. v0.1.1 RSS corrections are implemented and packaged locally on `deploy/cloudflare-setup`, awaiting branch CI and upload.
 
 Read this file first, then [AGENTS.md](../AGENTS.md) (rules), then the docs it points to. The [README](../README.md) is written for the owner; this file is written for the next agent.
 
 ## 1. In one paragraph
 
-Reader for Substack is an Even Hub plugin: a Vite + TypeScript web app (no UI framework) that runs inside the Even Realities phone app's WebView and shows public Substack posts as paginated text on Even G2 glasses through `@evenrealities/even_hub_sdk` 0.0.16. Substack sends no CORS headers and the Even WebView enforces both CORS and the `app.json` network whitelist, so all Substack traffic goes through a small stateless relay (`worker/relay.ts`) that the owner hosts on Cloudflare Workers. v0.1.0 is feature-complete, has been through three adversarial review rounds (all findings fixed), and passes every CI check. **It has never run on real glasses, and the relay has never been deployed.** The single blocker for a usable `.ehpk` is the owner deploying the relay and setting the `VITE_RELAY_ORIGIN` repository variable.
+Reader for Substack is an Even Hub plugin: a Vite + TypeScript web app (no UI framework) that runs inside the Even Realities phone app's WebView and shows public Substack posts as paginated text on Even G2 glasses through `@evenrealities/even_hub_sdk` 0.0.16. Substack sends no CORS headers and the Even WebView enforces both CORS and the `app.json` network whitelist, so all Substack traffic goes through a small stateless relay (`worker/relay.ts`) now deployed at `https://substack-reader-relay.chihin-lau-work.workers.dev`. v0.1.0 passed CI and is a Private Even Hub build. Live checks found all three Substack API probes returning 429, while the `on.substack.com` and `www.slowboring.com` RSS feeds returned 200 (20 items counted in the latter). This exposed missing RSS recovery in phone flows and cold glasses reading; v0.1.1 fixes are implemented with regression tests and packaged locally, awaiting CI and upload. Built-in relay RSS fallback is enabled; only the optional rss2json service is disabled. **Real glasses operation remains unverified.**
 
 ## 2. Status
 
 | Area | State | Evidence |
 | --- | --- | --- |
-| Phone UI (add by link / custom domain / @handle import / search, browse, Saved, settings, diagnostics, about) | Done | CI UI flows (`scripts/ui-ci.mjs`, Chromium with a stubbed Even bridge) |
-| Glasses UI (Home, Latest, Publications, Saved, History, reader with resume, end card, contextual menu, error frames) | Done | CI unit tests (`tests/unit/controller.test.ts`, `frames.test.ts`) and UI flows |
+| Phone UI (add by link / custom domain / @handle import / search, browse, Saved, settings, diagnostics, about) | v0.1.0 passed CI; v0.1.1 RSS recovery for adding links and browsing implemented, awaiting CI | New regression flows in `scripts/ui-ci.mjs` |
+| Glasses UI (Home, Latest, Publications, Saved, History, reader with resume, end card, contextual menu, error frames) | v0.1.0 passed CI; v0.1.1 cold Saved/History/Continue RSS recovery implemented, awaiting CI | New unit regressions in `tests/unit/controller.test.ts` and UI flows |
 | Substack HTML to glasses text | Done | CI browser tests on 11+ synthetic fixtures (`tests/browser/html.test.ts`) |
-| Relay (routes, allowlist, custom-domain checks, caps, rate limits, cache, CSP) | Done, **not deployed** | CI unit tests with stubbed `fetch` (`tests/unit/relay.test.ts`) |
+| Relay (routes, allowlist, custom-domain checks, caps, rate limits, cache, CSP) | **Deployed**, revision `0f8c717`, protocol 1 | [Deploy run 37723359582](https://github.com/CHL-work/substack-reader-for-evenhub/actions/runs/37723359582) succeeded |
 | Storage (bridge storage + localStorage mirror, merge, sync stamps) | Done | CI unit tests (`tests/unit/storage.test.ts`) and UI scenarios 12–12e |
-| Packaging (`.ehpk`) | Pipeline done; only dry runs with a placeholder origin | `scripts/pack.mjs`; CI packs once `VITE_RELAY_ORIGIN` is set |
+| Cloudflare setup | `workers.dev` ready; both `CLOUDFLARE_API_TOKEN` and `CLOUDFLARE_ACCOUNT_ID` encrypted GitHub secrets saved; `VITE_RELAY_ORIGIN` variable saved | Authorized Workers Scripts Write token expires 2027-01-06 |
+| Packaging (`.ehpk`) | v0.1.0 local and CI packages built for the deployed origin; v0.1.1 local build/pack passed, branch CI pending | [CI run](https://github.com/CHL-work/substack-reader-for-evenhub/actions/runs/37723032892) passed all suites and uploaded v0.1.0; optional rss2json disabled |
 | Real G2 hardware | **Not verified** | [device-checklist.md](device-checklist.md) is all unchecked |
-| Substack accepting the relay's Cloudflare egress | **Not verified (biggest risk)** | Check `/v1/health?probe=1` after deploy |
-| Even Hub listing / review | Not started | See section 3C |
+| Substack reachability | API probes all 429; two tested RSS feeds 200; 20 items counted for Slow Boring | `subdomain`, `customDomain`, `substackCom` probes; RSS for `on.substack.com` and `www.slowboring.com` |
+| Even Hub | Project `com.chlwork.substackreader` created; v0.1.0 uploaded **Private, not Beta** | v0.1.1 upload and Beta promotion remain; public listing/review not started |
 
-CI runs at the current commit: `node scripts/ci-status.mjs 228e20f`.
+CI runs at the code baseline: `node scripts/ci-status.mjs 0f8c717`.
+
+Local v0.1.0 package: `artifacts/substack-reader-0.1.0.ehpk`, 117,929 bytes, SHA-256 `165c1ffe92992ebb0ba6d358783503c4835f29735727b501457a08d9d8a41cbd`. Its only network whitelist entry is the deployed relay origin; the CLI stamped minimum Even app version 2.2.10 for SDK 0.0.16. It lacks the pending v0.1.1 RSS corrections; packaging does not verify device operation.
+
+Local v0.1.1 package: `artifacts/substack-reader-0.1.1.ehpk`, 118,238 bytes, SHA-256 `6f653b9ea133298bae4c6259a809003ff0b7be8530bf173b85f839d264fff750`. Build and pack passed with the sole relay whitelist entry and minimum Even app version 2.2.10. Wait for its branch CI before upload.
 
 ## 3. What to do next
 
-### 3A. Owner actions (need the owner's accounts; an agent cannot do these)
+### 3A. Remaining v0.1.1 validation and installation steps
 
-1. **Deploy the relay** (Cloudflare Workers, the owner's chosen host):
-   - In Cloudflare, create an API token with **Workers Scripts: Edit**, and make sure the account has a `workers.dev` subdomain.
-   - In GitHub (Settings → Secrets and variables → Actions → Secrets), add `CLOUDFLARE_API_TOKEN` and `CLOUDFLARE_ACCOUNT_ID`.
-   - Run **Actions → Deploy relay → Run workflow**. It type-checks, runs the unit tests, deploys with the locked wrangler 4.148.0, and (once step 2 is done) probes Substack from the relay and writes the result to the job summary.
-   - Alternative: run `pnpm exec wrangler login` locally, then an agent can run `pnpm exec wrangler deploy` (README "Cloudflare, from your computer").
-2. **Set the repository variable** `VITE_RELAY_ORIGIN` to the Worker origin, e.g. `https://substack-reader-relay.<subdomain>.workers.dev` (a variable, not a secret; it ends up in the package whitelist). Re-run **Deploy relay** once so its probe step runs.
-3. **Get the package:** run **Actions → CI → Run workflow** (or push any commit). The `substack-reader-ehpk` artifact contains `substack-reader-0.1.0.ehpk`. For a release instead: publish a GitHub pre-release tagged `v0.1.0-alpha.1`; `release.yml` attaches the `.ehpk`.
-4. **Upload to Even Hub:** hub.evenrealities.com → the project for `com.chlwork.substackreader` → Builds → upload, add a change log, then **promote Private → Beta** (forgetting this caused an "expired" message in the LIHKG reader). Install it as a tester from the Even app (Me → Beta tester).
+An agent can perform the account steps with authorized access. Physical phone and glasses testing requires the owner.
+
+1. **Validate v0.1.1 in branch CI.** The phone now retries eligible publication/post-link lookup and initial browse failures through the relay's RSS feed. The controller retries eligible cold post failures through the same feed, requiring the exact slug and a body. Missing posts or a failed feed preserve the original API error; cancellation must not draw or cache stale text. Unit/UI regressions are written; the local type check passed, but runtime tests must run in GitHub Actions only. Commit and push `deploy/cloudflare-setup`, wait for green CI, then fast-forward `main`.
+2. **Confirm the v0.1.1 CI package** with the saved `VITE_RELAY_ORIGIN`; the local build above is ready. Keep its sole relay whitelist entry and optional rss2json disabled. The already successful CI artifact is v0.1.0, so it does not contain these fixes.
+3. **Keep relay status accurate.** The deployed revision is `0f8c717`; any later deployment should be followed by checking `/v1/health?probe=1` and a feed route. The workflow only warns about a revision mismatch or upstream failure. API-only search and @handle import can remain unavailable even when RSS reading works; feed recovery covers recent items only. Both GitHub secrets are configured. Rotate the API token before 2027-01-06.
+4. **Upload v0.1.1 to the existing Even Hub project:** hub.evenrealities.com → `com.chlwork.substackreader` → Builds → upload with a change log, then **promote Private → Beta** (forgetting this caused an "expired" message in the LIHKG reader). The current v0.1.0 build is Private. Install the corrected build as a tester from the Even app (Me → Beta tester).
 5. **Walk through [device-checklist.md](device-checklist.md) on real glasses** and record the results (the Diagnostics panel shows raw glasses events and the relay health).
 
-### 3B. Agent tasks once the owner reports back
+### 3B. Follow-up after deployment and device testing
 
 1. **Interpret the relay probe** (`/v1/health?probe=1`, or the Deploy relay job summary). It probes one `*.substack.com` archive, one custom-domain archive and `substack.com` search:
 
@@ -47,7 +50,7 @@ CI runs at the current commit: `node scripts/ci-status.mjs 228e20f`.
    | All 200 | Substack accepts the relay | Nothing; proceed to device testing |
    | `subdomain` 403/challenge, `customDomain` 200 | Substack blocks this egress for `*.substack.com` only (seen from GitHub Actions IPs during research) | Try another host (OpenAI Sites: `.openai/README-sites.md`; Deno Deploy/Vercel per `docs/relay.md` "Other hosts"), or enable the rss2json fallback (`ENABLE_RSS2JSON_FALLBACK=1`, owner decision: off) |
    | `substackCom` 403 or empty | Search and @handle import fail; links still work | Same options; the phone already falls back to "paste a link" |
-   | 429 | Shared-egress rate limiting | Raise edge cache TTLs in `worker/relay.ts`; do not add retries that hammer Substack |
+   | 429 | Shared-egress rate limiting; observed on all three deployed API probes | Use built-in RSS recovery for recent posts when feeds answer; respect retry delays and do not hammer Substack |
 
    Never "fix" a block by spoofing a browser User-Agent, rotating IPs or replaying cookies. The owner's projects explicitly forbid that.
 2. **Act on device results.** Likely adjustments and where they live:
@@ -95,8 +98,8 @@ These were found in review and deliberately left as they are, or only partly fix
 ## 4. How to work on this repo (summary; the rules are in AGENTS.md)
 
 - **No local runtime tests.** The owner's standing rule (also for the LIHKG reader): never run the test runners, a dev server, Playwright, a browser or the Even simulator locally. Locally only `pnpm install`, `pnpm run check`, `pnpm run build`, `pnpm run pack`, and `node --check`. Every test runner throws unless `CI=true`.
-- **Toolchain:** no system Node. Portable Node 22.23.3 with a corepack pnpm 10.32.1 shim is in `C:\Code\.tools\node`; prepend it to `PATH` per command (PowerShell: `$env:PATH = "C:\Code\.tools\node;$env:PATH"; $env:COREPACK_ENABLE_DOWNLOAD_PROMPT = "0"`; Bash: `export PATH="/c/Code/.tools/node:$PATH" COREPACK_ENABLE_DOWNLOAD_PROMPT=0`).
-- **The CI loop is the test loop:** commit on a branch, push, then `node scripts/ci-status.mjs --wait`. GitHub job logs need a login (there is no `gh` CLI and the browser is not signed in), so the test runners publish failure details as annotations (`scripts/ci-annotate.mjs`), which the status script prints. Anonymous GitHub API calls are limited to 60 per hour.
+- **Toolchain:** no system Node. Portable Node 22.23.3 with a corepack pnpm 10.32.1 shim is in `C:\Code\substack-reader-for-evenhub\.tools\node`; prepend it to `PATH` per command (PowerShell: `$env:PATH = "C:\Code\substack-reader-for-evenhub\.tools\node;$env:PATH"; $env:COREPACK_ENABLE_DOWNLOAD_PROMPT = "0"`; Bash: `export PATH="/c/Code/substack-reader-for-evenhub/.tools/node:$PATH" COREPACK_ENABLE_DOWNLOAD_PROMPT=0`).
+- **The CI loop is the test loop:** commit on a branch, push, then `node scripts/ci-status.mjs --wait`. GitHub job logs need a login (there is no `gh` CLI), so the test runners publish failure details as annotations (`scripts/ci-annotate.mjs`), which the status script prints. Anonymous GitHub API calls are limited to 60 per hour.
 - **Tests:** write them carefully because you cannot run them: trace each expectation against the code, keep them deterministic (fake clocks; see `tests/unit/helpers.ts`), and update existing expectations whenever behaviour changes. Conventions: `tests/unit/*.test.ts` (`node:test`, bundled by esbuild), `tests/browser/*.test.ts` (Chromium, every network request aborted, uses `tests/browser/harness.ts`), `scripts/ui-ci.mjs` (production build with a stubbed Even bridge and a fake relay at `https://relay.ci.invalid`). Fixtures hold invented text only.
 - **Git:** the local clone has a repo-level identity `CHL-work <131831160+CHL-work@users.noreply.github.com>` (set it again in a fresh clone). End commit messages with the `Co-Authored-By` trailer your harness specifies. Work on a branch, wait for green CI, then fast-forward `main` (`git push origin HEAD:main`). Pushing uses Git Credential Manager.
 
@@ -141,6 +144,8 @@ These were found in review and deliberately left as they are, or only partly fix
 - RSS (`{host}/feed`) has full HTML for free posts; paid items end with a "Read more" link paragraph.
 - Requests from datacenter IPs (seen from GitHub Actions) sometimes get 403 on `*.substack.com` while custom domains answer.
 
+Cloudflare deployment checks on 2026-10-07 supersede those earlier reachability observations for this relay: the three API probes returned 429, while RSS through `/v1/feed` returned 200 for `on.substack.com` and `www.slowboring.com`, with 20 items counted for Slow Boring. API recovery is not confirmed. v0.1.1 extends the existing built-in RSS recovery to the phone and cold reader paths; it does not enable rss2json or make older posts outside the feed available.
+
 ### Timings and limits in the code
 
 | Value | Where |
@@ -163,11 +168,14 @@ These were found in review and deliberately left as they are, or only partly fix
 | `247981a` | Fixes for review round 1 (34 findings; e.g. free posts cut at a "Read more" link and labelled paid, a failed bridge read overwriting the library, script-capable XML from forged custom domains) |
 | `04c2e0c` | Fixes for review round 2 (deletions resurrected by the merge, a stale display trapping the wearer, relay verification edge cases) |
 | `228e20f` | Fixes for review round 3 (late storage answers looping, bridge-only edits merged away, redraws over the loading frame and the exit dialog) |
+| `0f8c717` | Handoff, agent guide and CI status helper; deployed relay and Private Even Hub v0.1.0 baseline |
+| Pending v0.1.1 | Phone and cold glasses RSS recovery with regressions; local build/pack passed; branch CI/upload pending |
 
 The owner's decisions so far (2026-10-06): relay on Cloudflare Workers; rss2json fallback off; name "Reader for Substack"; Even's gesture convention (double-tap back, exit on Home; long-press also back); free posts in full and paid posts as preview only; no persistent article text; CI-only tests.
 
 ## 8. Environment notes (owner's PC)
 
+- Workspace policy (2026-10-07): `C:\Code` contains the four canonical repositories only. Keep this project's worktrees under its ignored `.worktrees/`, portable Node under `.tools/node/`, and research metadata/scratch files under `.local/research/`; keep project configuration in its own `.env`. Use Git worktree commands for relocation. See the [local workspace layout](../README.md#local-workspace-layout). Existing `docs/background/` records retain their historical paths.
 - Windows 10; repo at `C:\Code\substack-reader-for-evenhub`. The sibling reference project is `C:\Code\lihkg-reader-for-evenhub` (GitHub `CHL-work/lihkg-reader-for-evenhub`, private); read it, never modify it from this project.
 - Tools present: Git (with Git Credential Manager), Python via `py -3`, curl. Not present: system Node, `gh`.
 - The repository is public: <https://github.com/CHL-work/substack-reader-for-evenhub>.

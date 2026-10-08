@@ -35,6 +35,7 @@ const BRIDGE_PREFIX = 'ci-bridge:'
 const MENU_NAMES = ['Home', 'Save for later', 'Next post', 'Restart post', 'Refresh']
 const ALPHA = 'alpha.substack.com'
 const ALPHA_TITLES = ['First synthetic essay', 'Second synthetic essay', 'Members only preview']
+const FEED_BODY_MARKER = 'rssci-body'
 
 // ---------------------------------------------------------------------------
 // Build (Vite JS API) and serve
@@ -106,6 +107,22 @@ function bodyHtml(post) {
   return paragraphs.join('\n')
 }
 
+/** RSS carries recent summaries and inert HTML strings, including a paid-preview tail. */
+function feedXml(host) {
+  const xml = value => String(value ?? '').replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;')
+  const pub = fixtures.publications[host]
+  const items = fixtures.posts.filter(post => post.host === host).slice(0, fixtures.archivePageCap).map(post => {
+    const link = `https://${host}/p/${post.slug}`
+    const body = `<p data-rss-ci-payload="body">${FEED_BODY_MARKER}</p><script data-rss-ci-payload="script">window.__rssCiExecuted = true</script>`
+      + bodyHtml(post) + (post.audience === 'everyone' ? '' : `<p><a href="${link}">Read more</a></p>`)
+    return `<item><title>${xml(post.title)}</title><link>${xml(link)}</link><pubDate>${xml(post.postDate)}</pubDate>`
+      + `<description>${xml(post.subtitle)}</description><dc:creator>${xml(post.authors.join(', '))}</dc:creator>`
+      + `<content:encoded><![CDATA[${body}]]></content:encoded></item>`
+  }).join('')
+  return `<?xml version="1.0"?><rss version="2.0" xmlns:dc="http://purl.org/dc/elements/1.1/" xmlns:content="http://purl.org/rss/1.0/modules/content/">`
+    + `<channel><title>${xml(pub.name)} RSS</title>${items}</channel></rss>`
+}
+
 function summary(post) {
   const pub = fixtures.publications[post.host]
   return {
@@ -173,6 +190,11 @@ function relayReply(url, request) {
         publication: fixtures.publications[post.host],
       }, post.host)]
     }
+    case '/v1/feed': {
+      const host = q.get('host') ?? ''
+      if (!fixtures.publications[host]) return [404, failure('PUBLICATION_NOT_FOUND', 'No feed at that address.')]
+      return [200, feedXml(host), 'application/rss+xml; charset=utf-8']
+    }
     case '/v1/profile': {
       const profile = fixtures.profiles[q.get('handle') ?? '']
       if (!profile) return [404, failure('PROFILE_NOT_FOUND', 'No Substack profile with that handle.')]
@@ -213,6 +235,17 @@ function installBridge({ seed, bridgeOnly, failReads }) {
   window.__g2Launch = null
   window.__g2LastWrite = -Infinity
   window.__g2LastSent = {}
+  window.__rssCiInserted = false
+  // Catch transient adoption too: a later redraw must not hide unsafe feed HTML insertion.
+  new MutationObserver(records => {
+    for (const record of records) {
+      for (const node of record.addedNodes) {
+        if (node instanceof Element && (node.matches('[data-rss-ci-payload]') || node.querySelector('[data-rss-ci-payload]'))) {
+          window.__rssCiInserted = true
+        }
+      }
+    }
+  }).observe(document, { childList: true, subtree: true })
   // failReads: the first N bridge storage reads fail (the Even app did not answer).
   window.__g2FailReads = failReads
   window.__g2FailedReads = 0
@@ -347,8 +380,8 @@ async function openPhone(options = {}) {
       assert.equal(headers.cookie, undefined, 'Relay requests must not carry cookies.')
       assert.equal(headers.authorization, undefined, 'Relay requests must not carry credentials.')
       fixture.relayRequests.push(`${url.pathname}${url.search}`)
-      const [status, body] = fixture.override?.(url) ?? relayReply(url, request)
-      await route.fulfill({ status, headers: CORS_JSON, body: JSON.stringify(body) })
+      const [status, body, contentType = CORS_JSON['Content-Type']] = fixture.override?.(url) ?? relayReply(url, request)
+      await route.fulfill({ status, headers: { ...CORS_JSON, 'Content-Type': contentType }, body: typeof body === 'string' ? body : JSON.stringify(body) })
     } catch (error) {
       fixture.unexpected.push(`relay fixture: ${error instanceof Error ? error.message : String(error)}`)
       await route.fulfill({ status: 500, headers: CORS_JSON, body: JSON.stringify(failure('INTERNAL_ERROR', 'Fixture failure.')) })
@@ -375,6 +408,9 @@ async function verifyInvariants(fixture) {
   assert.deepEqual(fixture.pageErrors, [], 'The app must not throw uncaught errors.')
   assert.equal(new URL(page.url()).origin, fixture.origin, 'The user must stay in the plugin.')
   assert.equal(fixture.context.pages().length, 1, 'No action may open another tab.')
+  await expect(page.locator('[data-rss-ci-payload]')).toHaveCount(0)
+  assert.equal(await page.evaluate(() => window.__rssCiInserted), false, 'Feed nodes never enter the live phone DOM, even briefly.')
+  assert.equal(await page.evaluate(() => window.__rssCiExecuted === true), false, 'Feed scripts never execute in the phone.')
   const pages = await page.evaluate(() => window.__g2Pages)
   assert.equal(pages.length, 1, 'createStartUpPageContainer runs exactly once per load (never rebuilt).')
   const boxes = pages[0].textObject ?? []
@@ -388,6 +424,7 @@ async function verifyInvariants(fixture) {
     const stored = await page.evaluate(([k, prefix]) => [localStorage.getItem(k) ?? '', sessionStorage.getItem(prefix + k) ?? ''], [key, BRIDGE_PREFIX])
     for (const value of stored) {
       assert.ok(!/t0\d{3}/.test(value), `${key} must never contain article text.`)
+      assert.ok(!value.includes(FEED_BODY_MARKER) && !value.includes('data-rss-ci-payload') && !value.includes('bodyHtml'), `${key} must never contain feed HTML or body text.`)
       assert.ok(value.length < 48_000, `${key} stays below 48k characters.`)
     }
   }
@@ -560,6 +597,112 @@ try {
     assert.equal(relayRequests.length, 3, 'Reload must not re-validate publications.')
   })
 
+  await scenario('2b rate-limited API: RSS follows a URL, browses recent summaries, saves and reads after reload', {
+    override: url => ['/v1/archive', '/v1/post'].includes(url.pathname)
+      ? [429, failure('UPSTREAM_RATE_LIMITED', 'Substack is temporarily rate limited.', { retryAfterSeconds: 41 })]
+      : null,
+  }, async ({ page, relayRequests }) => {
+    await addInput(page, `https://${ALPHA}/`)
+    await expect(page.locator('[data-testid="add-result"][data-kind="message"]')).toContainText('Following Alpha Notes RSS')
+    assert.deepEqual(await rowValues(page, '[data-pub-row]', 'data-pub-row'), [ALPHA])
+    await page.locator(`[data-action="browse"][data-host="${ALPHA}"]`).click()
+    await expect(page.locator('[data-post-row]')).toHaveCount(3)
+    await expect(page.locator('[data-testid="busy"]')).toHaveCount(0)
+    assert.deepEqual(await page.locator('[data-post-row] strong').allTextContents(), ALPHA_TITLES)
+    await expect(page.locator('[data-testid="browse-more"]')).toHaveCount(0)
+    await expect(page.locator('#app')).not.toContainText(FEED_BODY_MARKER)
+    await expect(page.locator('[data-rss-ci-payload]')).toHaveCount(0)
+    await page.locator('[data-post-row] [data-action="toggle-save"]').first().click()
+    await expect(page.locator('[data-post-row] [data-action="toggle-save"]').first()).toHaveAttribute('aria-pressed', 'true')
+    for (const copy of ['local', 'bridge']) {
+      await expect.poll(async () => (await storedDoc(page, PREFS_KEY))[copy]?.saved?.map(ref => ref.slug)).toEqual(['first-synthetic-essay'])
+      const prefs = (await storedDoc(page, PREFS_KEY))[copy]
+      assert.ok(prefs.saved[0].postId < 0, 'RSS saves its stable synthetic id with a host and slug.')
+      assert.equal(prefs.saved[0].host, ALPHA)
+      assert.equal(prefs.publications[0].name, 'Alpha Notes RSS')
+      assert.ok(!JSON.stringify(prefs).includes(FEED_BODY_MARKER), 'Saving keeps references, never feed bodies.')
+    }
+    const initialRequests = [
+      `/v1/archive?host=${ALPHA}&offset=0&limit=12&sort=new`, `/v1/feed?host=${ALPHA}`,
+      `/v1/archive?host=${ALPHA}&offset=0&limit=12&sort=new`, `/v1/feed?host=${ALPHA}`,
+    ]
+    assert.deepEqual(relayRequests, initialRequests)
+    assert.equal(await page.evaluate(() => window.__rssCiInserted), false, 'Add and Browse never adopt feed HTML.')
+    await page.reload({ waitUntil: 'load' })
+    await ready(page)
+    await openTab(page, 'saved')
+    assert.deepEqual(await rowValues(page, '[data-saved-row]', 'data-saved-row'), [`${ALPHA}/first-synthetic-essay`])
+    assert.deepEqual(relayRequests, initialRequests, 'Reload does not eagerly fetch bodies.')
+    await g2(page, 'next')
+    await g2(page, 'next')
+    await expectBody(page, '> Saved (1)')
+    await g2(page, 'select')
+    await expectBody(page, `> ${ALPHA_TITLES[0]}`)
+    await g2(page, 'select')
+    await expectFooter(page, readerFooter(1))
+    await expect(page.locator('[data-testid="now-reading"]')).toContainText(ALPHA_TITLES[0])
+    await g2(page, 'next')
+    await expectFooter(page, readerFooter(2))
+    await g2(page, 'next')
+    await expectFooter(page, readerFooter(3))
+    const shown = await page.evaluate(() => window.__g2Writes.filter(write => write.name === 'body').map(write => write.content).join('\n'))
+    assert.ok(shown.includes(FEED_BODY_MARKER), 'The cold Saved reference reads actual RSS body text on the glasses.')
+    assert.match(shown, /t0\d{3}/)
+    assert.deepEqual(relayRequests, [...initialRequests, `/v1/post?host=${ALPHA}&slug=first-synthetic-essay`, `/v1/feed?host=${ALPHA}`])
+    await expect.poll(async () => (await storedDoc(page, PROGRESS_KEY)).bridge?.history?.map(ref => ref.slug)).toEqual(['first-synthetic-essay'])
+  })
+
+  for (const feedFailure of ['request', 'malformed']) {
+    await scenario(`2c ${feedFailure} feed failure preserves the archive error for add and Browse`, {
+      seed: SEED_ALPHA,
+      override: url => url.pathname === '/v1/archive'
+        ? [429, failure('UPSTREAM_RATE_LIMITED', 'Original archive throttling.', { retryAfterSeconds: 41, upstream: { status: 429, contentType: 'text/html', challenge: false } })]
+        : url.pathname === '/v1/feed'
+          ? feedFailure === 'request' ? [503, failure('UPSTREAM_UNAVAILABLE', 'Different feed failure.')]
+            : [200, '<rss><channel>', 'application/rss+xml; charset=utf-8']
+          : null,
+    }, async ({ page, relayRequests }) => {
+      await addInput(page, `https://${ALPHA}/`)
+      const result = page.locator('[data-testid="add-result"][data-kind="error"]')
+      await expect(result).toContainText('UPSTREAM_RATE_LIMITED')
+      await expect(result).toContainText('Original archive throttling.')
+      await expect(result).toContainText('HTTP 429')
+      await expect(result).toContainText('Try again in 41 s.')
+      await expect(result).not.toContainText('Different feed failure.')
+      assert.deepEqual(await rowValues(page, '[data-pub-row]', 'data-pub-row'), [ALPHA])
+      await page.locator(`[data-action="browse"][data-host="${ALPHA}"]`).click()
+      const alert = page.locator('[data-testid="phone-alert"]')
+      await expect(alert).toContainText('UPSTREAM_RATE_LIMITED')
+      await expect(alert).toContainText('Original archive throttling.')
+      await expect(alert).toContainText('Try again in 41 s.')
+      await expect(page.locator('[data-testid="phone-retry"]')).toBeEnabled()
+      await expect(page.locator('[data-post-row]')).toHaveCount(0)
+      assert.deepEqual(relayRequests, [
+        `/v1/archive?host=${ALPHA}&offset=0&limit=12&sort=new`, `/v1/feed?host=${ALPHA}`,
+        `/v1/archive?host=${ALPHA}&offset=0&limit=12&sort=new`, `/v1/feed?host=${ALPHA}`,
+      ])
+    })
+  }
+
+  const rejectedArchive = { code: 'RATE_LIMITED', status: 429 }
+  await scenario('2d relay limits and validation failures never trigger a feed request on add or Browse', {
+    seed: SEED_ALPHA,
+    override: url => url.pathname === '/v1/archive'
+      ? [rejectedArchive.status, failure(rejectedArchive.code, 'Request rejected before reading Substack.')]
+      : null,
+  }, async ({ page, relayRequests }) => {
+    for (const [code, status] of [['RATE_LIMITED', 429], ['INVALID_HOST', 400], ['HOST_NOT_SUBSTACK', 403], ['PUBLICATION_NOT_FOUND', 404]]) {
+      rejectedArchive.code = code
+      rejectedArchive.status = status
+      await addInput(page, `https://${ALPHA}/`)
+      await expect(page.locator('[data-testid="add-result"][data-kind="error"] .code')).toHaveText(code)
+      await page.locator(`[data-action="browse"][data-host="${ALPHA}"]`).click()
+      await expect(page.locator('[data-testid="phone-alert"] .code')).toHaveText(code)
+      await expect(page.locator('[data-post-row]')).toHaveCount(0)
+    }
+    assert.deepEqual(relayRequests, Array(8).fill(`/v1/archive?host=${ALPHA}&offset=0&limit=12&sort=new`))
+  })
+
   await scenario('3 import from an @handle with checkboxes', {}, async ({ page, relayRequests }) => {
     await addInput(page, '@ci_reader')
     const card = page.locator('[data-testid="add-result"][data-kind="profile"]')
@@ -626,6 +769,34 @@ try {
     await expect(page.locator('[data-testid="add-result"][data-kind="invalid"]')).toHaveCount(0)
     assert.deepEqual(relayRequests, [`/v1/archive?host=${ALPHA}&offset=0&limit=12&sort=new`])
     assert.deepEqual(await rowValues(page, '[data-pub-row]', 'data-pub-row'), [ALPHA])
+  })
+
+  await scenario('4e blocked post URL uses an RSS preview; numeric ids and missing feed slugs keep the original error', {
+    override: url => url.pathname === '/v1/post'
+      ? [503, failure('UPSTREAM_BLOCKED', 'Original post API block.')]
+      : null,
+  }, async ({ page, relayRequests }) => {
+    await addInput(page, `https://${ALPHA}/p/members-only-preview`)
+    const card = page.locator('[data-testid="add-result"][data-kind="post"]')
+    await expect(card).toContainText('Members only preview')
+    await expect(card).toContainText('Alpha Notes RSS')
+    await expect(card).toContainText('Paid')
+    await expect(page.locator('#app')).not.toContainText(FEED_BODY_MARKER)
+    await expect(page.locator('[data-rss-ci-payload]')).toHaveCount(0)
+    await card.locator('[data-action="save-post"]').click()
+    await card.locator('[data-action="follow"]').click()
+    await expect.poll(async () => (await storedDoc(page, PREFS_KEY)).bridge?.saved?.map(ref => ({ slug: ref.slug, isPaywalled: ref.isPaywalled })))
+      .toEqual([{ slug: 'members-only-preview', isPaywalled: true }])
+    assert.deepEqual(await rowValues(page, '[data-pub-row]', 'data-pub-row'), [ALPHA])
+    await addInput(page, 'https://substack.com/home/post/p-5001')
+    await expect(page.locator('[data-testid="add-result"][data-kind="error"]')).toContainText('UPSTREAM_BLOCKED')
+    await addInput(page, `https://${ALPHA}/p/older-synthetic-note`)
+    await expect(page.locator('[data-testid="add-result"][data-kind="error"]')).toContainText('Original post API block.')
+    assert.deepEqual(relayRequests, [
+      `/v1/post?host=${ALPHA}&slug=members-only-preview`, `/v1/feed?host=${ALPHA}`,
+      '/v1/post?id=5001',
+      `/v1/post?host=${ALPHA}&slug=older-synthetic-note`, `/v1/feed?host=${ALPHA}`,
+    ])
   })
 
   await scenario('5 full glasses navigation: reader 2/N, back keeps the selection, root double-tap exits with mode 1', { seed: SEED_ALPHA }, async ({ page }) => {
@@ -717,7 +888,7 @@ try {
   const blocked = { blockPosts: true }
   await scenario('8 relay UPSTREAM_BLOCKED: glasses error frame, phone alert with Retry, then success', {
     seed: SEED_ALPHA,
-    override: url => (blocked.blockPosts && url.pathname === '/v1/post'
+    override: url => (blocked.blockPosts && ['/v1/post', '/v1/feed'].includes(url.pathname)
       ? [503, failure('UPSTREAM_BLOCKED', 'Substack refused the reader service.', { upstream: { status: 403, contentType: 'text/html', challenge: false } })]
       : null),
   }, async ({ page, relayRequests }) => {
@@ -862,6 +1033,22 @@ try {
     await page.locator('[data-testid="check-relay"]').click()
     await expect(page.locator('[data-testid="health"]')).toContainText('substack-reader-relay')
     await expect(page.locator('[data-testid="event-log"]')).toContainText('text:SCROLL_BOTTOM')
+  })
+
+  await scenario('12b2 blocked older archive page keeps existing rows and never substitutes recent RSS posts', {
+    seed: SEED_ALPHA,
+    override: url => url.pathname === '/v1/archive' && url.searchParams.get('offset') !== '0'
+      ? [503, failure('UPSTREAM_UNAVAILABLE', 'Older posts are temporarily unavailable.')]
+      : null,
+  }, async ({ page, relayRequests }) => {
+    await openTab(page, 'publications')
+    await page.locator(`[data-action="browse"][data-host="${ALPHA}"]`).click()
+    await expect(page.locator('[data-post-row]')).toHaveCount(3)
+    await page.locator('[data-testid="browse-more"]').click()
+    await expect(page.locator('[data-testid="phone-alert"]')).toContainText('UPSTREAM_UNAVAILABLE')
+    assert.deepEqual(await rowValues(page, '[data-post-row]', 'data-post-row'), ['5001', '5002', '5003'])
+    await expect(page.locator('[data-testid="browse-more"]')).toBeEnabled()
+    assert.deepEqual(relayRequests, [0, 3].map(offset => `/v1/archive?host=${ALPHA}&offset=${offset}&limit=12&sort=new`))
   })
 
   await scenario('12c browser copy lost: the first glasses frame and the phone show the bridge library', { seed: SEED_ALPHA, bridgeOnly: true }, async ({ page, relayRequests }) => {
