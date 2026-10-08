@@ -1,45 +1,42 @@
 # Handoff: Reader for Substack (Even Hub plugin for Even G2)
 
-State as of **2026-10-07**: deployed relay and v0.1.0 baseline `0f8c717` on `origin/main` and `origin/feat/reader-v0.1`. [Manual CI on `main`](https://github.com/CHL-work/substack-reader-for-evenhub/actions/runs/37723032892) passed all suites and uploaded v0.1.0. The relay is deployed and v0.1.0 is uploaded to Even Hub as **Private, not Beta**. v0.1.1 RSS corrections are implemented and packaged locally on `deploy/cloudflare-setup`, awaiting branch CI and upload.
+State as of **2026-10-07**: v0.1.1 code baseline `b963146` is on `main`, fast-forwarded after [branch CI](https://github.com/CHL-work/substack-reader-for-evenhub/actions/runs/37724951787) passed all tests, build and packaging. The relay is deployed at the same revision and v0.1.1 is **Published Beta** in Even Hub; v0.1.0 remains Private. [GitHub prerelease `v0.1.1-alpha.1`](https://github.com/CHL-work/substack-reader-for-evenhub/releases/tag/v0.1.1-alpha.1) points to `b963146`; its release workflow passed and attached the package. Tester enrollment and real glasses checks remain.
 
 Read this file first, then [AGENTS.md](../AGENTS.md) (rules), then the docs it points to. The [README](../README.md) is written for the owner; this file is written for the next agent.
 
 ## 1. In one paragraph
 
-Reader for Substack is an Even Hub plugin: a Vite + TypeScript web app (no UI framework) that runs inside the Even Realities phone app's WebView and shows public Substack posts as paginated text on Even G2 glasses through `@evenrealities/even_hub_sdk` 0.0.16. Substack sends no CORS headers and the Even WebView enforces both CORS and the `app.json` network whitelist, so all Substack traffic goes through a small stateless relay (`worker/relay.ts`) now deployed at `https://substack-reader-relay.chihin-lau-work.workers.dev`. v0.1.0 passed CI and is a Private Even Hub build. Live checks found all three Substack API probes returning 429, while the `on.substack.com` and `www.slowboring.com` RSS feeds returned 200 (20 items counted in the latter). This exposed missing RSS recovery in phone flows and cold glasses reading; v0.1.1 fixes are implemented with regression tests and packaged locally, awaiting CI and upload. Built-in relay RSS fallback is enabled; only the optional rss2json service is disabled. **Real glasses operation remains unverified.**
+Reader for Substack is an Even Hub plugin: a Vite + TypeScript web app (no UI framework) that runs inside the Even Realities phone app's WebView and shows public Substack posts as paginated text on Even G2 glasses through `@evenrealities/even_hub_sdk` 0.0.16. Substack sends no CORS headers and the Even WebView enforces both CORS and the `app.json` network whitelist, so all Substack traffic goes through a small stateless relay (`worker/relay.ts`) now deployed at `https://substack-reader-relay.chihin-lau-work.workers.dev`. v0.1.1 passed CI and is Published Beta in Even Hub. All three Substack API probes still return 429; RSS returned 200 for `on.substack.com` and `www.slowboring.com`, with 20 items counted for the latter and rechecked after deployment. v0.1.1 fixes RSS recovery in phone flows and cold glasses reading, with passing regressions. Built-in relay RSS fallback is enabled; only the optional rss2json service is disabled. **Real glasses operation remains unverified; the testing group is empty pending the owner's tester account selection.**
 
 ## 2. Status
 
 | Area | State | Evidence |
 | --- | --- | --- |
-| Phone UI (add by link / custom domain / @handle import / search, browse, Saved, settings, diagnostics, about) | v0.1.0 passed CI; v0.1.1 RSS recovery for adding links and browsing implemented, awaiting CI | New regression flows in `scripts/ui-ci.mjs` |
-| Glasses UI (Home, Latest, Publications, Saved, History, reader with resume, end card, contextual menu, error frames) | v0.1.0 passed CI; v0.1.1 cold Saved/History/Continue RSS recovery implemented, awaiting CI | New unit regressions in `tests/unit/controller.test.ts` and UI flows |
+| Phone UI (add by link / custom domain / @handle import / search, browse, Saved, settings, diagnostics, about) | v0.1.1 passed CI, including RSS recovery for adding links and browsing | Regression flows in `scripts/ui-ci.mjs`; API-only features remain subject to upstream throttling |
+| Glasses UI (Home, Latest, Publications, Saved, History, reader with resume, end card, contextual menu, error frames) | v0.1.1 passed CI, including cold Saved/History/Continue RSS recovery | Unit regressions in `tests/unit/controller.test.ts` and UI flows with a stubbed bridge |
 | Substack HTML to glasses text | Done | CI browser tests on 11+ synthetic fixtures (`tests/browser/html.test.ts`) |
-| Relay (routes, allowlist, custom-domain checks, caps, rate limits, cache, CSP) | **Deployed**, revision `0f8c717`, protocol 1 | [Deploy run 37723359582](https://github.com/CHL-work/substack-reader-for-evenhub/actions/runs/37723359582) succeeded |
+| Relay (routes, allowlist, custom-domain checks, caps, rate limits, cache, CSP) | **Deployed**, revision `b963146`, protocol 1; direct health verified | [Deploy run 37725196005](https://github.com/CHL-work/substack-reader-for-evenhub/actions/runs/37725196005) succeeded |
 | Storage (bridge storage + localStorage mirror, merge, sync stamps) | Done | CI unit tests (`tests/unit/storage.test.ts`) and UI scenarios 12–12e |
 | Cloudflare setup | `workers.dev` ready; both `CLOUDFLARE_API_TOKEN` and `CLOUDFLARE_ACCOUNT_ID` encrypted GitHub secrets saved; `VITE_RELAY_ORIGIN` variable saved | Authorized Workers Scripts Write token expires 2027-01-06 |
-| Packaging (`.ehpk`) | v0.1.0 local and CI packages built for the deployed origin; v0.1.1 local build/pack passed, branch CI pending | [CI run](https://github.com/CHL-work/substack-reader-for-evenhub/actions/runs/37723032892) passed all suites and uploaded v0.1.0; optional rss2json disabled |
+| Packaging (`.ehpk`) | v0.1.1 local and branch CI build/pack passed; local package uploaded to Even Hub | [CI run](https://github.com/CHL-work/substack-reader-for-evenhub/actions/runs/37724951787); optional rss2json disabled |
 | Real G2 hardware | **Not verified** | [device-checklist.md](device-checklist.md) is all unchecked |
-| Substack reachability | API probes all 429; two tested RSS feeds 200; 20 items counted for Slow Boring | `subdomain`, `customDomain`, `substackCom` probes; RSS for `on.substack.com` and `www.slowboring.com` |
-| Even Hub | Project `com.chlwork.substackreader` created; v0.1.0 uploaded **Private, not Beta** | v0.1.1 upload and Beta promotion remain; public listing/review not started |
+| Substack reachability | API probes all 429; two tested RSS feeds 200; Slow Boring rechecked after deployment with 20 items | `subdomain`, `customDomain`, `substackCom` probes; RSS for `on.substack.com` and `www.slowboring.com` |
+| Even Hub | [Project `com.chlwork.substackreader`](https://hub.evenrealities.com/hub/com.chlwork.substackreader): v0.1.1 visibly **Published Beta**; v0.1.0 Private | Testing group empty; tester account selection pending; public listing/review not started |
+| GitHub prerelease | [`v0.1.1-alpha.1`](https://github.com/CHL-work/substack-reader-for-evenhub/releases/tag/v0.1.1-alpha.1) published at `b963146`; package attached | [Release workflow](https://github.com/CHL-work/substack-reader-for-evenhub/actions/runs/37725451196) passed all checks; asset SHA-256 matches the local package uploaded to Even Hub |
 
-CI runs at the code baseline: `node scripts/ci-status.mjs 0f8c717`.
+CI and release runs at the code baseline: `node scripts/ci-status.mjs b963146`.
 
-Local v0.1.0 package: `artifacts/substack-reader-0.1.0.ehpk`, 117,929 bytes, SHA-256 `165c1ffe92992ebb0ba6d358783503c4835f29735727b501457a08d9d8a41cbd`. Its only network whitelist entry is the deployed relay origin; the CLI stamped minimum Even app version 2.2.10 for SDK 0.0.16. It lacks the pending v0.1.1 RSS corrections; packaging does not verify device operation.
-
-Local v0.1.1 package: `artifacts/substack-reader-0.1.1.ehpk`, 118,238 bytes, SHA-256 `6f653b9ea133298bae4c6259a809003ff0b7be8530bf173b85f839d264fff750`. Build and pack passed with the sole relay whitelist entry and minimum Even app version 2.2.10. Wait for its branch CI before upload.
+Local v0.1.1 package uploaded to Even Hub: `artifacts/substack-reader-0.1.1.ehpk`, 118,238 bytes, SHA-256 `6f653b9ea133298bae4c6259a809003ff0b7be8530bf173b85f839d264fff750`. Build and pack passed with the sole relay whitelist entry and minimum Even app version 2.2.10 for SDK 0.0.16. CI validates the software; device operation still needs observation.
 
 ## 3. What to do next
 
-### 3A. Remaining v0.1.1 validation and installation steps
+### 3A. Remaining tester installation and device validation
 
 An agent can perform the account steps with authorized access. Physical phone and glasses testing requires the owner.
 
-1. **Validate v0.1.1 in branch CI.** The phone now retries eligible publication/post-link lookup and initial browse failures through the relay's RSS feed. The controller retries eligible cold post failures through the same feed, requiring the exact slug and a body. Missing posts or a failed feed preserve the original API error; cancellation must not draw or cache stale text. Unit/UI regressions are written; the local type check passed, but runtime tests must run in GitHub Actions only. Commit and push `deploy/cloudflare-setup`, wait for green CI, then fast-forward `main`.
-2. **Confirm the v0.1.1 CI package** with the saved `VITE_RELAY_ORIGIN`; the local build above is ready. Keep its sole relay whitelist entry and optional rss2json disabled. The already successful CI artifact is v0.1.0, so it does not contain these fixes.
-3. **Keep relay status accurate.** The deployed revision is `0f8c717`; any later deployment should be followed by checking `/v1/health?probe=1` and a feed route. The workflow only warns about a revision mismatch or upstream failure. API-only search and @handle import can remain unavailable even when RSS reading works; feed recovery covers recent items only. Both GitHub secrets are configured. Rotate the API token before 2027-01-06.
-4. **Upload v0.1.1 to the existing Even Hub project:** hub.evenrealities.com → `com.chlwork.substackreader` → Builds → upload with a change log, then **promote Private → Beta** (forgetting this caused an "expired" message in the LIHKG reader). The current v0.1.0 build is Private. Install the corrected build as a tester from the Even app (Me → Beta tester).
-5. **Walk through [device-checklist.md](device-checklist.md) on real glasses** and record the results (the Diagnostics panel shows raw glasses events and the relay health).
+1. **Enroll the owner as a Beta tester.** The testing group is empty. The owner has been asked which Even app account to add or invite; that answer is pending. Once supplied, add that account and complete tester acceptance/install through the Even app (Me → Beta tester). Keep tester emails and invitation links out of the public repository. CI, release packaging, Cloudflare deployment and Even Hub Beta publication are complete.
+2. **Walk through [device-checklist.md](device-checklist.md) on real glasses** and record observed results, including cold Saved/History/Continue reading after restart. API-only search and @handle import can remain unavailable while RSS works; older posts outside the feed still require the API. Record these limits rather than marking the affected checks passed.
+3. **Keep relay status accurate.** The deployed revision is `b963146`; after future deployments check `/v1/health?probe=1` and a feed route. The workflow only warns about a revision mismatch or upstream failure. Rotate the configured API token before 2027-01-06.
 
 ### 3B. Follow-up after deployment and device testing
 
@@ -169,7 +166,7 @@ Cloudflare deployment checks on 2026-10-07 supersede those earlier reachability 
 | `04c2e0c` | Fixes for review round 2 (deletions resurrected by the merge, a stale display trapping the wearer, relay verification edge cases) |
 | `228e20f` | Fixes for review round 3 (late storage answers looping, bridge-only edits merged away, redraws over the loading frame and the exit dialog) |
 | `0f8c717` | Handoff, agent guide and CI status helper; deployed relay and Private Even Hub v0.1.0 baseline |
-| Pending v0.1.1 | Phone and cold glasses RSS recovery with regressions; local build/pack passed; branch CI/upload pending |
+| `b963146` | v0.1.1 phone and cold glasses RSS recovery with passing regressions; coordinated workspace layout/docs/ignore changes; main fast-forwarded, relay deployed and Even Hub Beta published; tagged `v0.1.1-alpha.1` |
 
 The owner's decisions so far (2026-10-06): relay on Cloudflare Workers; rss2json fallback off; name "Reader for Substack"; Even's gesture convention (double-tap back, exit on Home; long-press also back); free posts in full and paid posts as preview only; no persistent article text; CI-only tests.
 
