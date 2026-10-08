@@ -64,7 +64,7 @@ Post HTML is converted to plain text on the phone and never inserted into the pa
 
 ## Setup
 
-Current setup (2026-10-07): the relay is deployed at [substack-reader-relay.chihin-lau-work.workers.dev](https://substack-reader-relay.chihin-lau-work.workers.dev). GitHub has both deployment secrets and the build origin configured. Live checks found HTTP 429 from Substack's archive/search APIs, while RSS feeds for `on.substack.com` and `www.slowboring.com` returned 200. Version 0.1.1 extends RSS recovery to phone onboarding and saved-post reopening. The optional rss2json service remains disabled. Real glasses testing is still required; see [the handoff](docs/HANDOFF.md) for deployment evidence, package status and next steps.
+Current setup (2026-10-08): the relay is deployed at [substack-reader-relay.chihin-lau-work.workers.dev](https://substack-reader-relay.chihin-lau-work.workers.dev), revision `6b3507f`. GitHub has both deployment secrets and the build origin configured. Version 0.1.2 is Published Beta. Live checks confirmed the archive API remains rate-limited, while RSS for `andrewhclu.substack.com` returned 200 with 20 posts. Automatic public archive recovery is disabled on Cloudflare to preserve that recent list; older posts beyond RSS remain unavailable. Refresh the publication or reopen the plugin to clear an existing sitemap cursor. The optional rss2json service remains disabled. Real glasses retesting is required; see [the handoff](docs/HANDOFF.md) for evidence and the pending hosting decision.
 
 ### 1. Deploy the relay
 
