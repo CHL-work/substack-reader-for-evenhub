@@ -111,7 +111,10 @@ Optional variable `ENABLE_RSS2JSON_FALLBACK=1` builds with `VITE_ENABLE_RSS2JSON
 
 ## Development rules
 
+Continuing the work? Read [docs/HANDOFF.md](docs/HANDOFF.md) (status, next steps, open issues) and [AGENTS.md](AGENTS.md) (rules for coding agents) first.
+
 - **Runtime tests run only in GitHub Actions.** Every test script (`scripts/ci-tests.mjs`, `scripts/browser-ci.mjs`, `scripts/ui-ci.mjs`) throws unless `CI=true`. Locally you only install, type-check (`pnpm run check`), build and pack. Do not start a dev server, the simulator, Playwright or a browser locally.
+- Check a commit's CI result, including failure details, with `node scripts/ci-status.mjs [commit] [--wait]` (GitHub job logs need a login; the test runners publish failures as annotations).
 - Tests live in `tests/unit/*.test.ts` (Node, `node:test`), `tests/browser/*.test.ts` (Chromium with all network blocked, for `DOMParser` code) and `scripts/ui-ci.mjs` (phone and glasses flows against a stub of the Even bridge). Fixtures contain only invented text.
 - Node is portable: prefix commands with the `PATH` line shown above. pnpm 10.32.1 comes from corepack (`packageManager` in `package.json`). Install with the committed lockfile.
 - No UI framework. Strict TypeScript. `src/config.ts` is the only module that reads `import.meta.env`. `src/substack/html.ts` must stay ASCII-only.
@@ -125,9 +128,9 @@ Optional variable `ENABLE_RSS2JSON_FALLBACK=1` builds with `VITE_ENABLE_RSS2JSON
 | `src/substack/` | Relay client, input parsing, HTML to text, article header, RSS parsing, shared types |
 | `src/pagination.ts`, `src/storage.ts` | Pagination with offsets; persisted state |
 | `worker/` | The relay and its landing and privacy pages |
-| `scripts/` | CI test runners, `pack.mjs`, `check-relay-origin.mjs` |
+| `scripts/` | CI test runners, `ci-annotate.mjs` (failure annotations), `ci-status.mjs` (read CI results), `pack.mjs`, `check-relay-origin.mjs` |
 | `.github/workflows/` | `ci.yml`, `release.yml`, `deploy-relay.yml` |
-| `docs/` | Architecture, glasses UI, relay, privacy, device checklist |
+| `docs/` | Handoff (status and next steps), architecture, glasses UI, relay, privacy, device checklist; `docs/background/` holds the research and review records |
 
 ## Configuration reference
 
