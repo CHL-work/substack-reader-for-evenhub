@@ -52,6 +52,7 @@ function attributes(source: string, xml: boolean): Map<string, string> {
     if (!match) invalid()
     const name = xml ? match[0] : match[0].toLowerCase()
     i += match[0].length
+    const afterName = i
     while (i < source.length && /[\t\n\r ]/.test(source[i])) i += 1
     let value = ''
     if (source[i] === '=') {
@@ -70,7 +71,11 @@ function attributes(source: string, xml: boolean): Map<string, string> {
         if (i === start) invalid()
         value = source.slice(start, i)
       }
-    } else if (xml) invalid()
+    } else {
+      if (xml) invalid()
+      // The whitespace belongs to the next attribute when this one has no '=' value.
+      i = afterName
+    }
     if (out.has(name)) invalid()
     if (i < source.length && !/[\t\n\r ]/.test(source[i])) invalid()
     if (xml && value.includes('<')) invalid()
@@ -246,7 +251,15 @@ export function parseSitemapSlugs(xml: string, expectedHost: string): string[] {
       const parent = stack[stack.length - 1]
       if (!parent) {
         if (rootSeen || name !== 'urlset' || attrs.get('xmlns') !== SITEMAP_NAMESPACE) invalid()
-        if ([...attrs.keys()].some(k => !['xmlns', 'xmlns:xsi', 'xsi:schemaLocation'].includes(k))) invalid()
+        // Substack declares news/xhtml/image/video namespaces even when the map uses none of them.
+        // Declarations are data only: extension elements remain unsupported and no URI is fetched.
+        for (const [key, value] of attrs) {
+          if (key === 'xmlns' || key === 'xsi:schemaLocation') continue
+          if (!/^xmlns:[A-Za-z_][A-Za-z0-9_.-]*$/.test(key) || key === 'xmlns:xmlns'
+            || !/^[A-Za-z][A-Za-z0-9+.-]*:/.test(value) || /[\s<>]/.test(value)
+            || value === 'http://www.w3.org/2000/xmlns/') invalid()
+          if ((key === 'xmlns:xml') !== (value === 'http://www.w3.org/XML/1998/namespace')) invalid()
+        }
         if (attrs.has('xmlns:xsi') && attrs.get('xmlns:xsi') !== 'http://www.w3.org/2001/XMLSchema-instance') invalid()
         if (attrs.has('xsi:schemaLocation') && !attrs.has('xmlns:xsi')) invalid()
         rootSeen = true

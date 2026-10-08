@@ -95,7 +95,10 @@ const PUBLIC_HOST = 'publicletters.substack.com'
 const PUBLIC_PUB = { id: 424242, name: 'Public Letters', subdomain: 'publicletters', custom_domain: null, base_url: `https://${PUBLIC_HOST}` }
 
 function sitemap(slugs: readonly string[]): string {
-  return '<?xml version="1.0"?><urlset xmlns="http://www.sitemaps.org/schemas/sitemap/0.9">'
+  // Substack declares extension namespaces even when the document uses only ordinary URL entries.
+  return '<?xml version="1.0"?><urlset xmlns="http://www.sitemaps.org/schemas/sitemap/0.9"'
+    + ' xmlns:news="http://www.google.com/schemas/sitemap-news/0.9" xmlns:xhtml="http://www.w3.org/1999/xhtml"'
+    + ' xmlns:image="http://www.google.com/schemas/sitemap-image/1.1" xmlns:video="http://www.google.com/schemas/sitemap-video/1.1">'
     + slugs.map(slug => `<url><loc>https://${PUBLIC_HOST}/p/${slug}</loc></url>`).join('') + '</urlset>'
 }
 

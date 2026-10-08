@@ -31,6 +31,15 @@ test('public post ignores markers in article text, comments, raw text and extern
   for (const prefix of prefixes) assert.deepEqual(parsePublicPost(prefix + page({ post, pub }), post.slug), { post, pub })
 })
 
+test('public post tolerates actual Substack boolean script attributes before and after preloads', () => {
+  const before = '<script suppressHydrationWarning nonce="synthetic">window.unrelated = true</script>'
+    + '<script defer type="text/javascript" src="https://synthetic.invalid/bundle.js" charset="utf-8"></script>'
+  const after = '<script async defer src="https://synthetic.invalid/analytics.js"></script>'
+    + '<script nonce="synthetic" nomodule>window.unrelated = false</script>'
+  assert.deepEqual(parsePublicPost(before + page({ post, pub }) + after, post.slug), { post, pub })
+  assert.deepEqual(parsePublicPost(`<script suppressHydrationWarning nonce="synthetic">${assignment({ post, pub })}</script>`, post.slug), { post, pub })
+})
+
 test('public post rejects mismatched identity, ambiguous scripts and malformed JSON without execution', () => {
   for (const value of [null, [], { post }, { pub }, { post: { ...post, slug: 'other' }, pub }, { post, pub: { ...pub, id: 43 } }]) {
     assert.throws(() => parsePublicPost(page(value), post.slug))
@@ -57,6 +66,18 @@ test('sitemap keeps unique public slugs in sitemap order and ignores non-post UR
     ${loc(`https://${HOST}/p/newer-post`)}
   </urlset>`
   assert.deepEqual(parseSitemapSlugs(xml, HOST), ['newer-post', 'older-post'])
+})
+
+test('sitemap accepts Substack namespace declarations without enabling extension elements or external reads', () => {
+  const declarations = ' xmlns:news="http://www.google.com/schemas/sitemap-news/0.9"'
+    + ' xmlns:xhtml="http://www.w3.org/1999/xhtml"'
+    + ' xmlns:image="http://www.google.com/schemas/sitemap-image/1.1"'
+    + ' xmlns:video="http://www.google.com/schemas/sitemap-video/1.1"'
+  const xml = sitemap(`https://${HOST}/p/valid-post`).replace(ROOT, ROOT.slice(0, -1) + declarations + '>')
+  assert.deepEqual(parseSitemapSlugs(xml, HOST), ['valid-post'])
+  assert.throws(() => parseSitemapSlugs(xml.replace('</url>', '<news:news/></url>'), HOST))
+  assert.throws(() => parseSitemapSlugs(xml.replace('xmlns:news=', 'unexpected='), HOST))
+  assert.throws(() => parseSitemapSlugs(xml.replace('xmlns:news=', 'xmlns:xmlns='), HOST))
 })
 
 test('sitemap never returns cross-host, credentialed, port, query, fragment or encoded paths', () => {
