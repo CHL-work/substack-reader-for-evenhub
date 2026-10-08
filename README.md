@@ -6,7 +6,7 @@ An [Even Hub](https://hub.evenrealities.com) plugin that shows public Substack p
 - English only. No account, no login, no cookies.
 - This is an independent project. It is **not affiliated with Substack Inc. or Even Realities**.
 
-Version 0.1.1 is published as **Beta** in [Even Hub](https://hub.evenrealities.com/hub/com.chlwork.substackreader), with a [GitHub prerelease](https://github.com/CHL-work/substack-reader-for-evenhub/releases/tag/v0.1.1-alpha.1). Automated checks passed; real G2 device acceptance is still pending. The project owner must add the intended Even app accounts to the testing group before they can install the Beta.
+Version 0.1.1 is published as **Beta** in [Even Hub](https://hub.evenrealities.com/hub/com.chlwork.substackreader), with a [GitHub prerelease](https://github.com/CHL-work/substack-reader-for-evenhub/releases/tag/v0.1.1-alpha.1). Automated checks passed; real G2 device acceptance is still pending. The owner's confirmed Even app account was invited on 2026-10-07. They must accept the invitation before the app appears in **My Plugins**; acceptance and installation are unverified. Future testers must likewise be invited to the testing group and accept their invitations.
 
 The display name is defined in two places that must agree: `APP_NAME` in `src/config.ts` and `name` in `app.json`. `scripts/pack.mjs` refuses to package if they differ.
 
