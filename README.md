@@ -6,7 +6,9 @@ An [Even Hub](https://hub.evenrealities.com) plugin that shows public Substack p
 - English only. No account, no login, no cookies.
 - This is an independent project. It is **not affiliated with Substack Inc. or Even Realities**.
 
-Version 0.1.1 is published as **Beta** in [Even Hub](https://hub.evenrealities.com/hub/com.chlwork.substackreader), with a [GitHub prerelease](https://github.com/CHL-work/substack-reader-for-evenhub/releases/tag/v0.1.1-alpha.1). Automated checks passed; real G2 device acceptance is still pending. The owner's confirmed Even app account was invited on 2026-10-07. They must accept the invitation before the app appears in **My Plugins**; acceptance and installation are unverified. Future testers must likewise be invited to the testing group and accept their invitations.
+Version 0.1.2 is published as **Beta** in [Even Hub](https://hub.evenrealities.com/hub/com.chlwork.substackreader). Automated checks passed; real G2 device acceptance is still pending. Testers must join the testing group and accept their invitations before the app appears in **My Plugins**.
+
+**Current limitation (2026-10-08): older posts for 陸行之 (`andrewhclu.substack.com`) are not fully fixed.** Cloudflare can fetch the sitemap and some article pages, but selected older article pages still return HTTP 429. Automatic sitemap recovery is disabled on this deployment to preserve the 20-post RSS fallback instead of stopping after the four accessible public pages. Public-page recovery and source-aware pagination are implemented and tested, but broader live availability requires a host Substack accepts. See [the handoff](docs/HANDOFF.md) for the exact evidence and pending hosting decision.
 
 The display name is defined in two places that must agree: `APP_NAME` in `src/config.ts` and `name` in `app.json`. `scripts/pack.mjs` refuses to package if they differ.
 
@@ -47,7 +49,7 @@ Post HTML is converted to plain text on the phone and never inserted into the pa
 - **Gestures:** swipe to move or turn pages, tap to open or turn, double-tap to go back (and to exit from Home), plus a contextual menu (Home, Save for later, Next post, Restart post, Refresh). See [docs/glasses.md](docs/glasses.md).
 - **Settings:** lines per page (7, 6 or 5), tap behaviour in the reader, inverted swipes, image placeholders, footnote placement, upper-case short headings, emoji removal, Home items, and how many publications feed Latest.
 - **Readable conversion:** headings, quotes, lists, code, footnotes, tweets, images, galleries, embeds, formulas and polls are turned into plain text or short placeholders such as `[Image: caption]`. Characters the glasses font cannot draw are replaced.
-- **Older-post fallback:** if Substack blocks, rate-limits or cannot serve the first archive request, the relay uses the publication's public sitemap and article pages. Phone and glasses keep **Load older posts** available, loading up to four posts per page with actual titles and dates. Paging stays on the same source until Refresh. Opening a post by publication and slug can likewise recover from its public page. If those pages also fail, the app still tries RSS for recent posts; RSS alone has no older pages. Search, @handle imports and numeric share-link lookups require the API.
+- **Older-post fallback:** when enabled on a compatible relay host, a failed first archive request can recover through the public sitemap and article pages. Phone and glasses retain **Load older posts**, loading up to four posts per page with actual titles and dates; paging stays on the same source until Refresh. `PUBLIC_ARCHIVE_FALLBACK=0` disables this automatic path (the current Cloudflare configuration). Opening a post by publication and slug can still recover from its public page. RSS remains the recent-post fallback and has no older pages. Search, @handle imports and numeric share-link lookups require the API.
 
 ## Limitations
 
@@ -66,7 +68,7 @@ Current setup (2026-10-07): the relay is deployed at [substack-reader-relay.chih
 
 ### 1. Deploy the relay
 
-The relay is one file, `worker/relay.ts`. Pick one host:
+The relay entry point is `worker/relay.ts`. Pick one host:
 
 - **Cloudflare, from GitHub Actions (recommended).**
   1. In Cloudflare, create an API token with the **Workers Scripts: Edit** permission, and make sure your account has a `workers.dev` subdomain (if you have never deployed a Worker, open Workers & Pages in the Cloudflare dashboard once to choose one).

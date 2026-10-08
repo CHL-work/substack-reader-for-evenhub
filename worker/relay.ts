@@ -52,6 +52,8 @@ export interface Env {
   RL_STRICT?: RateLimitBinding
   /** Optional deploy revision (e.g. a git sha) reported by /v1/health. */
   REVISION?: string
+  /** Set to "0" to keep automatic archive failures available for the client's RSS recovery. */
+  PUBLIC_ARCHIVE_FALLBACK?: string
 }
 
 export interface Ctx {
@@ -1411,7 +1413,7 @@ export function createRelay(options: RelayOptions = {}): Relay {
           if (plan.publicPostSlug) return { shaped: await publicPost(plan, plan.host, plan.publicPostSlug, call, clock) }
           // An API offset and a sitemap offset are different sequences. Switch only at the start;
           // subsequent pages explicitly carry source=sitemap even if the API recovers meanwhile.
-          if (plan.archive?.offset === 0 && plan.archive.sort === 'new') {
+          if (call.env.PUBLIC_ARCHIVE_FALLBACK !== '0' && plan.archive?.offset === 0 && plan.archive.sort === 'new') {
             return { shaped: await publicArchive(plan, call, clock) }
           }
         } catch {

@@ -369,6 +369,38 @@ test('archive: sitemap recovery pages past 20 RSS items with four parallel publi
   })
 })
 
+test('archive: disabling automatic sitemap recovery preserves the API error, explicit sitemap and public-post recovery', async () => {
+  const relay = newRelay()
+  const env: Env = { PUBLIC_ARCHIVE_FALLBACK: '0' }
+  const slug = 'public-one'
+  await withUpstream({
+    [archiveUrl(PUBLIC_HOST)]: () => html('API rate limited', 429, { 'Retry-After': '37' }),
+    [`https://${PUBLIC_HOST}/sitemap.xml`]: () => sitemapResponse([slug]),
+    [`https://${PUBLIC_HOST}/api/v1/posts/${slug}`]: () => html('Post API rate limited', 429),
+    [`https://${PUBLIC_HOST}/p/${slug}`]: () => html(publicPostHtml(slug), 200, FINGERPRINT),
+  }, async () => {
+    const failure = await expectError(relay, `/v1/archive?host=${PUBLIC_HOST}`, 503, 'UPSTREAM_RATE_LIMITED', {}, env)
+    assert.equal(failure.res.headers.get('retry-after'), '37')
+    assert.equal(failure.error.retryAfterSeconds, 37)
+    assert.deepEqual(failure.error.upstream, { status: 429, contentType: 'text/html', challenge: false })
+    assert.deepEqual(fetchCalls.map(entry => entry.url), [archiveUrl(PUBLIC_HOST)], 'No sitemap is requested, so the client can use its recent RSS feed.')
+
+    const page = await expectOk<ArchivePage>(relay, `/v1/archive?host=${PUBLIC_HOST}&source=sitemap`, {}, env)
+    assert.equal(page.data.source, 'sitemap')
+    assert.deepEqual(page.data.posts.map(post => post.slug), [slug])
+    assert.equal(page.data.nextOffset, null)
+    const post = await expectOk<PostResponse>(relay, `/v1/post?host=${PUBLIC_HOST}&slug=${slug}`, {}, env)
+    assert.equal(post.data.post.slug, slug)
+    assert.deepEqual(fetchCalls.map(entry => entry.url), [
+      archiveUrl(PUBLIC_HOST),
+      `https://${PUBLIC_HOST}/sitemap.xml`,
+      `https://${PUBLIC_HOST}/p/${slug}`,
+      `https://${PUBLIC_HOST}/api/v1/posts/${slug}`,
+      `https://${PUBLIC_HOST}/p/${slug}`,
+    ])
+  })
+})
+
 test('archive: explicit sitemap respects smaller limits and does not use API offsets as sitemap offsets', async () => {
   const relay = newRelay()
   const slugs = ['public-one', 'public-two', 'public-three']

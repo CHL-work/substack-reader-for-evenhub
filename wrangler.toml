@@ -3,6 +3,10 @@ main = "worker/relay.ts"
 compatibility_date = "2026-09-01"
 workers_dev = true
 
+[vars]
+# Cloudflare can read recent RSS but some older public pages are rate limited.
+PUBLIC_ARCHIVE_FALLBACK = "0"
+
 [observability]
 enabled = false
 
