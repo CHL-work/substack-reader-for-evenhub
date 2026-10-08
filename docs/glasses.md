@@ -62,6 +62,8 @@ Tap then hold opens the system menu, which lists these items above the system's 
 
 An item that does not apply shows "Not available here" in the footer for one frame.
 
+Publication archives can use the relay's sitemap recovery when the Substack API is unavailable. A short page still offers Load older when the relay returns another cursor. Load older and Next post keep using the same archive ordering; Refresh starts again at the first page and lets the relay choose its source anew. If only the emergency RSS feed is available, it contains recent posts and has no older-page cursor.
+
 ## Frames
 
 `·` is U+00B7, `×` is U+00D7, `…` is U+2026. All are in the G2 font.

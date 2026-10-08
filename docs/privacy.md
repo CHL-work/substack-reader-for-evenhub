@@ -27,7 +27,7 @@ The app talks to one relay, at the origin shown in the phone's Diagnostics panel
 The relay:
 
 - **does not log requests** (no logging code; Cloudflare observability is disabled in `wrangler.toml`) and stores nothing permanently;
-- uses your IP address (for IPv6, only its first 64 bits) only as an in-memory key to limit request rates (at most 60 requests per minute per route, and 10 per minute for checking a new custom domain or probing Substack); with Cloudflare's rate-limit bindings, Cloudflare counts that key for one minute. On hosts other than Cloudflare the relay does not use your address at all, and everyone shares the same limits;
+- uses your IP address (for IPv6, only its first 64 bits) only as an in-memory key to limit request rates (at most 60 requests per minute per route, and 10 per minute for checking a new custom domain, probing Substack or recovering archive pages from public pages); with Cloudflare's rate-limit bindings, Cloudflare counts that key for one minute. On hosts other than Cloudflare the relay does not use your address at all, and everyone shares the same limits;
 - fetches the public Substack data with its own honest User-Agent (`SubstackReaderForEvenHub/<version>`) and no cookies, so Substack sees the relay, not you;
 - removes fields the app does not need before answering;
 - may keep the trimmed answers in the hosting provider's short-lived edge cache, keyed by what was requested and never by who asked: lists up to 5 minutes, posts up to 15 minutes (a "not found" answer for 1 minute), feeds up to 10 minutes, profiles and search results up to 1 hour. The result of checking that a custom domain belongs to Substack is cached for up to 24 hours (a failed check for 1 hour, a domain that does not exist for 10 minutes, and a check that could not finish for 1 minute in memory only);
@@ -37,7 +37,7 @@ The relay:
 
 | Party | Why | What it receives |
 | --- | --- | --- |
-| Substack | Source of all content | Requests from the relay (public archive, post, profile, search and feed endpoints) |
+| Substack | Source of all content | Requests from the relay (public archive, post, profile, search and feed endpoints, plus public sitemaps and article pages for recovery) |
 | Cloudflare | Hosts the relay (Workers) and answers DNS-over-HTTPS lookups (`cloudflare-dns.com`) used to verify custom domains | The connection from your phone to the relay, under Cloudflare's own privacy policy; domain names being verified |
 | OpenAI Sites | Only if the relay is hosted there instead of Cloudflare | The same as Cloudflare's hosting role |
 | Even Realities | Hosts and runs the plugin in the Even app and provides its storage | Whatever the Even app itself collects under Even Realities' policy; the plugin sends it no reading data |

@@ -64,8 +64,10 @@ export interface PostDetail extends PostSummary {
 export interface ArchivePage {
   publication: PubMeta | null
   posts: PostSummary[]
-  /** offset + posts.length while posts were returned; null only after an empty page. */
+  /** Relay cursor for the next page; null when this archive source is exhausted. */
   nextOffset: number | null
+  /** Pin subsequent offsets to this ordering; absent for the normal Substack archive. */
+  source?: 'sitemap'
 }
 
 export interface Profile {

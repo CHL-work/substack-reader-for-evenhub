@@ -41,6 +41,8 @@ export interface BrowseState {
   name: string
   posts: PostSummary[]
   nextOffset: number | null
+  /** In-memory cursor ordering returned by the relay. */
+  source?: 'sitemap'
   loaded: boolean
 }
 

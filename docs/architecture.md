@@ -61,10 +61,11 @@ Phone publication adding and Browse use the same first-page RSS recovery for `UP
 
 ## Lists
 
-- **Publication list:** the relay's archive route, 12 posts per request. A "Load older posts…" row stays while `nextOffset` is not `null`. Substack often returns fewer posts than asked for, so a short page never ends the list; only an empty one does.
+- **Publication list:** the relay's archive route requests 12 posts at a time. A "Load older posts…" row stays while `nextOffset` is not `null`; the returned cursor, not the requested page size, controls pagination. Both Substack and the relay's sitemap recovery can return shorter pages.
+- **Archive source:** a first page marked `source: 'sitemap'` pins subsequent offsets to the sitemap order. Phone Browse, glasses Load older, retries and Next post all send `source=sitemap` until that list is refreshed or reopened. Refresh requests offset zero without a source so the relay can use the regular API again. A cancelled or failed refresh keeps the previous list and its cursor source. Source metadata lives only in the open list, never in library or progress storage.
 - **Latest:** the first N publications marked "In Latest" (N is a setting, default 10) are fetched 2 at a time, merged newest first, deduplicated and cut to 50. Publications that fail are counted in the footer (`· 2 failed`). The result is cached in memory for 5 minutes; Refresh skips the cache.
 - **Saved and History:** local lists, no network.
-- **Feed fallback:** when the first archive page fails with `UPSTREAM_BLOCKED`, `UPSTREAM_RATE_LIMITED` or `UPSTREAM_UNAVAILABLE`, the controller fetches `GET <relay>/v1/feed` once and shows the feed's recent posts. Their HTML is kept in memory so opening them needs no further request. If the feed also fails, the original archive error is shown.
+- **Feed fallback:** if the first archive page still fails with `UPSTREAM_BLOCKED`, `UPSTREAM_RATE_LIMITED` or `UPSTREAM_UNAVAILABLE`, the controller fetches `GET <relay>/v1/feed` once and shows the feed's recent posts. This emergency list has no older-page cursor. Its HTML is kept in memory so opening these posts needs no further request. If the feed also fails, the original archive error is shown.
 
 ## Persistence
 

@@ -69,6 +69,8 @@ export interface ArchiveOptions {
   offset?: number
   limit?: number
   sort?: 'new' | 'top'
+  /** Continue the relay's sitemap ordering after a fallback page. */
+  source?: 'sitemap'
 }
 
 export type PostLookup = { host: string; slug: string } | { id: number }
@@ -270,6 +272,7 @@ function archiveFrom(data: unknown, offset: number, host: string): ArchivePage {
     publication: pubMetaFrom(d.publication),
     posts,
     nextOffset: next !== null && next > offset && next <= RELAY_MAX_ARCHIVE_OFFSET ? next : null,
+    ...(d.source === 'sitemap' ? { source: 'sitemap' as const } : {}),
   }
 }
 
@@ -431,6 +434,7 @@ export function createApi(
       const sort = o.sort === 'top' ? 'top' : 'new'
       const { data, meta } = await getJson(relayUrl(relay, 'archive', {
         host: requested, offset: String(offset), limit: String(limit), sort,
+        ...(o.source === 'sitemap' ? { source: 'sitemap' } : {}),
       }), signal)
       const finalHost = metaHost(meta) ?? requested
       return { page: archiveFrom(data, offset, finalHost), host: finalHost }

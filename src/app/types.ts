@@ -167,6 +167,8 @@ export type GlassesView =
       items: PostRef[]
       /** Archive offset for "Load older posts..."; null when there is no such row. */
       nextOffset: number | null
+      /** In-memory cursor ordering; never copied into saved posts or publications. */
+      archiveSource?: 'sitemap'
       state: LoadState
       error?: ViewError | null
       /** Latest only: publications whose archive failed to load. */

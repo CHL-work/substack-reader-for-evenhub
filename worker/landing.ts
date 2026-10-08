@@ -43,7 +43,7 @@ export function privacyPage(relayHost: string): string {
     + `<p>${name} is an independent project and is not affiliated with Substack Inc. or Even Realities.</p>`
     + `<h2>The relay at ${host}</h2>`
     + '<ul>'
-    + '<li>When you open a list, a post, a profile or a search in the app, the app asks this relay for it. The relay fetches the public Substack data (a publication archive, one post, a public profile, search results or an RSS feed), removes fields the app does not need and returns the rest.</li>'
+    + '<li>When you open a list, a post, a profile or a search in the app, the app asks this relay for it. The relay fetches the public Substack data (a publication archive, one post, a public profile, search results or an RSS feed), removes fields the app does not need and returns the rest. If the API is unavailable, it can read public sitemaps and article pages to recover older posts.</li>'
     + '<li>The relay never sends cookies or logins to Substack, so it only ever sees free posts and the public previews of paid posts.</li>'
     + '<li>It has no accounts, no cookies, no analytics and no request logs, and it stores nothing permanently.</li>'
     + '<li>To reduce load on Substack, responses may be kept in the hosting provider&#39;s short-lived edge cache: lists for up to 5 minutes, posts for up to 15 minutes, profiles and search results for up to 1 hour. The result of checking that a custom domain belongs to Substack is cached for up to 24 hours.</li>'

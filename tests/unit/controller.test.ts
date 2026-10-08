@@ -39,12 +39,12 @@ type ArchiveReply = { page: ArchivePage; host: string }
 type PostReply = { post: PostDetail; publication: PubMeta | null; host: string }
 
 function fakeApi() {
-  const archive: Array<{ host: string; offset?: number; limit?: number; signal?: AbortSignal; reply: Deferred<ArchiveReply> }> = []
+  const archive: Array<{ host: string; offset?: number; limit?: number; source?: 'sitemap'; signal?: AbortSignal; reply: Deferred<ArchiveReply> }> = []
   const posts: Array<{ ref: { host: string; slug: string } | { id: number }; signal?: AbortSignal; reply: Deferred<PostReply> }> = []
   const api: ReaderApi = {
     getArchive(host, options, signal) {
       const reply = deferred<ArchiveReply>()
-      archive.push({ host, offset: options.offset, limit: options.limit, signal, reply })
+      archive.push({ host, offset: options.offset, limit: options.limit, ...(options.source ? { source: options.source } : {}), signal, reply })
       return reply.promise
     },
     getPost(ref, signal) {
@@ -120,8 +120,8 @@ function pubMeta(host: string, name: string): PubMeta {
   return { id: 100, name, subdomain: host.split('.')[0]!, customDomain: null, host }
 }
 
-function archiveReply(host: string, name: string, posts: PostSummary[], offset: number): ArchiveReply {
-  return { page: { publication: pubMeta(host, name), posts, nextOffset: posts.length ? offset + posts.length : null }, host }
+function archiveReply(host: string, name: string, posts: PostSummary[], offset: number, source?: 'sitemap'): ArchiveReply {
+  return { page: { publication: pubMeta(host, name), posts, nextOffset: posts.length ? offset + posts.length : null, ...(source ? { source } : {}) }, host }
 }
 
 function postReply(id: number, overrides: Partial<PostDetail> = {}): PostReply {
@@ -977,6 +977,97 @@ test('a blocked archive falls back to the feed and opens posts from the feed HTM
   await other
   assert.deepEqual(feedCalls, [ALPHA])
   assert.deepEqual(t.last(), { title: 'Beta', body: 'That site is not a Substack publication.', footer: `Tap retry${DOT}2${X}tap back` })
+})
+
+test('sitemap pagination stays pinned for older, retry and Next post, while Refresh can return to the API', async () => {
+  const t = await setup({ publications: [pub(ALPHA, 'Alpha')] })
+  await t.controller.start()
+  await t.controller.onAction('next')
+  await t.controller.onAction('select')
+  const opening = t.controller.onAction('select')
+  assert.equal(t.api.archive[0]!.source, undefined, 'the relay chooses the first page source')
+  t.api.archive[0]!.reply.resolve(archiveReply(ALPHA, 'Alpha', [summary(1), summary(2), summary(3), summary(4)], 0, 'sitemap'))
+  await opening
+  const initial = t.controller.view()
+  assert.ok(initial.kind === 'posts')
+  assert.equal(initial.archiveSource, 'sitemap')
+
+  for (let index = 0; index < 4; index += 1) await t.controller.onAction('next')
+  let older = t.controller.onAction('select')
+  assert.deepEqual([t.api.archive[1]!.offset, t.api.archive[1]!.source], [4, 'sitemap'])
+  t.api.archive[1]!.reply.reject({ code: 'NETWORK_ERROR', message: 'offline' })
+  await older
+  older = t.controller.onAction('select')
+  assert.deepEqual([t.api.archive[2]!.offset, t.api.archive[2]!.source], [4, 'sitemap'])
+  t.api.archive[2]!.reply.resolve(archiveReply(ALPHA, 'Alpha', [summary(5)], 4, 'sitemap'))
+  await older
+
+  // A cancelled refresh keeps the loaded list's cursor ordering for subsequent navigation.
+  const cancelledRefresh = t.controller.onAction('menu:5')
+  assert.deepEqual([t.api.archive[3]!.offset, t.api.archive[3]!.source], [0, undefined])
+  await t.controller.onAction('back')
+  t.api.archive[3]!.reply.reject({ code: 'ABORTED', message: 'cancelled' })
+  await cancelledRefresh
+  const reading = t.controller.onAction('select')
+  t.api.posts[0]!.reply.resolve(postReply(5))
+  await reading
+  const next = t.controller.onAction('menu:3')
+  assert.deepEqual([t.api.archive[4]!.offset, t.api.archive[4]!.source], [5, 'sitemap'])
+  t.api.archive[4]!.reply.resolve(archiveReply(ALPHA, 'Alpha', [summary(6)], 5, 'sitemap'))
+  await flushPromises()
+  assert.deepEqual(t.api.posts[1]!.ref, { host: ALPHA, slug: 'post-6' })
+  t.api.posts[1]!.reply.resolve(postReply(6))
+  await next
+  await t.controller.onAction('back')
+
+  const refreshing = t.controller.onAction('menu:5')
+  assert.deepEqual([t.api.archive[5]!.offset, t.api.archive[5]!.source], [0, undefined])
+  t.api.archive[5]!.reply.resolve(archiveReply(ALPHA, 'Alpha', [summary(10)], 0))
+  await refreshing
+  const refreshed = t.controller.view()
+  assert.ok(refreshed.kind === 'posts')
+  assert.equal(refreshed.archiveSource, undefined)
+  await t.controller.onAction('next')
+  older = t.controller.onAction('select')
+  assert.deepEqual([t.api.archive[6]!.offset, t.api.archive[6]!.source], [1, undefined])
+  t.api.archive[6]!.reply.resolve(archiveReply(ALPHA, 'Alpha', [], 1))
+  await older
+  t.store.save('prefs')
+  await t.store.flush()
+  assert.ok(![...t.data.values()].join('').includes('sitemap'), 'archive source is never persisted with the library or reading progress')
+})
+
+test('all 20 RSS items can be selected and read across glasses list windows', async () => {
+  const posts = Array.from({ length: 20 }, (_, index) => summary(-(index + 1), {
+    slug: `feed-${index + 1}`, title: `Feed ${index + 1}`, wordcount: null,
+  }))
+  const feedCalls: string[] = []
+  const t = await setup({
+    publications: [pub(ALPHA, 'Alpha')],
+    async getFeed(host) {
+      feedCalls.push(host)
+      return { posts, bodies: new Map(posts.map((post, index) => [post.slug, bodyText(index + 1)])) }
+    },
+  })
+  await t.controller.start()
+  await t.controller.onAction('next')
+  await t.controller.onAction('select')
+  const opening = t.controller.onAction('select')
+  t.api.archive[0]!.reply.reject({ code: 'UPSTREAM_RATE_LIMITED', message: 'busy' })
+  await opening
+  for (let index = 0; index < posts.length; index += 1) {
+    if (index > 0) await t.controller.onAction('next')
+    assert.ok(t.last().body.split('\n').includes(`> Feed ${index + 1}`), `RSS item ${index + 1} is selected, including beyond the initial visible rows`)
+    assert.match(t.last().footer, new RegExp(`^${index + 1}/\\d+${DOT}Tap read`))
+    await t.controller.onAction('select')
+    assert.equal(t.last().body, pagesOf(index + 1)[0]!.text, `RSS item ${index + 1} opens its own body`)
+    assert.equal(t.store.state.lastOpen?.slug, posts[index]!.slug)
+    await t.controller.onAction('back')
+    assert.ok(t.last().body.split('\n').includes(`> Feed ${index + 1}`), 'Back retains the selected later item')
+  }
+  assert.deepEqual(feedCalls, [ALPHA])
+  assert.equal(t.api.archive.length, 1, 'All 20 feed items are available from the first response')
+  assert.equal(t.api.posts.length, 0, 'Every item keeps its in-memory feed body')
 })
 
 for (const [source, code] of [

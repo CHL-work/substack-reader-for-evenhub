@@ -2,7 +2,7 @@
 
 An [Even Hub](https://hub.evenrealities.com) plugin that shows public Substack posts on Even Realities G2 glasses. You choose publications on your phone and read them on the glasses, one page at a time.
 
-- Version 0.1.1, package id `com.chlwork.substackreader`, built with Even Hub SDK 0.0.16 (requires Even app 2.2.10 or later).
+- Version 0.1.2, package id `com.chlwork.substackreader`, built with Even Hub SDK 0.0.16 (requires Even app 2.2.10 or later).
 - English only. No account, no login, no cookies.
 - This is an independent project. It is **not affiliated with Substack Inc. or Even Realities**.
 
@@ -47,7 +47,7 @@ Post HTML is converted to plain text on the phone and never inserted into the pa
 - **Gestures:** swipe to move or turn pages, tap to open or turn, double-tap to go back (and to exit from Home), plus a contextual menu (Home, Save for later, Next post, Restart post, Refresh). See [docs/glasses.md](docs/glasses.md).
 - **Settings:** lines per page (7, 6 or 5), tap behaviour in the reader, inverted swipes, image placeholders, footnote placement, upper-case short headings, emoji removal, Home items, and how many publications feed Latest.
 - **Readable conversion:** headings, quotes, lists, code, footnotes, tweets, images, galleries, embeds, formulas and polls are turned into plain text or short placeholders such as `[Image: caption]`. Characters the glasses font cannot draw are replaced.
-- **Fallback:** if Substack blocks, rate-limits or cannot serve the first archive request, both phone and glasses try the publication's RSS feed through the same relay. You can add publications, browse and save recent posts, paste recent post URLs, and reopen saved posts after restarting. Only posts still present in the feed are available while the API is unavailable; RSS does not provide older archive pages, search, @handle imports or numeric share-link lookups.
+- **Older-post fallback:** if Substack blocks, rate-limits or cannot serve the first archive request, the relay uses the publication's public sitemap and article pages. Phone and glasses keep **Load older posts** available, loading up to four posts per page with actual titles and dates. Paging stays on the same source until Refresh. Opening a post by publication and slug can likewise recover from its public page. If those pages also fail, the app still tries RSS for recent posts; RSS alone has no older pages. Search, @handle imports and numeric share-link lookups require the API.
 
 ## Limitations
 
@@ -92,7 +92,7 @@ Optional variable `ENABLE_RSS2JSON_FALLBACK=1` builds with `VITE_ENABLE_RSS2JSON
 
 ### 3. Build the package
 
-- **In CI:** every push runs the **CI** workflow. When `VITE_RELAY_ORIGIN` is set, it uploads the artifact `substack-reader-ehpk` (`substack-reader-0.1.1.ehpk`). Publishing a GitHub release whose tag matches `package.json` (for example `v0.1.1-alpha.1`, marked as a pre-release) runs the **Release package** workflow, which attaches the `.ehpk` to the release.
+- **In CI:** every push runs the **CI** workflow. When `VITE_RELAY_ORIGIN` is set, it uploads the artifact `substack-reader-ehpk` (`substack-reader-0.1.2.ehpk`). Publishing a GitHub release whose tag matches `package.json` (for example `v0.1.2-alpha.1`, marked as a pre-release) runs the **Release package** workflow, which attaches the `.ehpk` to the release.
 - **Locally** (PowerShell, portable Node; this only builds and packs, it runs no tests):
   ```powershell
   $env:PATH = "C:\Code\substack-reader-for-evenhub\.tools\node;$env:PATH"; $env:COREPACK_ENABLE_DOWNLOAD_PROMPT = "0"
@@ -100,7 +100,7 @@ Optional variable `ENABLE_RSS2JSON_FALLBACK=1` builds with `VITE_ENABLE_RSS2JSON
   pnpm run check
   $env:VITE_RELAY_ORIGIN = "https://<relay-origin>"
   pnpm run build
-  pnpm run pack      # -> artifacts/substack-reader-0.1.1.ehpk
+  pnpm run pack      # -> artifacts/substack-reader-0.1.2.ehpk
   ```
 
 `pnpm run pack` refuses to package when `dist/` was built for a different relay origin or version, when the Even Hub CLI prints a warning, or when the CLI does not stamp `min_app_version 2.2.10`. It needs network access to the npm registry, because the CLI looks up the SDK's minimum app version there.
@@ -108,7 +108,7 @@ Optional variable `ENABLE_RSS2JSON_FALLBACK=1` builds with `VITE_ENABLE_RSS2JSON
 ### 4. Upload to Even Hub
 
 1. Sign in at [hub.evenrealities.com](https://hub.evenrealities.com) with your developer account and open (or create) the project for `com.chlwork.substackreader`.
-2. Under **Builds**, upload `substack-reader-0.1.1.ehpk` and write a short change log (Even requires one for every version).
+2. Under **Builds**, upload `substack-reader-0.1.2.ehpk` and write a short change log (Even requires one for every version).
 3. A new build starts as **Private**. Promote it to **Beta** (open the build's Private badge, choose Beta, then Promote to Beta). The LIHKG reader once showed an "expired" message because this step was missed.
 4. As a tester, install or update it in the Even app (Me → Beta tester). Private builds appear under Even Hub → Me → Apps → Private builds.
 5. Work through [docs/device-checklist.md](docs/device-checklist.md) on real glasses. For the listing's privacy policy, use `https://<relay-origin>/privacy` together with [docs/privacy.md](docs/privacy.md).

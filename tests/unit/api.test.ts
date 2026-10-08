@@ -192,6 +192,29 @@ test('archive data is normalized defensively; meta.host wins', async () => {
   })
 })
 
+test('archive source is accepted only for sitemap pages and is sent only when explicitly requested', async () => {
+  let source: unknown = 'sitemap'
+  let nextOffset = 4
+  const rec = recorder(() => ok({ publication: null, posts: [postFixture], nextOffset, source }))
+  const api = createApi(RELAY, rec.fetch)
+  const initial = await api.getArchive('foo.substack.com')
+  assert.equal(initial.page.source, 'sitemap')
+  nextOffset = 8
+  const older = await api.getArchive('foo.substack.com', { offset: initial.page.nextOffset!, source: initial.page.source })
+  assert.equal(older.page.source, 'sitemap')
+  assert.equal(older.page.nextOffset, 8, 'a short sitemap page keeps its own cursor')
+  assert.deepEqual(rec.calls.slice(0, 2).map(call => call.url), [
+    `${RELAY}/v1/archive?host=foo.substack.com&offset=0&limit=12&sort=new`,
+    `${RELAY}/v1/archive?host=foo.substack.com&offset=4&limit=12&sort=new&source=sitemap`,
+  ])
+  for (source of ['SITEMAP', 'api', '', null, false, {}]) {
+    const result = await api.getArchive('foo.substack.com', { source: 'unknown' as 'sitemap' })
+    assert.equal(Object.hasOwn(result.page, 'source'), false, 'unknown response sources are discarded')
+    assert.equal(new URL(rec.calls[rec.calls.length - 1]!.url).searchParams.has('source'), false)
+  }
+  for (const call of rec.calls) assertSimpleGet(call.init)
+})
+
 test('nextOffset: short pages continue (C1); offsets that do not advance end the list', async () => {
   let nextOffset: unknown = 13
   const rec = recorder(() => ok({ publication: null, posts: [postFixture], nextOffset }))

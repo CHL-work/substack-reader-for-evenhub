@@ -1,5 +1,15 @@
 # Handoff: Reader for Substack (Even Hub plugin for Even G2)
 
+## Active update: older posts (2026-10-08)
+
+Work is on `fix/older-posts`, preparing v0.1.2. The owner reports that the publication for 陸行之 stops after four posts / cannot load older posts. Publisher identity is `andrewhclu.substack.com`. Live RSS has 20 posts, while the deployed archive API returns 429. The client treated RSS recovery as a complete archive (`nextOffset=null`), so older posts outside RSS were inaccessible. There is no intentional four-post cap; regressions now cover all 20 RSS posts and the fourth-to-fifth transition.
+
+An isolated Cloudflare probe confirmed `/sitemap.xml` 200 with 165 post URLs, normal `/archive` HTML 429, and an older `/p/<slug>` page 200 with public preloads. [Probe run](https://github.com/CHL-work/substack-reader-for-evenhub/actions/runs/37809714465) includes status/shape only and confirmed cleanup of the disposable Worker. Its temporary workflow was removed. The first probe run needed propagation delay and scoped API cleanup (Wrangler delete tried an ungranted KV permission); no token expansion or production change was made for the probe.
+
+v0.1.2 adds bounded sitemap + public article-page recovery in the relay, and `source=sitemap` continuation in phone/glasses paging so API and sitemap offsets never mix. At most four public article pages are hydrated concurrently, within a shared 10-second deadline; partial failure fails the page for retry. Actual titles/dates come from post metadata, not sitemap lastmod. Public paid previews remain previews, no cookies/login/scripts, and no article bodies are persisted on the phone. RSS remains the last recovery path when public pages also fail. See [relay.md](relay.md) for the contract and security bounds.
+
+Pending for this update: branch CI, production deployment, real publication paging checks, v0.1.2 Beta/package release, and hardware retest by the owner. The older release record below describes v0.1.1 and is superseded by this section for the current work. Other agents must preserve this branch and shared checkout while this update is in progress; no local runtime tests are permitted.
+
 State as of **2026-10-07**: v0.1.1 code baseline `b963146` is on `main`, fast-forwarded after [branch CI](https://github.com/CHL-work/substack-reader-for-evenhub/actions/runs/37724951787) passed all tests, build and packaging. The relay is deployed at the same revision and v0.1.1 is **Published Beta** in Even Hub; v0.1.0 remains Private. [GitHub prerelease `v0.1.1-alpha.1`](https://github.com/CHL-work/substack-reader-for-evenhub/releases/tag/v0.1.1-alpha.1) points to `b963146`; its release workflow passed and attached the package. The owner's confirmed Even app account was invited on 2026-10-07; invitation acceptance, installation and real glasses checks remain unverified.
 
 Read this file first, then [AGENTS.md](../AGENTS.md) (rules), then the docs it points to. The [README](../README.md) is written for the owner; this file is written for the next agent.

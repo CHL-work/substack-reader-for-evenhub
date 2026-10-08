@@ -404,9 +404,9 @@ export function createPhoneApp(deps: PhoneDeps): PhoneApp {
   }
 
   /** RSS has only recent posts, so it can replace the first page but never an older page. */
-  async function archiveWithFeed(host: string, offset: number, ctx: RunContext): Promise<ArchiveResult> {
+  async function archiveWithFeed(host: string, offset: number, ctx: RunContext, source?: 'sitemap'): Promise<ArchiveResult> {
     try {
-      return await api.getArchive(host, { offset, limit: ARCHIVE_PAGE_SIZE }, ctx.signal)
+      return await api.getArchive(host, { offset, limit: ARCHIVE_PAGE_SIZE, ...(source ? { source } : {}) }, ctx.signal)
     } catch (err) {
       if (offset !== 0) throw err
       const feed = await feedAfterError(host, ctx, err)
@@ -627,7 +627,7 @@ export function createPhoneApp(deps: PhoneDeps): PhoneApp {
     const current = browse
     if (!current) return
     const offset = more ? current.nextOffset ?? current.posts.length : 0
-    const result = await archiveWithFeed(current.host, offset, ctx)
+    const result = await archiveWithFeed(current.host, offset, ctx, more ? current.source : undefined)
     if (!ctx.live() || browse !== current) return
     if (result.host !== current.host) {
       if (rehostPublication(state, current.host, result.host)) changed('prefs')
@@ -636,6 +636,7 @@ export function createPhoneApp(deps: PhoneDeps): PhoneApp {
     const fresh = result.page.posts.map(summaryOf)
     current.posts = more ? appendPosts(current.posts, fresh) : fresh
     current.nextOffset = result.page.posts.length ? result.page.nextOffset : null
+    current.source = more ? result.page.source ?? current.source : result.page.source
     if (result.page.publication?.name && !current.name) current.name = result.page.publication.name
     current.loaded = true
   }

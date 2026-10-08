@@ -91,6 +91,35 @@ function archiveUrl(host: string, offset = 0, limit = 12, sort = 'new'): string 
   return `https://${host}/api/v1/archive?sort=${sort}&search=&offset=${offset}&limit=${limit}`
 }
 
+const PUBLIC_HOST = 'publicletters.substack.com'
+const PUBLIC_PUB = { id: 424242, name: 'Public Letters', subdomain: 'publicletters', custom_domain: null, base_url: `https://${PUBLIC_HOST}` }
+
+function sitemap(slugs: readonly string[]): string {
+  return '<?xml version="1.0"?><urlset xmlns="http://www.sitemaps.org/schemas/sitemap/0.9">'
+    + slugs.map(slug => `<url><loc>https://${PUBLIC_HOST}/p/${slug}</loc></url>`).join('') + '</urlset>'
+}
+
+function sitemapResponse(slugs: readonly string[]): Response {
+  return new Response(sitemap(slugs), { headers: { ...FINGERPRINT, 'content-type': 'application/xml' } })
+}
+
+/** Public anonymous page payload: parse the string as data; never execute either script. */
+function publicPostHtml(slug: string, id = 9001, overrides: Record<string, unknown> = {}): string {
+  const preloads = {
+    pub: PUBLIC_PUB,
+    post: { ...postFreeFixture, id, slug, canonical_url: `https://${PUBLIC_HOST}/p/${slug}`, ...overrides },
+    user: { private_test_marker: 'UNRELATED-PRELOAD-DATA' },
+  }
+  return '<!doctype html><html><body><script>throw new Error("PUBLIC-PAGE-SCRIPT-MUST-NOT-RUN")</script>'
+    + `<script nonce="synthetic">window._preloads = JSON.parse(${JSON.stringify(JSON.stringify(preloads))});</script></body></html>`
+}
+
+function assertPublicInit(init: RequestInit | undefined, content: 'xml' | 'html'): void {
+  const accept = new Headers(init?.headers).get('Accept') ?? ''
+  assert.ok(accept.includes(content), `The public ${content} request advertises its expected content type.`)
+  assertUpstreamInit(init, accept) // Exactly the honest User-Agent and Accept; no cookies or browser headers.
+}
+
 function proofUrl(host: string): string {
   return `https://${host}/api/v1/archive?sort=new&offset=0&limit=1`
 }
@@ -297,6 +326,199 @@ test('archive: limit is clamped to 1..20, short pages still page on, only an emp
   })
 })
 
+test('archive: sitemap recovery pages past 20 RSS items with four parallel public pages per request', async () => {
+  const relay = newRelay()
+  const slugs = Array.from({ length: 25 }, (_, index) => `public-post-${String(index + 1).padStart(2, '0')}`)
+  let concurrent = 0
+  let maximumConcurrent = 0
+  const table: Record<string, Handler> = {
+    [archiveUrl(PUBLIC_HOST)]: () => html('API rate limited', 429, { 'Retry-After': '60' }),
+    [`https://${PUBLIC_HOST}/sitemap.xml`]: init => { assertPublicInit(init, 'xml'); return sitemapResponse(slugs) },
+  }
+  for (const [index, slug] of slugs.entries()) {
+    table[`https://${PUBLIC_HOST}/p/${slug}`] = async init => {
+      assertPublicInit(init, 'html')
+      concurrent += 1
+      maximumConcurrent = Math.max(maximumConcurrent, concurrent)
+      await Promise.resolve()
+      concurrent -= 1
+      return html(publicPostHtml(slug, 9200 + index), 200, FINGERPRINT)
+    }
+  }
+  await withUpstream(table, async () => {
+    const seen: string[] = []
+    for (let offset = 0; offset < slugs.length; offset += 4) {
+      const path = `/v1/archive?host=${PUBLIC_HOST}&offset=${offset}` + (offset ? '&source=sitemap' : '')
+      const { data, meta } = await expectOk<ArchivePage>(relay, path)
+      assert.equal((data as ArchivePage & { source?: string }).source, 'sitemap')
+      assert.equal(meta.host, PUBLIC_HOST)
+      assert.equal(data.publication?.name, PUBLIC_PUB.name)
+      assert.deepEqual(data.posts.map(post => post.slug), slugs.slice(offset, offset + 4))
+      assert.equal(data.nextOffset, offset + 4 < slugs.length ? offset + 4 : null)
+      assert.equal(JSON.stringify(data).includes('bodyHtml'), false, 'Archive responses retain summaries only.')
+      assert.equal(JSON.stringify(data).includes('UNRELATED-PRELOAD-DATA'), false)
+      seen.push(...data.posts.map(post => post.slug))
+    }
+    assert.deepEqual(seen, slugs, 'Every sitemap post is reachable, including posts 21 through 25 outside the recent RSS feed.')
+    assert.equal(fetchCalls.filter(entry => entry.url.includes('/api/v1/archive')).length, 1, 'The source cursor never retries the blocked API on older pages.')
+    assert.equal(fetchCalls.filter(entry => entry.url.includes('/p/')).length, 25)
+    assert.equal(maximumConcurrent, 4, 'Each full page hydrates its four bounded public posts in parallel.')
+  })
+})
+
+test('archive: explicit sitemap respects smaller limits and does not use API offsets as sitemap offsets', async () => {
+  const relay = newRelay()
+  const slugs = ['public-one', 'public-two', 'public-three']
+  await withUpstream({
+    [`https://${PUBLIC_HOST}/sitemap.xml`]: () => sitemapResponse(slugs),
+    [`https://${PUBLIC_HOST}/p/public-one`]: () => html(publicPostHtml('public-one'), 200, FINGERPRINT),
+    [`https://${PUBLIC_HOST}/p/public-two`]: () => html(publicPostHtml('public-two', 9002), 200, FINGERPRINT),
+    [archiveUrl(PUBLIC_HOST, 4)]: () => html('API rate limited', 429),
+    [archiveUrl(PUBLIC_HOST, 0, 12, 'top')]: () => html('API blocked', 403),
+  }, async () => {
+    const page = await expectOk<ArchivePage>(relay, `/v1/archive?host=${PUBLIC_HOST}&source=sitemap&limit=2`)
+    assert.deepEqual(page.data.posts.map(post => post.slug), slugs.slice(0, 2))
+    assert.equal(page.data.nextOffset, 2)
+    const before = fetchCalls.length
+    await expectError(relay, `/v1/archive?host=${PUBLIC_HOST}&offset=4`, 503, 'UPSTREAM_RATE_LIMITED')
+    await expectError(relay, `/v1/archive?host=${PUBLIC_HOST}&sort=top`, 503, 'UPSTREAM_BLOCKED')
+    assert.deepEqual(fetchCalls.slice(before).map(entry => entry.url), [archiveUrl(PUBLIC_HOST, 4), archiveUrl(PUBLIC_HOST, 0, 12, 'top')])
+  })
+})
+
+test('archive: blocked and unavailable first pages also recover through the public sitemap', async () => {
+  for (const status of [403, 503]) {
+    const relay = newRelay()
+    await withUpstream({
+      [archiveUrl(PUBLIC_HOST)]: () => html('API unavailable', status),
+      [`https://${PUBLIC_HOST}/sitemap.xml`]: () => sitemapResponse(['public-one']),
+      [`https://${PUBLIC_HOST}/p/public-one`]: () => html(publicPostHtml('public-one'), 200, FINGERPRINT),
+    }, async () => {
+      const { data } = await expectOk<ArchivePage>(relay, `/v1/archive?host=${PUBLIC_HOST}`)
+      assert.deepEqual(data.posts.map(post => post.slug), ['public-one'])
+      assert.equal(data.nextOffset, null)
+    })
+  }
+})
+
+test('public post recovery keeps free text and paid previews separate, and cannot infer a host from numeric ids', async () => {
+  const relay = newRelay()
+  const cases = [
+    { slug: 'public-free', audience: 'everyone', body: '<p>Synthetic public full text.</p>' },
+    { slug: 'public-paid', audience: 'only_paid', body: '<p>Synthetic free preview only.</p>' },
+    { slug: 'public-paid-null', audience: 'only_paid', body: null },
+  ]
+  const table: Record<string, Handler> = {
+    'https://substack.com/api/v1/posts/by-id/9001': () => html('API rate limited', 429),
+  }
+  for (const [index, entry] of cases.entries()) {
+    table[`https://${PUBLIC_HOST}/api/v1/posts/${entry.slug}`] = () => html('API rate limited', 429)
+    table[`https://${PUBLIC_HOST}/p/${entry.slug}`] = init => {
+      assertPublicInit(init, 'html')
+      return html(publicPostHtml(entry.slug, 9300 + index, {
+        audience: entry.audience, body_html: entry.body, body_json: { private_text: 'DO-NOT-RETURN-OTHER-PAYLOAD-FIELDS' },
+      }), 200, FINGERPRINT)
+    }
+  }
+  await withUpstream(table, async () => {
+    for (const entry of cases) {
+      const { data, meta } = await expectOk<PostResponse>(relay, `/v1/post?host=${PUBLIC_HOST}&slug=${entry.slug}`)
+      assert.equal(meta.host, PUBLIC_HOST)
+      assert.equal(data.publication?.name, PUBLIC_PUB.name)
+      assert.equal(data.post.bodyHtml, entry.body)
+      assert.equal(data.post.isPaywalled, entry.audience !== 'everyone')
+      assert.equal(data.post.truncated, entry.audience !== 'everyone')
+      assert.equal(JSON.stringify(data).includes('DO-NOT-RETURN-OTHER-PAYLOAD-FIELDS'), false)
+      assert.equal(JSON.stringify(data).includes('UNRELATED-PRELOAD-DATA'), false)
+    }
+    const before = fetchCalls.length
+    await expectError(relay, '/v1/post?id=9001', 503, 'UPSTREAM_RATE_LIMITED')
+    assert.deepEqual(fetchCalls.slice(before).map(entry => entry.url), ['https://substack.com/api/v1/posts/by-id/9001'])
+  })
+})
+
+test('automatic public fallback failures preserve original API errors and retry delays', async () => {
+  const relay = newRelay()
+  await withUpstream({
+    [archiveUrl(PUBLIC_HOST)]: () => html('API rate limited', 429, { 'Retry-After': '73' }),
+    [`https://${PUBLIC_HOST}/sitemap.xml`]: () => new Response('<urlset><broken>', { headers: { ...FINGERPRINT, 'content-type': 'application/xml' } }),
+    [`https://${PUBLIC_HOST}/api/v1/posts/public-one`]: () => html('API rate limited', 429, { 'Retry-After': '73' }),
+    [`https://${PUBLIC_HOST}/p/public-one`]: () => html(publicPostHtml('wrong-slug'), 200, FINGERPRINT),
+  }, async () => {
+    for (const path of [`/v1/archive?host=${PUBLIC_HOST}`, `/v1/post?host=${PUBLIC_HOST}&slug=public-one`]) {
+      const { error, res } = await expectError(relay, path, 503, 'UPSTREAM_RATE_LIMITED')
+      assert.equal(error.retryAfterSeconds, 73)
+      assert.equal(res.headers.get('retry-after'), '73')
+    }
+    assert.deepEqual(fetchCalls.map(entry => entry.url), [
+      archiveUrl(PUBLIC_HOST), `https://${PUBLIC_HOST}/sitemap.xml`,
+      `https://${PUBLIC_HOST}/api/v1/posts/public-one`, `https://${PUBLIC_HOST}/p/public-one`,
+    ])
+  })
+})
+
+test('public archive fan-out has a strict budget and cached pages do not spend it', async () => {
+  const clock = createFakeClock(0)
+  const relay = newRelay({ cache: memoryCache(), now: clock.now, strictRateLimitPerMinute: 1 })
+  await withUpstream({
+    [`https://${PUBLIC_HOST}/sitemap.xml`]: () => sitemapResponse(['public-one', 'public-two']),
+    [`https://${PUBLIC_HOST}/p/public-one`]: () => html(publicPostHtml('public-one'), 200, FINGERPRINT),
+    [archiveUrl(PUBLIC_HOST)]: () => html('API rate limited', 429, { 'Retry-After': '73' }),
+  }, async () => {
+    const path = `/v1/archive?host=${PUBLIC_HOST}&source=sitemap&limit=1`
+    await expectOk<ArchivePage>(relay, path)
+    const before = fetchCalls.length
+    assert.equal((await expectOk<ArchivePage>(relay, path)).meta.cached, true)
+    assert.equal(fetchCalls.length, before)
+    const limited = await expectError(relay, `${path}&offset=1`, 429, 'RATE_LIMITED')
+    assert.equal(limited.error.retryAfterSeconds, 60)
+    assert.equal(fetchCalls.length, before, 'A rejected fan-out never fetches the sitemap or another public page.')
+    const automatic = await expectError(relay, `/v1/archive?host=${PUBLIC_HOST}`, 503, 'UPSTREAM_RATE_LIMITED')
+    assert.equal(automatic.error.retryAfterSeconds, 73, 'If public recovery has no budget, the API error still reaches RSS recovery.')
+    assert.deepEqual(fetchCalls.slice(before).map(entry => entry.url), [archiveUrl(PUBLIC_HOST)])
+  })
+})
+
+test('explicit sitemap failures cannot masquerade as an empty archive or bypass public-page security checks', async () => {
+  const relay = newRelay()
+  let mapReply = () => sitemapResponse(['public-one'])
+  let pageReply = () => html(publicPostHtml('public-one'), 200, FINGERPRINT)
+  const cases: Array<{ map?: () => Response; page?: () => Response; status: number; code: string }> = [
+    { map: () => new Response('<urlset><broken>', { headers: { ...FINGERPRINT, 'content-type': 'application/xml' } }), status: 502, code: 'UPSTREAM_INVALID' },
+    { map: () => new Response(sitemap(['public-one']), { headers: { 'content-type': 'application/xml' } }), status: 403, code: 'HOST_NOT_SUBSTACK' },
+    { map: () => redirectTo('https://127.0.0.1/sitemap.xml'), status: 502, code: 'REDIRECT_NOT_ALLOWED' },
+    { page: () => html(publicPostHtml('public-one'), 200), status: 403, code: 'HOST_NOT_SUBSTACK' },
+    { page: () => redirectTo('https://metadata.internal/p/public-one'), status: 502, code: 'REDIRECT_NOT_ALLOWED' },
+    { page: () => html('<html>No supported public payload.</html>', 200, FINGERPRINT), status: 502, code: 'UPSTREAM_INVALID' },
+    { page: () => html(publicPostHtml('different-post'), 200, FINGERPRINT), status: 502, code: 'UPSTREAM_INVALID' },
+    { page: () => html('temporarily unavailable', 503), status: 503, code: 'UPSTREAM_UNAVAILABLE' },
+    { page: () => html('', 200, { ...FINGERPRINT, 'content-length': String(32 * 1024 * 1024) }), status: 502, code: 'UPSTREAM_TOO_LARGE' },
+  ]
+  await withUpstream({
+    [`https://${PUBLIC_HOST}/sitemap.xml`]: () => mapReply(),
+    [`https://${PUBLIC_HOST}/p/public-one`]: () => pageReply(),
+  }, async () => {
+    for (const entry of cases) {
+      mapReply = entry.map ?? (() => sitemapResponse(['public-one']))
+      pageReply = entry.page ?? (() => html(publicPostHtml('public-one'), 200, FINGERPRINT))
+      await expectError(relay, `/v1/archive?host=${PUBLIC_HOST}&source=sitemap`, entry.status, entry.code)
+    }
+  })
+})
+
+test('a nonempty sitemap page fails as a whole when one public post cannot be read', async () => {
+  const relay = newRelay()
+  await withUpstream({
+    [`https://${PUBLIC_HOST}/sitemap.xml`]: () => sitemapResponse(['public-one', 'public-two']),
+    [`https://${PUBLIC_HOST}/p/public-one`]: () => html(publicPostHtml('public-one'), 200, FINGERPRINT),
+    [`https://${PUBLIC_HOST}/p/public-two`]: () => html('<html>Unsupported page.</html>', 200, FINGERPRINT),
+  }, async () => {
+    const { text } = await expectError(relay, `/v1/archive?host=${PUBLIC_HOST}&source=sitemap`, 502, 'UPSTREAM_INVALID')
+    assert.equal(text.includes('nextOffset'), false, 'A failed hydration cannot advance past or hide an unread post.')
+    assert.equal(fetchCalls.filter(entry => entry.url.includes('/p/')).length, 2)
+  })
+})
+
 test('every route validates its parameters before any upstream request', async () => {
   const relay = newRelay()
   const cases: Array<[string, string]> = [
@@ -320,6 +542,8 @@ test('every route validates its parameters before any upstream request', async (
     ['/v1/archive?host=exampleletters.substack.com&offset=5001', 'INVALID_PARAM'],
     ['/v1/archive?host=exampleletters.substack.com&limit=ten', 'INVALID_PARAM'],
     ['/v1/archive?host=exampleletters.substack.com&sort=old', 'INVALID_PARAM'],
+    ['/v1/archive?host=exampleletters.substack.com&source=unknown', 'INVALID_PARAM'],
+    ['/v1/archive?host=exampleletters.substack.com&source=sitemap&sort=top', 'INVALID_PARAM'],
     ['/v1/post', 'INVALID_PARAM'],
     ['/v1/post?slug=a-post', 'INVALID_HOST'],
     ['/v1/post?host=exampleletters.substack.com', 'INVALID_SLUG'],
@@ -906,7 +1130,10 @@ test('upstream failures map to honest codes with bounded diagnostics and never e
     },
   ]
   let reply: () => Response = () => html('', 500)
-  await withUpstream({ [url]: () => reply() }, async () => {
+  await withUpstream({
+    [url]: () => reply(),
+    'https://exampleletters.substack.com/p/a-post': () => html('The public page is unavailable too.', 503),
+  }, async () => {
     for (const entry of cases) {
       reply = entry.reply
       const { res, error, text } = await expectError(relay, request, entry.status, entry.code)
@@ -1353,6 +1580,7 @@ test('edge cache: hits skip upstream and set meta.cached; 404s are kept 60 s; fa
     [archiveUrl('news.example.com', 12)]: () => substackJson([]),
     [post('missing-post')]: () => substackJson({ error: 'Post not found', type: 'single' }, 404),
     [post('blocked-post')]: () => html('blocked', 403),
+    'https://exampleletters.substack.com/p/blocked-post': () => html('blocked public page', 403),
   }, async () => {
     const first = await expectOk<ArchivePage>(relay, '/v1/archive?host=exampleletters.substack.com')
     assert.equal(first.meta.cached, false)

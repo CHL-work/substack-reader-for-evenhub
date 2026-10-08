@@ -108,10 +108,10 @@ function bodyHtml(post) {
 }
 
 /** RSS carries recent summaries and inert HTML strings, including a paid-preview tail. */
-function feedXml(host) {
+function feedXml(host, posts = fixtures.posts.filter(post => post.host === host).slice(0, fixtures.archivePageCap)) {
   const xml = value => String(value ?? '').replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;')
   const pub = fixtures.publications[host]
-  const items = fixtures.posts.filter(post => post.host === host).slice(0, fixtures.archivePageCap).map(post => {
+  const items = posts.map(post => {
     const link = `https://${host}/p/${post.slug}`
     const body = `<p data-rss-ci-payload="body">${FEED_BODY_MARKER}</p><script data-rss-ci-payload="script">window.__rssCiExecuted = true</script>`
       + bodyHtml(post) + (post.audience === 'everyone' ? '' : `<p><a href="${link}">Read more</a></p>`)
@@ -650,6 +650,129 @@ try {
     assert.match(shown, /t0\d{3}/)
     assert.deepEqual(relayRequests, [...initialRequests, `/v1/post?host=${ALPHA}&slug=first-synthetic-essay`, `/v1/feed?host=${ALPHA}`])
     await expect.poll(async () => (await storedDoc(page, PROGRESS_KEY)).bridge?.history?.map(ref => ref.slug)).toEqual(['first-synthetic-essay'])
+  })
+
+  const twentyFeedPosts = Array.from({ length: 20 }, (_, index) => ({
+    ...fixtures.posts[0],
+    id: 8001 + index,
+    slug: `rss-item-${index + 1}`,
+    title: `RSS item ${String(index + 1).padStart(2, '0')}`,
+    subtitle: null,
+    paragraphs: 4,
+  }))
+  await scenario('2b2 a 20-item RSS feed remains browsable, saveable and readable beyond the first four posts', {
+    seed: SEED_ALPHA,
+    override: url => ['/v1/archive', '/v1/post'].includes(url.pathname)
+      ? [503, failure('UPSTREAM_RATE_LIMITED', 'Substack API is temporarily rate limited.')]
+      : url.pathname === '/v1/feed' ? [200, feedXml(ALPHA, twentyFeedPosts), 'application/rss+xml; charset=utf-8'] : null,
+  }, async ({ page, relayRequests }) => {
+    await openTab(page, 'publications')
+    await page.locator(`[data-action="browse"][data-host="${ALPHA}"]`).click()
+    await expect(page.locator('[data-post-row]')).toHaveCount(20)
+    assert.deepEqual(await page.locator('[data-post-row] strong').allTextContents(), twentyFeedPosts.map(post => post.title))
+    for (const index of [4, 19]) {
+      const row = page.locator('[data-post-row]').nth(index)
+      await expect(row).toContainText(twentyFeedPosts[index].title)
+      await row.locator('[data-action="toggle-save"]').click()
+      await expect(row.locator('[data-action="toggle-save"]')).toHaveAttribute('aria-pressed', 'true')
+    }
+    for (const copy of ['local', 'bridge']) {
+      await expect.poll(async () => (await storedDoc(page, PREFS_KEY))[copy]?.saved?.map(ref => ref.slug))
+        .toEqual(['rss-item-5', 'rss-item-20'])
+    }
+    await openTab(page, 'saved')
+    assert.deepEqual(await rowValues(page, '[data-saved-row]', 'data-saved-row'), [`${ALPHA}/rss-item-5`, `${ALPHA}/rss-item-20`])
+    await expectBody(page, '> Latest')
+    await g2(page, 'next')
+    await expectBody(page, '> Publications (1)')
+    await g2(page, 'select')
+    await expectBody(page, '> Alpha Notes')
+    await g2(page, 'select')
+    for (let index = 0; index < twentyFeedPosts.length; index += 1) {
+      if (index > 0) await g2(page, 'next')
+      await expectBody(page, `> ${twentyFeedPosts[index].title}`)
+      await expectFooter(page, new RegExp(`^${index + 1}/\\d+${DOT}Tap read`))
+      if (index !== 4 && index !== 19) continue
+      await g2(page, 'select')
+      await expectFooter(page, readerFooter(1))
+      await expect(page.locator('[data-testid="now-reading"]')).toContainText(twentyFeedPosts[index].title)
+      await g2(page, 'next')
+      await expectFooter(page, readerFooter(2))
+      assert.match(await g2Field(page, 'body'), /t0\d{3}/, 'The selected later RSS item contains readable article text.')
+      await g2(page, 'back')
+      await expectBody(page, `> ${twentyFeedPosts[index].title}`)
+    }
+    assert.deepEqual(relayRequests, [
+      `/v1/archive?host=${ALPHA}&offset=0&limit=12&sort=new`, `/v1/feed?host=${ALPHA}`,
+      `/v1/archive?host=${ALPHA}&offset=0&limit=12&sort=new`, `/v1/feed?host=${ALPHA}`,
+    ], 'Scrolling through all 20 RSS items and reading later items uses their in-memory bodies.')
+  })
+
+  const sitemapPosts = twentyFeedPosts.slice(0, 8).map((post, index) => ({
+    ...post, id: 9001 + index, slug: `catalog-item-${index + 1}`, title: `Catalog item ${String(index + 1).padStart(2, '0')}`,
+  }))
+  await scenario('2b3 sitemap pages load beyond four posts on phone and glasses and keep the cursor source', {
+    seed: SEED_ALPHA,
+    override: url => {
+      if (url.pathname === '/v1/archive') {
+        const offset = Number(url.searchParams.get('offset'))
+        if (offset > 0 && url.searchParams.get('source') !== 'sitemap') {
+          return [503, failure('UPSTREAM_INVALID', 'An older sitemap page must retain its source.')]
+        }
+        const posts = sitemapPosts.slice(offset, offset + 4).map(summary)
+        return [200, ok({ publication: fixtures.publications[ALPHA], posts, nextOffset: offset + posts.length < sitemapPosts.length ? offset + posts.length : null, source: 'sitemap' }, ALPHA)]
+      }
+      if (url.pathname === '/v1/post') {
+        const post = sitemapPosts.find(item => item.slug === url.searchParams.get('slug'))
+        if (post) return [200, ok({ post: { ...summary(post), bodyHtml: bodyHtml(post), truncated: false }, publication: fixtures.publications[ALPHA] }, ALPHA)]
+      }
+      return null
+    },
+  }, async ({ page, relayRequests }) => {
+    await openTab(page, 'publications')
+    await page.locator(`[data-action="browse"][data-host="${ALPHA}"]`).click()
+    await expect(page.locator('[data-post-row]')).toHaveCount(4)
+    await page.locator('[data-testid="browse-more"]').click()
+    await expect(page.locator('[data-post-row]')).toHaveCount(8)
+    assert.deepEqual(await page.locator('[data-post-row] strong').allTextContents(), sitemapPosts.map(post => post.title))
+    await expect(page.locator('[data-testid="browse-more"]')).toHaveCount(0)
+    await page.locator('[data-post-row]').nth(4).locator('[data-action="toggle-save"]').click()
+    for (const copy of ['local', 'bridge']) {
+      await expect.poll(async () => (await storedDoc(page, PREFS_KEY))[copy]?.saved?.map(ref => ref.postId)).toEqual([9005])
+      const prefs = (await storedDoc(page, PREFS_KEY))[copy]
+      assert.equal(prefs.saved[0].slug, 'catalog-item-5')
+      assert.equal(JSON.stringify(prefs).includes('sitemap'), false, 'The archive cursor source is never stored in library metadata.')
+    }
+    await openTab(page, 'publications')
+    await page.locator(`[data-action="browse"][data-host="${ALPHA}"]`).click()
+    await expect(page.locator('[data-post-row]')).toHaveCount(4)
+    assert.equal(relayRequests[2], `/v1/archive?host=${ALPHA}&offset=0&limit=12&sort=new`, 'Reopening Browse lets the relay choose the source again.')
+
+    await expectBody(page, '> Latest')
+    await g2(page, 'next')
+    await g2(page, 'select')
+    await expectBody(page, '> Alpha Notes')
+    await g2(page, 'select')
+    await expectBody(page, '> Catalog item 01')
+    for (let index = 0; index < 4; index += 1) await g2(page, 'next')
+    await expectFooter(page, new RegExp(`^5/5${DOT}Tap load`))
+    await g2(page, 'select')
+    await expectBody(page, '> Catalog item 05')
+    await expectFooter(page, new RegExp(`^5/8${DOT}Tap read`))
+    await g2(page, 'select')
+    await expectFooter(page, readerFooter(1))
+    await expect(page.locator('[data-testid="now-reading"]')).toContainText('Catalog item 05')
+    await g2(page, 'next')
+    await expectFooter(page, readerFooter(2))
+    assert.match(await g2Field(page, 'body'), /t0\d{3}/)
+    assert.deepEqual(relayRequests, [
+      `/v1/archive?host=${ALPHA}&offset=0&limit=12&sort=new`,
+      `/v1/archive?host=${ALPHA}&offset=4&limit=12&sort=new&source=sitemap`,
+      `/v1/archive?host=${ALPHA}&offset=0&limit=12&sort=new`,
+      `/v1/archive?host=${ALPHA}&offset=0&limit=12&sort=new`,
+      `/v1/archive?host=${ALPHA}&offset=4&limit=12&sort=new&source=sitemap`,
+      `/v1/post?host=${ALPHA}&slug=catalog-item-5`,
+    ])
   })
 
   for (const feedFailure of ['request', 'malformed']) {

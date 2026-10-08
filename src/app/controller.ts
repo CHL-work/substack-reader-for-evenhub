@@ -26,7 +26,7 @@ import { LIMITS, type Article, type GlassesView, type LinesPerPage, type Positio
 
 /** The relay-client subset the glasses need (src/substack/api.ts satisfies it). */
 export interface ReaderApi {
-  getArchive(host: string, options: { offset?: number; limit?: number }, signal?: AbortSignal): Promise<{ page: ArchivePage; host: string }>
+  getArchive(host: string, options: { offset?: number; limit?: number; source?: 'sitemap' }, signal?: AbortSignal): Promise<{ page: ArchivePage; host: string }>
   getPost(ref: { host: string; slug: string } | { id: number }, signal?: AbortSignal): Promise<{ post: PostDetail; publication: PubMeta | null; host: string }>
 }
 
@@ -447,20 +447,21 @@ export function createController(deps: ControllerDeps): Controller {
   }
 
   /** Append an older archive page, skipping posts already listed; returns the new posts. */
-  function appendPage(view: PostsState, page: { items: PostRef[]; nextOffset: number | null }): PostRef[] {
+  function appendPage(view: PostsState, page: { items: PostRef[]; nextOffset: number | null; source?: 'sitemap' }): PostRef[] {
     const known = new Set(view.items.map(refKey))
     const fresh = page.items.filter(item => !known.has(refKey(item)))
     view.items = [...view.items, ...fresh]
     view.nextOffset = page.nextOffset
+    view.archiveSource = page.source ?? view.archiveSource
     return fresh
   }
 
   // -------------------------------------------------------------------------
   // Lists
 
-  async function fetchArchive(host: string, offset: number, name: string, signal: AbortSignal): Promise<{ items: PostRef[]; nextOffset: number | null; host: string }> {
+  async function fetchArchive(host: string, offset: number, name: string, signal: AbortSignal, source?: 'sitemap'): Promise<{ items: PostRef[]; nextOffset: number | null; host: string; source?: 'sitemap' }> {
     try {
-      const result = await deps.api.getArchive(host, { offset, limit: ARCHIVE_PAGE_SIZE }, signal)
+      const result = await deps.api.getArchive(host, { offset, limit: ARCHIVE_PAGE_SIZE, ...(source ? { source } : {}) }, signal)
       const resolved = result.host || host
       const archiveName = result.page.publication?.name
       if (archiveName) backfillName(host, resolved, archiveName)
@@ -472,7 +473,7 @@ export function createController(deps: ControllerDeps): Controller {
         if (ref) items.push(ref)
       }
       // Only an empty page ends the archive (Substack may return fewer than `limit`).
-      return { items, nextOffset: result.page.posts.length ? result.page.nextOffset : null, host: resolved }
+      return { items, nextOffset: result.page.posts.length ? result.page.nextOffset : null, host: resolved, ...(result.page.source ? { source: result.page.source } : {}) }
     } catch (error) {
       if (offset !== 0 || !deps.getFeed || !FEED_FALLBACK_CODES.has(toViewError(error).code)) throw error
       let feed: FeedResult
@@ -567,7 +568,7 @@ export function createController(deps: ControllerDeps): Controller {
         selectKey(view, keep)
       } else if (typeof source === 'object') {
         const offset = mode === 'older' ? view.nextOffset ?? view.items.length : 0
-        const result = await fetchArchive(source.host, offset, source.name ?? '', signal)
+        const result = await fetchArchive(source.host, offset, source.name ?? '', signal, mode === 'older' ? view.archiveSource : undefined)
         if (gen !== generation) return
         adoptHost(view, source, result.host)
         if (mode === 'older') {
@@ -577,6 +578,7 @@ export function createController(deps: ControllerDeps): Controller {
         } else {
           view.items = result.items
           view.nextOffset = result.nextOffset
+          view.archiveSource = result.source
           selectKey(view, keep)
         }
       } else {
@@ -765,7 +767,7 @@ export function createController(deps: ControllerDeps): Controller {
     view.error = null
     void draw()
     try {
-      const result = await fetchArchive(source.host, offset, source.name ?? '', signal)
+      const result = await fetchArchive(source.host, offset, source.name ?? '', signal, list.archiveSource)
       if (gen !== generation) return
       adoptHost(list, source, result.host)
       const first = list.items.length

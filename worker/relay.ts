@@ -37,6 +37,7 @@ import {
   type UpstreamContentType,
 } from '../src/substack/types'
 import { landingPage, privacyPage } from './landing'
+import { parsePublicPost, parseSitemapSlugs } from './public-pages'
 
 /* ------------------------------------------------------------------ runtime contracts */
 
@@ -103,6 +104,7 @@ const POST_CAP = 4 * MIB
 const PROFILE_CAP = MIB
 const SEARCH_CAP = 2 * MIB
 const FEED_CAP = 4 * MIB
+const PUBLIC_ARCHIVE_PAGE_SIZE = 4
 const DOH_CAP = 64 * 1024
 const DEFAULT_TIMEOUT_MS = 10_000
 const MAX_REDIRECTS = 3
@@ -135,6 +137,7 @@ const MAX_SUBSCRIPTIONS = 500
 
 const ACCEPT_JSON = 'application/json'
 const ACCEPT_FEED = 'application/rss+xml, application/xml;q=0.9'
+const ACCEPT_HTML = 'text/html'
 const ACCEPT_DOH = 'application/dns-json'
 const JSON_TYPE = 'application/json; charset=utf-8'
 /** S1: feed XML goes out as text, so a browser never renders upstream markup on the relay origin. */
@@ -441,7 +444,9 @@ interface Plan {
   href: string
   accept: string
   cap: number
-  kind: 'json' | 'xml'
+  kind: 'json' | 'xml' | 'html'
+  archive?: { offset: number; limit: number; sort: 'new' | 'top'; source?: 'sitemap' }
+  publicPostSlug?: string
   ttl: { readonly edge: number; readonly client: number }
   /** > 0: cache upstream 404s at the edge for this many seconds. */
   notFoundEdgeTtl: number
@@ -478,6 +483,9 @@ function archivePlan(params: URLSearchParams): Plan {
   const rawSort = params.get('sort')
   if (rawSort !== null && rawSort !== '' && rawSort !== 'new' && rawSort !== 'top') throw new RelayFailure('INVALID_PARAM')
   const sort = rawSort === 'top' ? 'top' : 'new'
+  const source = params.get('source')
+  if (source !== null && source !== 'sitemap') throw new RelayFailure('INVALID_PARAM')
+  if (source === 'sitemap' && sort !== 'new') throw new RelayFailure('INVALID_PARAM')
   return {
     route: 'archive',
     host,
@@ -486,10 +494,11 @@ function archivePlan(params: URLSearchParams): Plan {
     accept: ACCEPT_JSON,
     cap: ARCHIVE_CAP,
     kind: 'json',
+    archive: { offset, limit, sort, ...(source === 'sitemap' ? { source } : {}) },
     ttl: TTL.archive,
     notFoundEdgeTtl: 0,
     notFound: () => 'PUBLICATION_NOT_FOUND',
-    cachePath: h => `/v1/archive?host=${h}&offset=${offset}&limit=${limit}&sort=${sort}`,
+    cachePath: h => `/v1/archive?host=${h}&offset=${offset}&limit=${limit}&sort=${sort}${source === 'sitemap' ? '&source=sitemap' : ''}`,
     shape(json, finalHost) {
       if (!Array.isArray(json)) invalidShape()
       const items: unknown[] = json
@@ -540,6 +549,7 @@ function postPlan(params: URLSearchParams): Plan {
     host,
     allowSubstackCom: false,
     href: `https://${host}/api/v1/posts/${encodeURIComponent(slug)}`,
+    publicPostSlug: slug,
     accept: ACCEPT_JSON,
     cap: POST_CAP,
     kind: 'json',
@@ -821,6 +831,7 @@ interface Deadline {
   signal: AbortSignal
   expired(): boolean
   clear(): void
+  cancel(): void
 }
 
 interface UpstreamBody {
@@ -930,7 +941,7 @@ export function createRelay(options: RelayOptions = {}): Relay {
       expired = true
       controller.abort()
     }, timeoutMs)
-    return { signal: controller.signal, expired: () => expired, clear: () => clearTimeout(timer) }
+    return { signal: controller.signal, expired: () => expired, clear: () => clearTimeout(timer), cancel: () => controller.abort() }
   }
 
   /** Exactly two request headers, no cookies, no body, manual redirects. */
@@ -1296,12 +1307,13 @@ export function createRelay(options: RelayOptions = {}): Relay {
     }
   }
 
-  async function fetchUpstream(plan: Plan, call: Call): Promise<UpstreamBody> {
-    const clock = deadline()
+  async function fetchUpstream(plan: Plan, call: Call, sharedClock?: Deadline): Promise<UpstreamBody> {
+    const clock = sharedClock ?? deadline()
     let url = new URL(plan.href)
     let redirects = 0
     try {
       for (;;) {
+        if (clock.expired()) throw new RelayFailure('UPSTREAM_TIMEOUT')
         let response: Response
         try {
           response = await get(url.href, plan.accept, clock.signal)
@@ -1333,7 +1345,8 @@ export function createRelay(options: RelayOptions = {}): Relay {
           await discard(response)
           throw new RelayFailure('UPSTREAM_ERROR', { upstream: info })
         }
-        const acceptable = plan.kind === 'json' ? info.contentType === 'application/json' : FEED_TYPE_RE.test(mediaType(response))
+        const acceptable = plan.kind === 'json' ? info.contentType === 'application/json'
+          : plan.kind === 'html' ? info.contentType === 'text/html' : FEED_TYPE_RE.test(mediaType(response))
         if (!acceptable) {
           await discard(response)
           throw new RelayFailure('UPSTREAM_INVALID', { upstream: info })
@@ -1341,7 +1354,74 @@ export function createRelay(options: RelayOptions = {}): Relay {
         return { text: await readBody(response, plan, info, clock), finalHost: url.hostname, info }
       }
     } finally {
+      if (!sharedClock) clock.clear()
+    }
+  }
+
+  /** Public pages use the same host, redirect, fingerprint, byte and deadline checks as the API. */
+  async function publicPost(plan: Plan, host: string, slug: string, call: Call, clock: Deadline): Promise<{ data: PostResponse; host: string }> {
+    const upstream = await fetchUpstream({ ...plan, host, allowSubstackCom: false,
+      href: `https://${host}/p/${encodeURIComponent(slug)}`, accept: ACCEPT_HTML, kind: 'html', cap: POST_CAP,
+      notFound: () => 'POST_NOT_FOUND',
+    }, call, clock)
+    let parsed: ReturnType<typeof parsePublicPost>
+    try { parsed = parsePublicPost(upstream.text, slug) } catch { return invalidShape() }
+    const post = postDetail(parsed.post, upstream.finalHost) ?? invalidShape()
+    const publication = publicationMeta(parsed.pub)
+    if (!publication || (publication.host !== upstream.finalHost
+      && `${publication.subdomain}.substack.com` !== upstream.finalHost)) invalidShape()
+    return { data: { post, publication }, host: upstream.finalHost }
+  }
+
+  async function publicArchive(plan: Plan, call: Call, clock: Deadline): Promise<{ data: ArchivePage; host: string }> {
+    const page = plan.archive ?? invalidShape()
+    // A page hydrates at most four public documents, only on demand. Cache hits cost no fan-out.
+    await rateLimit('archive-public', call, true)
+    const upstream = await fetchUpstream({ ...plan, href: `https://${plan.host}/sitemap.xml`,
+      accept: 'application/xml', kind: 'xml', cap: ARCHIVE_CAP,
+    }, call, clock)
+    let slugs: string[]
+    try { slugs = parseSitemapSlugs(upstream.text, upstream.finalHost) } catch { return invalidShape() }
+    const selected = slugs.slice(page.offset, page.offset + Math.min(page.limit, PUBLIC_ARCHIVE_PAGE_SIZE))
+    // Reject a partial page on any failure: retrying must not silently skip an unread post.
+    const details = await Promise.all(selected.map(slug => publicPost(plan, upstream.finalHost, slug, call, clock)))
+    const end = page.offset + selected.length
+    const posts = details.map(({ data: { post } }) => {
+      const { bodyHtml: _body, truncated: _truncated, ...summary } = post
+      return summary
+    })
+    return { data: { publication: details[0]?.data.publication ?? null, posts, source: 'sitemap',
+      nextOffset: end < slugs.length && end <= RELAY_MAX_ARCHIVE_OFFSET ? end : null,
+    }, host: upstream.finalHost }
+  }
+
+  function canUsePublicPages(error: unknown): boolean {
+    return error instanceof RelayFailure && ['UPSTREAM_BLOCKED', 'UPSTREAM_RATE_LIMITED', 'UPSTREAM_UNAVAILABLE'].includes(error.code)
+  }
+
+  async function load(plan: Plan, call: Call): Promise<{ upstream: UpstreamBody } | { shaped: { data: unknown; host: string } }> {
+    const clock = deadline()
+    try {
+      if (plan.archive?.source === 'sitemap') return { shaped: await publicArchive(plan, call, clock) }
+      try {
+        return { upstream: await fetchUpstream(plan, call, clock) }
+      } catch (error) {
+        if (!canUsePublicPages(error)) throw error
+        try {
+          if (plan.publicPostSlug) return { shaped: await publicPost(plan, plan.host, plan.publicPostSlug, call, clock) }
+          // An API offset and a sitemap offset are different sequences. Switch only at the start;
+          // subsequent pages explicitly carry source=sitemap even if the API recovers meanwhile.
+          if (plan.archive?.offset === 0 && plan.archive.sort === 'new') {
+            return { shaped: await publicArchive(plan, call, clock) }
+          }
+        } catch {
+          // Keep the original API failure (including Retry-After) for the client's RSS recovery.
+        }
+        throw error
+      }
+    } finally {
       clock.clear()
+      clock.cancel()
     }
   }
 
@@ -1393,15 +1473,23 @@ export function createRelay(options: RelayOptions = {}): Relay {
     const outcome = await hostVerdict(plan.host, plan.allowSubstackCom, call)
     if (outcome.verdict === 'unknown') throw unverified(outcome)
     if (outcome.verdict === 'fail') throw new RelayFailure('HOST_NOT_SUBSTACK')
-    let upstream: UpstreamBody
+    let loaded: Awaited<ReturnType<typeof load>>
     try {
-      upstream = await fetchUpstream(plan, call)
+      loaded = await load(plan, call)
     } catch (error) {
       if (cache && plan.notFoundEdgeTtl > 0 && error instanceof RelayFailure && error.status === 404) {
         await store(cache, [key], errorJson(error), 404, JSON_TYPE, plan.notFoundEdgeTtl, call.ctx)
       }
       throw error
     }
+    if ('shaped' in loaded) {
+      const { shaped } = loaded
+      const keys = shaped.host === plan.host ? [key] : [key, call.cacheNs + plan.cachePath(shaped.host)]
+      const body = okJson(shaped.data, shaped.host, iso())
+      if (cache) await store(cache, keys, body, 200, JSON_TYPE, plan.ttl.edge, call.ctx)
+      return new Response(body, { status: 200, headers: responseHeaders(JSON_TYPE, `public, max-age=${plan.ttl.client}`) })
+    }
+    const { upstream } = loaded
     // Also cache under the post-redirect host, which the client adopts from meta.host.
     const keys = upstream.finalHost === plan.host ? [key] : [key, call.cacheNs + plan.cachePath(upstream.finalHost)]
     const clientCache = `public, max-age=${plan.ttl.client}`
